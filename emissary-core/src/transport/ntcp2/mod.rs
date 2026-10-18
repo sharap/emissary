@@ -1116,8 +1116,19 @@ mod tests {
         );
 
         let make_remote_manager = |key: [u8; 32], iv: [u8; 16]| {
-            let remote_ctx =
-                RouterContextBuilder::default().with_net_id(local_router_info.net_id).build();
+            // router info must advertise the same ntcp2 static key that is used in the handshake
+            let (router_info, static_key, signing_key) = RouterInfoBuilder::default()
+                .with_ntcp2(Ntcp2Config {
+                    key,
+                    iv,
+                    max_connections: None,
+                    ..config.clone()
+                })
+                .build();
+            let remote_ctx = RouterContextBuilder::default()
+                .with_net_id(local_router_info.net_id)
+                .with_router_info(router_info, static_key, signing_key)
+                .build();
             let (tx, rx) = mpsc::channel(16);
 
             (

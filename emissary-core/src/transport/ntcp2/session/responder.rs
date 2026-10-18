@@ -27,7 +27,7 @@ use crate::{
         EphemeralPrivateKey, StaticPrivateKey, StaticPublicKey,
     },
     error::Ntcp2Error,
-    primitives::RouterInfo,
+    primitives::{RouterAddress, RouterInfo},
     runtime::Runtime,
     transport::{
         ntcp2::{
@@ -597,6 +597,26 @@ impl Responder {
                 }
             }
         }?;
+
+        // verify that the static key used in the handshake is the NTCP2 static key the remote
+        // router advertises in its `RouterInfo`
+        //
+        // without this check anyone holding a valid `RouterInfo` of another router could complete
+        // the handshake with their own static key and be treated as that router
+        //
+        // https://geti2p.net/spec/ntcp2#sessionconfirmed
+        if !router_info.addresses().any(|address| match address {
+            RouterAddress::Ntcp2 { static_key, .. } =>
+                AsRef::<[u8]>::as_ref(static_key) == AsRef::<[u8]>::as_ref(&initiator_public),
+            _ => false,
+        }) {
+            tracing::warn!(
+                target: LOG_TARGET,
+                router_id = %router_info.identity.id(),
+                "static key used in the handshake doesn't match the router info",
+            );
+            return Err(Ntcp2Error::StaticKeyMismatch);
+        }
 
         // create send and receive keys
         let temp_key = Hmac::new(encryption_ctx.noise_ctx().chaining_key()).update([]).finalize();

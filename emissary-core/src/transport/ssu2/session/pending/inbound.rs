@@ -840,10 +840,10 @@ impl<R: Runtime> InboundSsu2Session<R> {
         self.encryption_ctx.noise_ctx().mix_hash(&pkt[16..64]);
 
         // MixKey(DH())
-        let mut cipher_key = self.encryption_ctx.noise_ctx().mix_key(
-            &ephemeral_key,
-            &StaticPublicKey::try_from_bytes(&static_key).expect("to succeed"),
-        );
+        let remote_static_key =
+            StaticPublicKey::try_from_bytes(&static_key).ok_or(Ssu2Error::Malformed)?;
+        let mut cipher_key =
+            self.encryption_ctx.noise_ctx().mix_key(&ephemeral_key, &remote_static_key);
 
         // decrypt payload
         let mut payload = pkt[64..].to_vec();
@@ -874,17 +874,45 @@ impl<R: Runtime> InboundSsu2Session<R> {
             return Err(Ssu2Error::Malformed);
         };
 
-        let Some(RouterAddress::Ssu2 { intro_key, .. }) = router_info
+        let ssu2_addresses = router_info
             .addresses()
-            .find(|address| core::matches!(address, RouterAddress::Ssu2 { .. }))
-        else {
+            .filter_map(|address| match address {
+                RouterAddress::Ssu2 {
+                    intro_key,
+                    static_key,
+                    ..
+                } => Some((intro_key, static_key)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        if ssu2_addresses.is_empty() {
             tracing::warn!(
                 target: LOG_TARGET,
                 "no ssu2 transport found",
             );
             debug_assert!(false);
             return Err(Ssu2Error::Malformed);
+        }
+
+        // verify that the static key used in the handshake is the SSU2 static key the remote
+        // router advertises in its `RouterInfo`
+        //
+        // without this check anyone holding a valid `RouterInfo` of another router could complete
+        // the handshake with their own static key and be treated as that router
+        //
+        // https://geti2p.net/spec/ssu2#sessionconfirmed-type-2
+        let Some((intro_key, _)) = ssu2_addresses.iter().find(|(_, static_key)| {
+            AsRef::<[u8]>::as_ref(*static_key) == AsRef::<[u8]>::as_ref(&remote_static_key)
+        }) else {
+            tracing::warn!(
+                target: LOG_TARGET,
+                router_id = %router_info.identity.id(),
+                "static key used in the handshake doesn't match the router info",
+            );
+            return Err(Ssu2Error::StaticKeyMismatch);
         };
+        let intro_key = **intro_key;
 
         let verifying_key = router_info.identity.signing_key().clone();
         let temp_key =
@@ -914,7 +942,7 @@ impl<R: Runtime> InboundSsu2Session<R> {
             .with_dst_id(self.src_id)
             .with_pkt_num(0u32)
             .with_key_context(
-                *intro_key,
+                intro_key,
                 &KeyContext {
                     k_data: k_data_ba,
                     k_header_2: k_header_2_ba,
@@ -943,7 +971,7 @@ impl<R: Runtime> InboundSsu2Session<R> {
             context: Ssu2SessionContext {
                 address: self.address,
                 dst_id: self.src_id,
-                intro_key: *intro_key,
+                intro_key,
                 max_payload_size,
                 pkt_rx: self.rx.take().expect("to exist"),
                 recv_key_ctx: KeyContext::new(k_data_ab, k_header_2_ab),
@@ -1243,6 +1271,18 @@ mod tests {
         iters: Option<usize>,
         ml_kem: Option<usize>,
     ) -> (InboundContext, OutboundContext) {
+        create_session_inner(iters, ml_kem, false).await
+    }
+
+    /// Create inbound/outbound session pair.
+    ///
+    /// If `advertise_wrong_static_key` is true, the `RouterInfo` sent by the outbound session
+    /// advertises an SSU2 static key that differs from the one used in the handshake.
+    async fn create_session_inner(
+        iters: Option<usize>,
+        ml_kem: Option<usize>,
+        advertise_wrong_static_key: bool,
+    ) -> (InboundContext, OutboundContext) {
         let src_id = MockRuntime::rng().next_u64();
         let dst_id = MockRuntime::rng().next_u64();
 
@@ -1289,8 +1329,14 @@ mod tests {
                 ipv6: false,
                 publish_ipv4: true,
                 publish_ipv6: true,
-                static_key: TryInto::<[u8; 32]>::try_into(outbound_static_key.as_ref().to_vec())
-                    .unwrap(),
+                static_key: if advertise_wrong_static_key {
+                    let mut key = [0u8; 32];
+                    MockRuntime::rng().fill_bytes(&mut key);
+
+                    key
+                } else {
+                    TryInto::<[u8; 32]>::try_into(outbound_static_key.as_ref().to_vec()).unwrap()
+                },
                 intro_key: outbound_intro_key,
                 ipv4_mtu: None,
                 ipv6_mtu: None,
@@ -2136,6 +2182,93 @@ mod tests {
         match tokio::time::timeout(Duration::from_secs(5), future).await.unwrap().unwrap() {
             PendingSsu2SessionStatus::SessionTerminated { .. } => {}
             status => panic!("unexpected status: {status:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn static_key_mismatch_x25519() {
+        static_key_mismatch(None).await
+    }
+
+    #[tokio::test]
+    async fn static_key_mismatch_ml_kem_512() {
+        static_key_mismatch(Some(3)).await
+    }
+
+    #[tokio::test]
+    async fn static_key_mismatch_ml_kem_768() {
+        static_key_mismatch(Some(4)).await
+    }
+
+    // outbound session performs the handshake with one static key but its `RouterInfo`
+    // advertises another one, inbound session must reject `SessionConfirmed`
+    async fn static_key_mismatch(ml_kem: Option<usize>) {
+        let (
+            InboundContext {
+                inbound_session,
+                inbound_socket_rx,
+                inbound_session_tx: ib_sess_tx,
+            },
+            OutboundContext {
+                outbound_session,
+                outbound_session_tx: ob_sess_tx,
+                outbound_socket_rx,
+                ..
+            },
+        ) = create_session_inner(None, ml_kem, true).await;
+
+        let intro_key = inbound_session.intro_key;
+        let _outbound_session = tokio::spawn(outbound_session);
+        let inbound_session = tokio::spawn(inbound_session.run());
+
+        // send retry message to outbound session
+        {
+            let Packet { mut pkt, address } = tokio::select! {
+                pkt = outbound_socket_rx.recv() => pkt.unwrap(),
+                _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("timeout"),
+            };
+            let mut reader = HeaderReader::new(intro_key, &mut pkt).unwrap();
+            let _connection_id = reader.dst_id();
+
+            ob_sess_tx.send(Packet { pkt, address }).await.unwrap();
+        }
+
+        // read session request from outbound session, send it to inbound session
+        // and read session created
+        let pkt = {
+            let Packet { mut pkt, address } = inbound_socket_rx.recv().await.unwrap();
+            let mut reader = HeaderReader::new(intro_key, &mut pkt).unwrap();
+            let _connection_id = reader.dst_id();
+            ib_sess_tx.send(Packet { pkt, address }).await.unwrap();
+
+            outbound_socket_rx.recv().await.unwrap()
+        };
+
+        // send `SessionCreated` to outbound session
+        {
+            let Packet { mut pkt, address } = pkt;
+            let mut reader = HeaderReader::new(intro_key, &mut pkt).unwrap();
+            let _connection_id = reader.dst_id();
+
+            ob_sess_tx.send(Packet { pkt, address }).await.unwrap();
+        }
+
+        // read `SessionConfirmed` from outbound session and relay it to inbound session
+        {
+            let Packet { mut pkt, address } = inbound_socket_rx.recv().await.unwrap();
+            let mut reader = HeaderReader::new(intro_key, &mut pkt).unwrap();
+            let _connection_id = reader.dst_id();
+            ib_sess_tx.send(Packet { pkt, address }).await.unwrap();
+        }
+
+        match timeout!(inbound_session).await.unwrap().unwrap() {
+            PendingSsu2SessionStatus::SessionTerminated {
+                reason, router_id, ..
+            } => {
+                assert_eq!(reason, TerminationReason::InvalidRouterInfo);
+                assert!(router_id.is_none());
+            }
+            res => panic!("unexpected result: {res:?}"),
         }
     }
 

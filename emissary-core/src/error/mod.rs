@@ -132,6 +132,10 @@ pub enum Ntcp2Error {
 
     /// Network mismatch.
     NetworkMismatch,
+
+    /// Static key used in the handshake doesn't match the NTCP2 static key
+    /// advertised in remote router's `RouterInfo`.
+    StaticKeyMismatch,
 }
 
 impl From<Ntcp2Error> for DialError {
@@ -154,6 +158,8 @@ impl From<Ntcp2Error> for DialError {
             Ntcp2Error::InvalidOptions =>
                 Self::SessionTerminated(TerminationReason::IncompatibleOptions),
             Ntcp2Error::NetworkMismatch => Self::SessionTerminated(TerminationReason::WrongNetId),
+            Ntcp2Error::StaticKeyMismatch =>
+                Self::SessionTerminated(TerminationReason::InvalidRouterInfo),
         }
     }
 }
@@ -299,6 +305,10 @@ pub enum Ssu2Error {
 
     /// Connection limits have been exceeded.
     ConnectionLimits,
+
+    /// Static key used in the handshake doesn't match the SSU2 static key
+    /// advertised in remote router's `RouterInfo`.
+    StaticKeyMismatch,
 }
 
 impl fmt::Display for Ssu2Error {
@@ -318,6 +328,7 @@ impl fmt::Display for Ssu2Error {
             Self::NonExistentOutbound => write!(f, "non-existent outbound session"),
             Self::Parse(error) => write!(f, "parse error: {error:?}"),
             Self::ConnectionLimits => write!(f, "connection limits"),
+            Self::StaticKeyMismatch => write!(f, "static key mismatch"),
         }
     }
 }
@@ -339,6 +350,7 @@ impl From<Ssu2Error> for &'static str {
             Ssu2Error::NonExistentOutbound => "no-outbound-session",
             Ssu2Error::Parse(_) => "payload-format",
             Ssu2Error::ConnectionLimits => "connection-limits",
+            Ssu2Error::StaticKeyMismatch => "static-key-mismatch",
         }
     }
 }
@@ -360,6 +372,7 @@ impl From<Ssu2Error> for TerminationReason {
             Ssu2Error::NonExistentOutbound => Self::Unspecified,
             Ssu2Error::Parse(_) => Self::PayloadFormatError,
             Ssu2Error::ConnectionLimits => Self::ConnectionLimits,
+            Ssu2Error::StaticKeyMismatch => Self::InvalidRouterInfo,
         }
     }
 }

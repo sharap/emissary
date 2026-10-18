@@ -1099,6 +1099,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn static_key_mismatch_initiator_x25519() {
+        static_key_mismatch_initiator(None).await
+    }
+
+    #[tokio::test]
+    async fn static_key_mismatch_initiator_ml_kem_512() {
+        static_key_mismatch_initiator(Some(3)).await
+    }
+
+    #[tokio::test]
+    async fn static_key_mismatch_initiator_ml_kem_768() {
+        static_key_mismatch_initiator(Some(4)).await
+    }
+
+    #[tokio::test]
+    async fn static_key_mismatch_initiator_ml_kem_1024() {
+        static_key_mismatch_initiator(Some(5)).await
+    }
+
+    // initiator performs the handshake with one static key but its `RouterInfo` advertises
+    // another one, responder must reject the session
+    async fn static_key_mismatch_initiator(kind: Option<usize>) {
+        let (_event_mgr, _event_subscriber, event_handle) =
+            EventManager::new(None, MockRuntime::register_metrics(vec![], None));
+        let (transport_tx1, _transport_rx1) = channel(16);
+        let mut local = Ntcp2Builder::<MockRuntime>::new().with_ml_kem(kind).build();
+
+        // replace the advertised ntcp2 address with one that uses a different static key
+        local.router_info.addresses = {
+            use rand::Rng;
+
+            let mut key = [0u8; 32];
+            MockRuntime::rng().fill_bytes(&mut key);
+
+            vec![RouterAddress::new_unpublished_ntcp2(
+                key,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8888),
+            )]
+        };
+
+        let local_manager = SessionManager::new(
+            match kind {
+                None => StaticPrivateKey::from_bytes(local.ntcp2_key),
+                Some(3) => StaticPrivateKey::from_bytes_ml_kem_512(local.ntcp2_key),
+                Some(4) => StaticPrivateKey::from_bytes_ml_kem_768(local.ntcp2_key),
+                Some(5) => StaticPrivateKey::from_bytes_ml_kem_1024(local.ntcp2_key),
+                _ => unreachable!(),
+            },
+            local.ntcp2_iv,
+            RouterContext::new(
+                MockRuntime::register_metrics(Vec::new(), None),
+                ProfileStorage::<MockRuntime>::new(&[], &[], None),
+                local.router_info.identity.id(),
+                Bytes::from(local.router_info.serialize(&local.signing_key)),
+                local.static_key,
+                local.signing_key,
+                2u8,
+                event_handle.clone(),
+            ),
+            true,
+            true,
+            transport_tx1,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = Ntcp2Builder::<MockRuntime>::new()
+            .with_ml_kem(kind)
+            .with_router_address(listener.local_addr().unwrap().port())
+            .build();
+        let (transport_tx2, _transport_rx2) = channel(16);
+        let remote_manager = SessionManager::new(
+            match kind {
+                None => StaticPrivateKey::from_bytes(remote.ntcp2_key),
+                Some(3) => StaticPrivateKey::from_bytes_ml_kem_512(remote.ntcp2_key),
+                Some(4) => StaticPrivateKey::from_bytes_ml_kem_768(remote.ntcp2_key),
+                Some(5) => StaticPrivateKey::from_bytes_ml_kem_1024(remote.ntcp2_key),
+                _ => unreachable!(),
+            },
+            remote.ntcp2_iv,
+            RouterContext::new(
+                MockRuntime::register_metrics(Vec::new(), None),
+                ProfileStorage::<MockRuntime>::new(&[], &[], None),
+                remote.router_info.identity.id(),
+                Bytes::from(remote.router_info.serialize(&remote.signing_key)),
+                remote.static_key,
+                remote.signing_key,
+                2u8,
+                event_handle.clone(),
+            ),
+            true,
+            true,
+            transport_tx2,
+        );
+
+        let handle = tokio::spawn(async move {
+            local_manager.create_session(remote.router_info.clone(), true, false).await
+        });
+
+        let (stream, address) = timeout!(listener.accept()).await.unwrap().unwrap();
+        let (res1, _res2) = tokio::join!(
+            remote_manager.accept_session(MockTcpStream::new(stream), address),
+            handle
+        );
+
+        // the initiator has already sent `SessionConfirmed` and may consider the handshake
+        // complete, only the responder's verdict is checked
+        assert_eq!(
+            res1.err().map(|(_, error)| error),
+            Some(Ntcp2Error::StaticKeyMismatch)
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_network_id_responder_x25519() {
         invalid_network_id_responder(None).await;
     }
