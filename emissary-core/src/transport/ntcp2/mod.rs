@@ -55,7 +55,7 @@ mod metrics;
 mod options;
 mod session;
 
-#[cfg(feature = "fuzz")]
+#[cfg(any(test, feature = "fuzz"))]
 pub use message::MessageBlock;
 
 /// Logging target for the file.

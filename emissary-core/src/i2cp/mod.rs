@@ -52,7 +52,7 @@ mod socket;
 
 pub use payload::{I2cpPayload, I2cpPayloadBuilder};
 
-#[cfg(feature = "fuzz")]
+#[cfg(any(test, feature = "fuzz"))]
 pub use message::{Message, MessageType};
 
 /// Logging target for the file.

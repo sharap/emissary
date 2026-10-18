@@ -43,10 +43,10 @@ pub use config::{
 pub use error::Error;
 pub use profile::Profile;
 
-#[cfg(feature = "fuzz")]
+#[cfg(any(test, feature = "fuzz"))]
 pub use {
     i2cp::{Message, MessageType},
-    sam::{Datagram, Packet, SamCommand},
+    sam::{Datagram, Packet, PacketBuilder, SamCommand},
     transport::{Block, HeaderReader, MessageBlock},
 };
 
@@ -64,6 +64,9 @@ mod subsystem;
 mod transport;
 mod tunnel;
 mod util;
+
+#[cfg(test)]
+mod robustness_tests;
 
 pub mod crypto;
 pub mod events;

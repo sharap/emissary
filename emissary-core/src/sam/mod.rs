@@ -66,12 +66,11 @@ mod session;
 mod socket;
 mod types;
 
-#[cfg(not(feature = "fuzz"))]
-use parser::Datagram;
-#[cfg(feature = "fuzz")]
+pub use parser::Datagram;
+#[cfg(any(test, feature = "fuzz"))]
 pub use {
-    parser::{Datagram, SamCommand},
-    protocol::streaming::Packet,
+    parser::SamCommand,
+    protocol::streaming::{Packet, PacketBuilder},
 };
 
 /// Logging target for the file.

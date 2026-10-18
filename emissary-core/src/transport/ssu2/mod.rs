@@ -47,7 +47,7 @@ mod relay;
 mod session;
 mod socket;
 
-#[cfg(feature = "fuzz")]
+#[cfg(any(test, feature = "fuzz"))]
 pub use message::{Block, HeaderReader};
 
 /// Logging target for the file.

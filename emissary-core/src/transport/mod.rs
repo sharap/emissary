@@ -61,7 +61,7 @@ pub use ntcp2::Ntcp2Transport;
 pub use ssu2::Ssu2Transport;
 pub use types::*;
 
-#[cfg(feature = "fuzz")]
+#[cfg(any(test, feature = "fuzz"))]
 pub use {
     ntcp2::MessageBlock,
     ssu2::{Block, HeaderReader},

@@ -27,7 +27,6 @@ use crate::{
         protocol::streaming::{
             config::StreamConfig,
             listener::{SocketKind, StreamListener, StreamListenerEvent},
-            packet::PacketBuilder,
             stream::{
                 active::{Stream, StreamContext, StreamEvent, StreamKind},
                 pending::{PendingStream, PendingStreamResult},
@@ -58,10 +57,7 @@ mod stream;
 
 pub use listener::ListenerKind;
 
-#[cfg(not(feature = "fuzz"))]
-use packet::Packet;
-#[cfg(feature = "fuzz")]
-pub use packet::Packet;
+pub use packet::{Packet, PacketBuilder};
 
 /// Logging target for the file.
 const LOG_TARGET: &str = "emissary::streaming";
