@@ -59,6 +59,9 @@ struct Fragment<R: Runtime> {
     /// Fragments.
     fragments: BTreeMap<u8, Vec<u8>>,
 
+    /// Insertion sequence number, used to find the oldest incomplete message.
+    seq: u64,
+
     /// Total of fragments.
     ///
     /// `None` if last fragment hasn't been received.
@@ -84,6 +87,7 @@ impl<R: Runtime> Default for Fragment<R> {
             info: None,
             total_size: 0usize,
             created: R::now(),
+            seq: 0u64,
         }
     }
 }
@@ -128,6 +132,9 @@ pub struct FragmentHandler<R: Runtime> {
 
     /// Metrics handle.
     metrics: R::MetricsHandle,
+
+    /// Sequence number assigned to the next new message.
+    next_seq: u64,
 }
 
 impl<R: Runtime> FragmentHandler<R> {
@@ -137,6 +144,7 @@ impl<R: Runtime> FragmentHandler<R> {
             messages: HashMap::new(),
             gc_timer: R::timer(GARBAGE_COLLECTION_INTERVAL),
             metrics,
+            next_seq: 0u64,
         }
     }
 
@@ -151,7 +159,7 @@ impl<R: Runtime> FragmentHandler<R> {
         if let Some(oldest) = self
             .messages
             .iter()
-            .max_by_key(|(_, message)| message.created.elapsed())
+            .min_by_key(|(_, message)| message.seq)
             .map(|(message_id, _)| *message_id)
         {
             tracing::debug!(
@@ -162,6 +170,19 @@ impl<R: Runtime> FragmentHandler<R> {
             self.metrics.counter(GARBAGE_COLLECTED_COUNT).increment(1);
             self.messages.remove(&oldest);
         }
+    }
+
+    /// Get the incomplete message for `message_id`, creating it with the next sequence number
+    /// if it doesn't exist yet.
+    fn get_or_create(&mut self, message_id: MessageId) -> &mut Fragment<R> {
+        self.messages.entry(message_id).or_insert_with(|| {
+            self.next_seq += 1;
+
+            Fragment {
+                seq: self.next_seq,
+                ..Default::default()
+            }
+        })
     }
 
     /// Handle first fragment.
@@ -175,7 +196,7 @@ impl<R: Runtime> FragmentHandler<R> {
         payload: Vec<u8>,
     ) -> Option<Message> {
         self.make_room(&message_id);
-        let message = self.messages.entry(message_id).or_default();
+        let message = self.get_or_create(message_id);
 
         message.total_size += payload.len();
         message.fragments.insert(0u8, payload.to_vec());
@@ -203,7 +224,7 @@ impl<R: Runtime> FragmentHandler<R> {
         payload: Vec<u8>,
     ) -> Option<Message> {
         self.make_room(&message_id);
-        let message = self.messages.entry(message_id).or_default();
+        let message = self.get_or_create(message_id);
 
         message.total_size += payload.len();
         message.fragments.insert(sequence, payload.to_vec());
