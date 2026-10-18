@@ -104,6 +104,10 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2 * 60);
 // ref: https://geti2p.net/spec/ecies#ack
 const LOW_PRIORITY_RESPONSE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long to wait for the upper protocol layer to reply to a `NewSession` before a
+/// `NewSessionReply` without payload is sent.
+const NSR_RESPONSE_INTERVAL: Duration = Duration::from_secs(3);
+
 /// Number of seconds in the past that is allowable for a `DateTime` block for a new session message
 const NS_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
@@ -209,6 +213,10 @@ pub struct SessionManager<R: Runtime> {
     /// Maintenance timer.
     maintenance_timer: R::Timer,
 
+    /// Timers for sending `NewSessionReply` without payload if the upper protocol layer doesn't
+    /// reply to a `NewSession` in time.
+    nsr_timers: R::JoinSet<DestinationId>,
+
     /// Pending sessions.
     pending: HashMap<DestinationId, PendingSession<R>>,
 
@@ -260,6 +268,7 @@ impl<R: Runtime> SessionManager<R> {
             lease_set_publish_timers: R::join_set(),
             protocol_response_timers: R::join_set(),
             maintenance_timer: R::timer(MAINTENANCE_INTERVAL),
+            nsr_timers: R::join_set(),
             pending_events: VecDeque::new(),
             pending: HashMap::new(),
             remote_destinations: HashMap::new(),
@@ -786,6 +795,24 @@ impl<R: Runtime> SessionManager<R> {
                     return Err(SessionError::InvalidKey);
                 }
 
+                // the static key used for the session must be one of the encryption keys of the
+                // bundled lease set, otherwise the session cannot be bound to that destination
+                let static_key_matches = session.remote_static_public_key().is_some_and(|key| {
+                    lease_set.public_keys.iter().any(|public_key| {
+                        AsRef::<[u8]>::as_ref(public_key) == AsRef::<[u8]>::as_ref(key)
+                    })
+                });
+
+                if !static_key_matches {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        local = %self.destination_id,
+                        remote = %destination_id,
+                        "static key of `NewSession` doesn't match the bundled lease set",
+                    );
+                    return Err(SessionError::InvalidKey);
+                }
+
                 match self.pending.get_mut(&destination_id) {
                     None => {
                         tracing::debug!(
@@ -805,6 +832,18 @@ impl<R: Runtime> SessionManager<R> {
                                 self.key_context.clone(),
                             ),
                         );
+
+                        // reply on our own if the upper protocol layer doesn't do it in time
+                        let remote = destination_id.clone();
+                        self.nsr_timers.push(async move {
+                            R::delay(NSR_RESPONSE_INTERVAL).await;
+
+                            remote
+                        });
+
+                        if let Some(waker) = self.waker.take() {
+                            waker.wake_by_ref();
+                        }
                     }
                     Some(_) => tracing::trace!(
                         target: LOG_TARGET,
@@ -1019,7 +1058,10 @@ impl<R: Runtime> SessionManager<R> {
                     %remote,
                     "purging expired pending session",
                 );
-                self.pending.remove(&remote);
+
+                if let Some(session) = self.pending.remove(&remote) {
+                    session.destroy();
+                }
             });
 
         self.active
@@ -1093,6 +1135,44 @@ impl<R: Runtime> Stream for SessionManager<R> {
         }
 
         loop {
+            match self.nsr_timers.poll_next_unpin(cx) {
+                Poll::Pending => break,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(destination_id)) => {
+                    let ratchet_threshold = self.ratchet_threshold;
+                    let Some(session) = self.pending.get_mut(&destination_id) else {
+                        continue;
+                    };
+
+                    match session.create_empty_new_session_reply(ratchet_threshold) {
+                        Ok(None) => continue,
+                        Ok(Some(message)) => {
+                            let mut out = BytesMut::with_capacity(message.len() + 4);
+
+                            out.put_u32(message.len() as u32);
+                            out.put_slice(&message);
+
+                            return Poll::Ready(Some(SessionManagerEvent::SendMessage {
+                                destination_id,
+                                message: out.freeze().to_vec(),
+                            }));
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                local = %self.destination_id,
+                                remote = %destination_id,
+                                ?error,
+                                "failed to create `NewSessionReply` without payload",
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        loop {
             match self.protocol_response_timers.poll_next_unpin(cx) {
                 Poll::Pending => break,
                 Poll::Ready(None) => return Poll::Ready(None),
@@ -1135,6 +1215,261 @@ mod tests {
     use zeroize::Zeroize;
 
     const TEST_THRESHOLD: u16 = 10;
+
+    #[tokio::test]
+    async fn new_session_rejected_on_static_key_mismatch_x25519() {
+        new_session_rejected_on_static_key_mismatch(
+            StaticPrivateKey::random(MockRuntime::rng()),
+            StaticPrivateKey::random(MockRuntime::rng()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn new_session_rejected_on_static_key_mismatch_ml_kem_768() {
+        new_session_rejected_on_static_key_mismatch(
+            StaticPrivateKey::random_ml_kem_768(MockRuntime::rng()),
+            StaticPrivateKey::random_ml_kem_768(MockRuntime::rng()),
+        )
+        .await
+    }
+
+    // `NewSession` whose bundled lease set advertises encryption keys other than the static key
+    // used for the session must be rejected
+    async fn new_session_rejected_on_static_key_mismatch(
+        private_key: StaticPrivateKey,
+        outbound_private_key: StaticPrivateKey,
+    ) {
+        let public_key = private_key.public();
+        let destination_id = DestinationId::random();
+        let (mut leaseset, signing_key) = LeaseSet2::random();
+        leaseset.public_keys = vec![public_key.clone()];
+        let leaseset = Bytes::from(leaseset.serialize(&signing_key));
+        let mut session = SessionManager::<MockRuntime>::new(
+            destination_id.clone(),
+            private_key,
+            vec![public_key.clone()],
+            leaseset,
+        );
+
+        // outbound session bundles a lease set with random, unrelated encryption keys
+        let (outbound_leaseset, outbound_destination_id) = {
+            let (leaseset, signing_key) = LeaseSet2::random();
+            let outbound_destination_id = leaseset.header.destination.id();
+
+            (
+                Bytes::from(leaseset.serialize(&signing_key)),
+                outbound_destination_id,
+            )
+        };
+        let mut outbound_session = SessionManager::<MockRuntime>::new(
+            outbound_destination_id.clone(),
+            outbound_private_key.clone(),
+            vec![outbound_private_key.public()],
+            outbound_leaseset,
+        );
+        outbound_session.add_remote_destination(destination_id.clone(), public_key);
+        let message = outbound_session.encrypt(&destination_id, vec![1, 2, 3, 4]).unwrap();
+
+        match session.decrypt(Message {
+            payload: message,
+            ..Default::default()
+        }) {
+            Err(SessionError::InvalidKey) => {}
+            Ok(_) => panic!("session accepted"),
+            Err(error) => panic!("unexpected error: {error:?}"),
+        }
+
+        assert!(session.pending.is_empty());
+        assert!(session.garlic_tags.read().is_empty());
+    }
+
+    /// Create inbound and outbound session managers with consistent lease sets and send the
+    /// first `NewSession` from the outbound to the inbound manager.
+    fn create_session_pair_with_pending_ns() -> (
+        SessionManager<MockRuntime>,
+        DestinationId,
+        SessionManager<MockRuntime>,
+        DestinationId,
+    ) {
+        let private_key = StaticPrivateKey::random(MockRuntime::rng());
+        let outbound_private_key = StaticPrivateKey::random(MockRuntime::rng());
+        let public_key = private_key.public();
+        let destination_id = DestinationId::random();
+        let (mut leaseset, signing_key) = LeaseSet2::random();
+        leaseset.public_keys = vec![public_key.clone()];
+        let leaseset = Bytes::from(leaseset.serialize(&signing_key));
+        let mut session = SessionManager::<MockRuntime>::new(
+            destination_id.clone(),
+            private_key,
+            vec![public_key.clone()],
+            leaseset,
+        );
+
+        let (outbound_leaseset, outbound_destination_id) = {
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
+            let outbound_destination_id = leaseset.header.destination.id();
+
+            (
+                Bytes::from(leaseset.serialize(&signing_key)),
+                outbound_destination_id,
+            )
+        };
+        let mut outbound_session = SessionManager::<MockRuntime>::new(
+            outbound_destination_id.clone(),
+            outbound_private_key.clone(),
+            vec![outbound_private_key.public()],
+            outbound_leaseset,
+        );
+        outbound_session.add_remote_destination(destination_id.clone(), public_key);
+
+        let message = outbound_session.encrypt(&destination_id, vec![1, 2, 3, 4]).unwrap();
+        let _ = session
+            .decrypt(Message {
+                payload: message,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(session.pending.contains_key(&outbound_destination_id));
+
+        (session, destination_id, outbound_session, outbound_destination_id)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_session_reply_sent_without_application_reply() {
+        let (mut session, destination_id, mut outbound_session, outbound_destination_id) =
+            create_session_pair_with_pending_ns();
+
+        // the application never replies, the session manager sends an NSR without payload
+        let event = tokio::time::timeout(Duration::from_secs(5), session.next())
+            .await
+            .expect("timeout")
+            .expect("stream ended");
+        let SessionManagerEvent::SendMessage {
+            destination_id: remote,
+            message,
+        } = event
+        else {
+            panic!("unexpected event");
+        };
+        assert_eq!(remote, outbound_destination_id);
+
+        // outbound side accepts the reply, it contains no application data
+        let cloves = outbound_session
+            .decrypt(Message {
+                payload: message,
+                ..Default::default()
+            })
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert!(cloves.iter().all(|clove| !std::matches!(clove.message_type, MessageType::Data)));
+
+        // the session is usable in both directions
+        let message = outbound_session.encrypt(&destination_id, vec![5, 6, 7, 8]).unwrap();
+        assert_eq!(
+            session
+                .decrypt(Message {
+                    payload: message,
+                    ..Default::default()
+                })
+                .unwrap()
+                .find(|clove| std::matches!(clove.message_type, MessageType::Data))
+                .unwrap()
+                .message_body,
+            [0, 0, 0, 4, 5, 6, 7, 8]
+        );
+        assert!(session.active.contains_key(&outbound_destination_id));
+        assert!(outbound_session.active.contains_key(&destination_id));
+
+        let message = session.encrypt(&outbound_destination_id, vec![9, 9, 9]).unwrap();
+        assert_eq!(
+            outbound_session
+                .decrypt(Message {
+                    payload: message,
+                    ..Default::default()
+                })
+                .unwrap()
+                .find(|clove| std::matches!(clove.message_type, MessageType::Data))
+                .unwrap()
+                .message_body,
+            [0, 0, 0, 3, 9, 9, 9]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_empty_new_session_reply_after_application_reply() {
+        let (mut session, _destination_id, _outbound_session, outbound_destination_id) =
+            create_session_pair_with_pending_ns();
+
+        // the application replies before the timer expires
+        let _ = session.encrypt(&outbound_destination_id, vec![1, 2, 3, 4]).unwrap();
+
+        // the timer expires but no additional reply is sent
+        assert!(tokio::time::timeout(Duration::from_secs(5), session.next()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_pending_sessions_release_garlic_tags() {
+        let private_key = StaticPrivateKey::random(MockRuntime::rng());
+        let outbound_private_key = StaticPrivateKey::random(MockRuntime::rng());
+        let public_key = private_key.public();
+        let destination_id = DestinationId::random();
+        let (mut leaseset, signing_key) = LeaseSet2::random();
+        leaseset.public_keys = vec![public_key.clone()];
+        let leaseset = Bytes::from(leaseset.serialize(&signing_key));
+        let mut session = SessionManager::<MockRuntime>::new(
+            destination_id.clone(),
+            private_key,
+            vec![public_key.clone()],
+            leaseset,
+        );
+
+        let (outbound_leaseset, outbound_destination_id) = {
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
+            let outbound_destination_id = leaseset.header.destination.id();
+
+            (
+                Bytes::from(leaseset.serialize(&signing_key)),
+                outbound_destination_id,
+            )
+        };
+        let mut outbound_session = SessionManager::<MockRuntime>::new(
+            outbound_destination_id.clone(),
+            outbound_private_key.clone(),
+            vec![outbound_private_key.public()],
+            outbound_leaseset,
+        );
+        outbound_session.add_remote_destination(destination_id.clone(), public_key);
+
+        // NS registers the NSR tags of the outbound pending session
+        let message = outbound_session.encrypt(&destination_id, vec![1, 2, 3, 4]).unwrap();
+        assert_eq!(outbound_session.garlic_tags.read().len(), 16);
+
+        // NSR registers the ES tags of the inbound pending session
+        let _ = session
+            .decrypt(Message {
+                payload: message,
+                ..Default::default()
+            })
+            .unwrap();
+        let _ = session.encrypt(&outbound_destination_id, vec![1, 2, 3, 4]).unwrap();
+        assert_eq!(session.garlic_tags.read().len(), NUM_TAGS_TO_GENERATE);
+
+        // neither side ever hears back, both pending sessions expire and release their tags
+        let expired = MockRuntime::now().subtract(Duration::from_secs(6 * 60));
+        session.pending.get_mut(&outbound_destination_id).unwrap().set_created(expired);
+        outbound_session.pending.get_mut(&destination_id).unwrap().set_created(expired);
+
+        session.maintain();
+        outbound_session.maintain();
+
+        assert!(session.pending.is_empty());
+        assert!(outbound_session.pending.is_empty());
+        assert!(session.garlic_tags.read().is_empty());
+        assert!(outbound_session.garlic_tags.read().is_empty());
+    }
 
     /// Decrypt `message` using `session` and verify the inbound `Data` message
     /// inside the garlic message matches `diff`
@@ -1198,7 +1533,8 @@ mod tests {
     ) {
         let public_key = private_key.public();
         let destination_id = DestinationId::random();
-        let (leaseset, signing_key) = LeaseSet2::random();
+        let (mut leaseset, signing_key) = LeaseSet2::random();
+        leaseset.public_keys = vec![public_key.clone()];
         let leaseset = Bytes::from(leaseset.serialize(&signing_key));
         let mut session = SessionManager::<MockRuntime>::new(
             destination_id.clone(),
@@ -1209,7 +1545,8 @@ mod tests {
 
         // create outbound `SessionManager`
         let (outbound_leaseset, outbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let outbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -1327,7 +1664,8 @@ mod tests {
     ) {
         let public_key = private_key.public();
         let destination_id = DestinationId::random();
-        let (leaseset, signing_key) = LeaseSet2::random();
+        let (mut leaseset, signing_key) = LeaseSet2::random();
+        leaseset.public_keys = vec![public_key.clone()];
         let leaseset = Bytes::from(leaseset.serialize(&signing_key));
         let mut session = SessionManager::<MockRuntime>::new(
             destination_id.clone(),
@@ -1338,7 +1676,8 @@ mod tests {
 
         // create outbound `SessionManager`
         let (outbound_leaseset, outbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let outbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -1500,7 +1839,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -1517,7 +1857,8 @@ mod tests {
 
         // create outbound `SessionManager`
         let (outbound_leaseset, outbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let outbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -1659,7 +2000,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -1676,7 +2018,8 @@ mod tests {
 
         // create first outbound `SessionManager`
         let (outbound1_leaseset, outbound1_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound1_private_key.public()];
             let outbound1_destination_id = leaseset.header.destination.id();
 
             (
@@ -1695,7 +2038,8 @@ mod tests {
 
         // create second outbound `SessionManager`
         let (outbound2_leaseset, outbound2_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound2_private_key.public()];
             let outbound2_destination_id = leaseset.header.destination.id();
 
             (
@@ -1933,7 +2277,8 @@ mod tests {
         // create first inbound `SessionManager`
         let inbound1_public_key = inbound1_private_key.public();
         let (inbound1_leaseset, inbound1_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound1_private_key.public()];
             let inbound1_destination_id = leaseset.header.destination.id();
 
             (
@@ -1951,7 +2296,8 @@ mod tests {
         // create second inbound `SessionManager`
         let inbound2_public_key = inbound2_private_key.public();
         let (inbound2_leaseset, inbound2_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound2_private_key.public()];
             let inbound2_destination_id = leaseset.header.destination.id();
 
             (
@@ -1968,7 +2314,8 @@ mod tests {
 
         // create outbound `SessionManager`
         let (outbound_leaseset, outbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let outbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -2170,7 +2517,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -2187,7 +2535,8 @@ mod tests {
 
         // create outbound `SessionManager`
         let (outbound_leaseset, outbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let outbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -2330,7 +2679,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -2348,7 +2698,8 @@ mod tests {
 
         // create outbound `SessionManager`
         let (outbound_leaseset, outbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let outbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -2511,7 +2862,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -2533,7 +2885,8 @@ mod tests {
             outbound_destination,
             outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -2780,7 +3133,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -2802,7 +3156,8 @@ mod tests {
             outbound_destination,
             outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -3059,7 +3414,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -3081,7 +3437,8 @@ mod tests {
             _outbound_destination,
             _outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -3176,7 +3533,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -3198,7 +3556,8 @@ mod tests {
             _outbound_destination,
             _outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -3291,7 +3650,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -3313,7 +3673,8 @@ mod tests {
             _outbound_destination,
             _outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -3413,7 +3774,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -3435,7 +3797,8 @@ mod tests {
             _outbound_destination,
             _outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -3521,7 +3884,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -3543,7 +3907,8 @@ mod tests {
             _outbound_destination,
             _outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -3631,7 +3996,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -3653,7 +4019,8 @@ mod tests {
             _outbound_destination,
             _outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -3738,7 +4105,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -3760,7 +4128,8 @@ mod tests {
             outbound_destination,
             outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -3933,7 +4302,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -3955,7 +4325,8 @@ mod tests {
             outbound_destination,
             outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -4107,7 +4478,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -4130,7 +4502,8 @@ mod tests {
             _outbound_destination,
             _outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -4274,7 +4647,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -4297,7 +4671,8 @@ mod tests {
             _outbound_destination,
             _outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -4420,7 +4795,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -4443,7 +4819,8 @@ mod tests {
             outbound_destination,
             outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 
@@ -4763,7 +5140,8 @@ mod tests {
         let private_key = StaticPrivateKey::random(MockRuntime::rng());
         let public_key = private_key.public();
         let destination_id = DestinationId::random();
-        let (leaseset, signing_key) = LeaseSet2::random();
+        let (mut leaseset, signing_key) = LeaseSet2::random();
+        leaseset.public_keys = vec![private_key.public()];
         let leaseset = Bytes::from(leaseset.serialize(&signing_key));
         let mut session = SessionManager::<MockRuntime>::new(
             destination_id.clone(),
@@ -4791,7 +5169,8 @@ mod tests {
         let private_key = StaticPrivateKey::random(MockRuntime::rng());
         let public_key = private_key.public();
         let destination_id = DestinationId::random();
-        let (leaseset, signing_key) = LeaseSet2::random();
+        let (mut leaseset, signing_key) = LeaseSet2::random();
+        leaseset.public_keys = vec![private_key.public()];
         let leaseset = Bytes::from(leaseset.serialize(&signing_key));
         let mut session = SessionManager::<MockRuntime>::new(
             destination_id.clone(),
@@ -4823,7 +5202,8 @@ mod tests {
         let private_key = StaticPrivateKey::random(MockRuntime::rng());
         let public_key = private_key.public();
         let destination_id = DestinationId::random();
-        let (leaseset, signing_key) = LeaseSet2::random();
+        let (mut leaseset, signing_key) = LeaseSet2::random();
+        leaseset.public_keys = vec![private_key.public()];
         let leaseset = Bytes::from(leaseset.serialize(&signing_key));
         let mut session = SessionManager::<MockRuntime>::new(
             destination_id.clone(),
@@ -4899,7 +5279,8 @@ mod tests {
         // create inbound `SessionManager`
         let inbound_public_key = inbound_private_key.public();
         let (inbound_leaseset, inbound_destination_id) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![inbound_public_key.clone()];
             let inbound_destination_id = leaseset.header.destination.id();
 
             (
@@ -4921,7 +5302,8 @@ mod tests {
             _outbound_destination,
             _outbound_signing_key,
         ) = {
-            let (leaseset, signing_key) = LeaseSet2::random();
+            let (mut leaseset, signing_key) = LeaseSet2::random();
+            leaseset.public_keys = vec![outbound_private_key.public()];
             let destination = leaseset.header.destination.clone();
             let outbound_destination_id = leaseset.header.destination.id();
 

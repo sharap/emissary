@@ -199,6 +199,9 @@ pub struct PendingSession<R: Runtime> {
     /// ID of the remote destination.
     remote: DestinationId,
 
+    /// Has a `NewSessionReply` been sent for an inbound session.
+    nsr_sent: bool,
+
     /// State of the session.
     state: PendingSessionState<R>,
 }
@@ -217,6 +220,7 @@ impl<R: Runtime> PendingSession<R> {
             key_context,
             local,
             remote,
+            nsr_sent: false,
             state: PendingSessionState::InboundActive {
                 inbound: Box::new(inbound),
                 tag_set_entries: HashMap::new(),
@@ -253,6 +257,7 @@ impl<R: Runtime> PendingSession<R> {
             key_context,
             local,
             remote,
+            nsr_sent: false,
             state: PendingSessionState::AwaitingNsr {
                 outbound: HashMap::from_iter([(0usize, outbound)]),
                 remote_public_key,
@@ -268,48 +273,28 @@ impl<R: Runtime> PendingSession<R> {
         self.created.elapsed() > PENDING_SESSION_MAX_AGE
     }
 
-    /// Advance the state of [`PendingSession`] with an outbound `message`.
-    ///
-    /// TODO: more documentation
-    pub fn advance_outbound(
+    /// Override the creation time of the session.
+    #[cfg(test)]
+    pub fn set_created(&mut self, created: R::Instant) {
+        self.created = created;
+    }
+
+    /// Create `NewSessionReply` for an inbound session from `payload`, a serialized garlic
+    /// message, register the receive tags of the session and return the serialized reply.
+    fn transmit_new_session_reply(
         &mut self,
-        lease_set: Bytes,
-        message: Vec<u8>,
+        payload: Vec<u8>,
         ratchet_threshold: u16,
-    ) -> Result<PendingSessionEvent<R>, SessionError> {
+    ) -> Result<Vec<u8>, SessionError> {
         match mem::replace(&mut self.state, PendingSessionState::Poisoned) {
             PendingSessionState::InboundActive {
                 mut inbound,
                 mut tag_set_entries,
                 garlic_tags,
             } => {
-                tracing::trace!(
-                    target: LOG_TARGET,
-                    local = %self.local,
-                    remote = %self.remote,
-                    "send NSR",
-                );
-
-                let hash = self.remote.to_vec();
-                let message = GarlicMessageBuilder::default()
-                    .with_garlic_clove(
-                        MessageType::Data,
-                        MessageId::from(R::rng().next_u32()),
-                        R::time_since_epoch() + I2NP_MESSAGE_EXPIRATION,
-                        GarlicDeliveryInstructions::Destination { hash: &hash },
-                        &{
-                            let mut out = BytesMut::with_capacity(message.len() + 4);
-
-                            out.put_u32(message.len() as u32);
-                            out.put_slice(&message);
-                            out
-                        },
-                    )
-                    .build();
-
                 // create `NewSessionReply` and garlic receive tags
                 let (message, entries) =
-                    inbound.create_new_session_reply(message, ratchet_threshold)?;
+                    inbound.create_new_session_reply(payload, ratchet_threshold)?;
 
                 // store receive garlic tags both in the global storage common for all destinations
                 // so `SessionManager` can dispatch received messages to the correct `Session` and
@@ -329,9 +314,124 @@ impl<R: Runtime> PendingSession<R> {
                     tag_set_entries,
                     garlic_tags,
                 };
+                self.nsr_sent = true;
 
-                Ok(PendingSessionEvent::SendMessage { message })
+                Ok(message)
             }
+            state => {
+                self.state = state;
+                Err(SessionError::InvalidState)
+            }
+        }
+    }
+
+    /// Create `NewSessionReply` without application payload.
+    ///
+    /// Called if the upper protocol layer hasn't replied to the `NewSession` in time so the remote
+    /// destination still learns our ephemeral key and the session can be completed.
+    ///
+    /// Returns `None` if a reply has already been sent or the session is not an inbound session.
+    pub fn create_empty_new_session_reply(
+        &mut self,
+        ratchet_threshold: u16,
+    ) -> Result<Option<Vec<u8>>, SessionError> {
+        if self.nsr_sent || !core::matches!(self.state, PendingSessionState::InboundActive { .. })
+        {
+            return Ok(None);
+        }
+
+        tracing::trace!(
+            target: LOG_TARGET,
+            local = %self.local,
+            remote = %self.remote,
+            "send NSR without payload",
+        );
+
+        let message = GarlicMessageBuilder::default()
+            .with_date_time(R::time_since_epoch().as_secs() as u32)
+            .build();
+
+        self.transmit_new_session_reply(message, ratchet_threshold).map(Some)
+    }
+
+    /// Destroy pending session and remove all garlic tags it has registered.
+    pub fn destroy(self) {
+        let Self { remote, state, .. } = self;
+
+        let (garlic_tags, tags) = match state {
+            PendingSessionState::InboundActive {
+                garlic_tags,
+                tag_set_entries,
+                ..
+            } => (garlic_tags, tag_set_entries.into_keys().collect::<Vec<_>>()),
+            PendingSessionState::AwaitingNsr {
+                garlic_tags,
+                nsr_tag_set_entries,
+                tag_set_entries,
+                ..
+            }
+            | PendingSessionState::AwaitingEsTransmit {
+                garlic_tags,
+                nsr_tag_set_entries,
+                tag_set_entries,
+                ..
+            } => (
+                garlic_tags,
+                nsr_tag_set_entries.into_keys().chain(tag_set_entries.into_keys()).collect(),
+            ),
+            PendingSessionState::Poisoned => return,
+        };
+
+        let mut inner = garlic_tags.write();
+
+        // only remove tags that still belong to this session
+        tags.into_iter().for_each(|tag| {
+            if inner.get(&tag) == Some(&remote) {
+                inner.remove(&tag);
+            }
+        });
+    }
+
+    /// Advance the state of [`PendingSession`] with an outbound `message`.
+    ///
+    /// TODO: more documentation
+    pub fn advance_outbound(
+        &mut self,
+        lease_set: Bytes,
+        message: Vec<u8>,
+        ratchet_threshold: u16,
+    ) -> Result<PendingSessionEvent<R>, SessionError> {
+        if core::matches!(self.state, PendingSessionState::InboundActive { .. }) {
+            tracing::trace!(
+                target: LOG_TARGET,
+                local = %self.local,
+                remote = %self.remote,
+                "send NSR",
+            );
+
+            let hash = self.remote.to_vec();
+            let message = GarlicMessageBuilder::default()
+                .with_garlic_clove(
+                    MessageType::Data,
+                    MessageId::from(R::rng().next_u32()),
+                    R::time_since_epoch() + I2NP_MESSAGE_EXPIRATION,
+                    GarlicDeliveryInstructions::Destination { hash: &hash },
+                    &{
+                        let mut out = BytesMut::with_capacity(message.len() + 4);
+
+                        out.put_u32(message.len() as u32);
+                        out.put_slice(&message);
+                        out
+                    },
+                )
+                .build();
+            let message = self.transmit_new_session_reply(message, ratchet_threshold)?;
+
+            return Ok(PendingSessionEvent::SendMessage { message });
+        }
+
+        match mem::replace(&mut self.state, PendingSessionState::Poisoned) {
+            PendingSessionState::InboundActive { .. } => unreachable!("handled above"),
             PendingSessionState::AwaitingNsr {
                 garlic_tags,
                 mut outbound,

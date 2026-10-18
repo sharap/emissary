@@ -257,6 +257,19 @@ impl<R: Runtime> InboundSession<R> {
         }
     }
 
+    /// Get remote destination's static public key.
+    ///
+    /// Returns `None` if the session is no longer awaiting the first `NewSessionReply` to be sent.
+    pub fn remote_static_public_key(&self) -> Option<&StaticPublicKey> {
+        match &self.state {
+            InboundSessionState::AwaitingNewSessionReplyTransmit {
+                remote_static_public_key,
+                ..
+            } => Some(remote_static_public_key),
+            _ => None,
+        }
+    }
+
     /// Create NSR message.
     pub fn create_new_session_reply(
         &mut self,
