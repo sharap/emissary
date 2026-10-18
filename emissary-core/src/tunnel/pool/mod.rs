@@ -232,6 +232,16 @@ pub struct TunnelPool<R: Runtime, S: TunnelSelector + HopSelector> {
     /// Tunnel/hop selector for the tunnel pool.
     selector: S,
 
+    /// Inbound tunnels (IBGW `TunnelId`) whose latest tunnel test failed.
+    ///
+    /// Tunnel is retired if the next test fails as well.
+    test_failed_inbound: HashSet<TunnelId>,
+
+    /// Outbound tunnels whose latest tunnel test failed.
+    ///
+    /// Tunnel is retired if the next test fails as well.
+    test_failed_outbound: HashSet<TunnelId>,
+
     /// RX channel for receiving a shutdown signal from the pool's owner.
     shutdown_rx: Option<oneshot::Receiver<()>>,
 
@@ -288,6 +298,8 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> TunnelPool<R, S> {
                 num_tunnel_build_failures: 0usize,
                 num_tunnels_built: 0usize,
                 router_ctx,
+                test_failed_inbound: HashSet::new(),
+                test_failed_outbound: HashSet::new(),
                 pending_tests: R::join_set(),
                 subsystem_handle,
                 selector,
@@ -837,6 +849,132 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> TunnelPool<R, S> {
     }
 }
 
+impl<R: Runtime, S: TunnelSelector + HopSelector> TunnelPool<R, S> {
+    /// Remove outbound tunnel from the pool and inform the pool's owner.
+    fn remove_outbound_tunnel(&mut self, tunnel_id: TunnelId) {
+        self.outbound.remove(&tunnel_id);
+        self.expiring_outbound.remove(&tunnel_id);
+        self.test_failed_outbound.remove(&tunnel_id);
+        self.selector.remove_outbound_tunnel(&tunnel_id);
+        self.router_ctx.metrics_handle().gauge(NUM_OUTBOUND_TUNNELS).decrement(1);
+
+        // inform the owner of the tunnel pool that an outbound tunnel has expired
+        if let Err(error) = self.context.register_outbound_tunnel_expired(tunnel_id) {
+            tracing::warn!(
+                target: LOG_TARGET,
+                name = %self.config.name,
+                %tunnel_id,
+                ?error,
+                "failed to register expired outbound tunnel to owner",
+            );
+        }
+    }
+
+    /// Retire inbound tunnel identified by its gateway's `TunnelId`.
+    ///
+    /// The tunnel is removed from the pool, from the routing table and from the pool owner's
+    /// lease set. The event loop of the tunnel is left to expire on its own.
+    fn retire_inbound_tunnel(&mut self, gateway_tunnel_id: TunnelId) {
+        let Some((tunnel_id, _)) = self.inbound_tunnels.remove(&gateway_tunnel_id) else {
+            return;
+        };
+
+        self.expiring_inbound.remove(&gateway_tunnel_id);
+        self.test_failed_inbound.remove(&gateway_tunnel_id);
+        self.subsystem_handle.remove_tunnel(&tunnel_id);
+        self.selector.remove_inbound_tunnel(&gateway_tunnel_id);
+        self.router_ctx.metrics_handle().gauge(NUM_INBOUND_TUNNELS).decrement(1);
+
+        if let Err(error) = self.context.register_inbound_tunnel_expired(gateway_tunnel_id) {
+            tracing::warn!(
+                target: LOG_TARGET,
+                name = %self.config.name,
+                %gateway_tunnel_id,
+                ?error,
+                "failed to register retired inbound tunnel to owner",
+            );
+        }
+    }
+
+    /// Handle failed tunnel test for an outbound tunnel.
+    ///
+    /// A tunnel is retired after two consecutive failed tests, same as i2pd does. Tunnels that
+    /// are already expiring are left alone as a replacement is being built for them anyway.
+    fn on_outbound_tunnel_test_failed(&mut self, tunnel_id: TunnelId) {
+        if self.expiring_outbound.contains(&tunnel_id) || !self.outbound.contains_key(&tunnel_id) {
+            return;
+        }
+
+        if !self.test_failed_outbound.remove(&tunnel_id) {
+            self.test_failed_outbound.insert(tunnel_id);
+            return;
+        }
+
+        tracing::info!(
+            target: LOG_TARGET,
+            name = %self.config.name,
+            %tunnel_id,
+            "retiring outbound tunnel after consecutive failed tunnel tests",
+        );
+        self.remove_outbound_tunnel(tunnel_id);
+    }
+
+    /// Handle failed tunnel test for an inbound tunnel identified by its gateway's `TunnelId`.
+    ///
+    /// See [`TunnelPool::on_outbound_tunnel_test_failed()`].
+    fn on_inbound_tunnel_test_failed(&mut self, gateway_tunnel_id: TunnelId) {
+        if self.expiring_inbound.contains(&gateway_tunnel_id)
+            || !self.inbound_tunnels.contains_key(&gateway_tunnel_id)
+        {
+            return;
+        }
+
+        if !self.test_failed_inbound.remove(&gateway_tunnel_id) {
+            self.test_failed_inbound.insert(gateway_tunnel_id);
+            return;
+        }
+
+        tracing::info!(
+            target: LOG_TARGET,
+            name = %self.config.name,
+            %gateway_tunnel_id,
+            "retiring inbound tunnel after consecutive failed tunnel tests",
+        );
+        self.retire_inbound_tunnel(gateway_tunnel_id);
+    }
+}
+
+/// Select a tunnel from `tunnels` for sending a message.
+///
+/// Tunnels that are about to expire are avoided if any other tunnel is available and the tunnel
+/// is selected at random so that traffic is spread over all tunnels of the pool.
+fn select_tunnel<'a, R: Runtime, T>(
+    tunnels: &'a HashMap<TunnelId, T>,
+    expiring: &HashSet<TunnelId>,
+) -> Option<(TunnelId, &'a T)> {
+    let num_active = tunnels.keys().filter(|tunnel_id| !expiring.contains(*tunnel_id)).count();
+    let (num_candidates, allow_expiring) = match num_active {
+        0 => (tunnels.len(), true),
+        num_active => (num_active, false),
+    };
+
+    if num_candidates == 0 {
+        return None;
+    }
+
+    let index = {
+        use rand::RngExt;
+
+        R::rng().random_range(0..num_candidates)
+    };
+
+    tunnels
+        .iter()
+        .filter(|(tunnel_id, _)| allow_expiring || !expiring.contains(*tunnel_id))
+        .nth(index)
+        .map(|(tunnel_id, tunnel)| (*tunnel_id, tunnel))
+}
+
 impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
     type Output = ();
 
@@ -993,6 +1131,11 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
             match event {
                 None => return Poll::Ready(()),
                 Some((tunnel_id, gateway_tunnel_id)) => {
+                    // tunnel may have been retired earlier after failed tunnel tests
+                    if !self.inbound_tunnels.contains_key(&gateway_tunnel_id) {
+                        continue;
+                    }
+
                     tracing::info!(
                         target: LOG_TARGET,
                         name = %self.config.name,
@@ -1106,8 +1249,9 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
                         tunnel_id,
                         message,
                     } => {
-                        // TODO: needs to be fairer
-                        let Some((outbound_gateway, tunnel)) = self.outbound.iter().next() else {
+                        let Some((outbound_gateway, tunnel)) =
+                            select_tunnel::<R, _>(&self.outbound, &self.expiring_outbound)
+                        else {
                             tracing::warn!(
                                 target: LOG_TARGET,
                                 name = %self.config.name,
@@ -1150,8 +1294,11 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
                         message,
                     } => {
                         let (outbound_gateway, tunnel) = match outbound_tunnel {
-                            None => match self.outbound.iter().next() {
-                                Some((obgw_tunnel_id, tunnel)) => (*obgw_tunnel_id, tunnel),
+                            None => match select_tunnel::<R, _>(
+                                &self.outbound,
+                                &self.expiring_outbound,
+                            ) {
+                                Some((obgw_tunnel_id, tunnel)) => (obgw_tunnel_id, tunnel),
                                 None => {
                                     tracing::warn!(
                                         target: LOG_TARGET,
@@ -1171,9 +1318,10 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
                                     );
                                     debug_assert!(false);
 
-                                    let Some((outbound_gateway, tunnel)) =
-                                        self.outbound.iter().next()
-                                    else {
+                                    let Some((outbound_gateway, tunnel)) = select_tunnel::<R, _>(
+                                        &self.outbound,
+                                        &self.expiring_outbound,
+                                    ) else {
                                         tracing::warn!(
                                             target: LOG_TARGET,
                                             name = %self.config.name,
@@ -1182,7 +1330,7 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
                                         continue;
                                     };
 
-                                    (*outbound_gateway, tunnel)
+                                    (outbound_gateway, tunnel)
                                 }
                             },
                         };
@@ -1215,8 +1363,11 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
                         message,
                     } => {
                         let (outbound_gateway, tunnel) = match outbound_tunnel {
-                            None => match self.outbound.iter().next() {
-                                Some((obgw_tunnel_id, tunnel)) => (*obgw_tunnel_id, tunnel),
+                            None => match select_tunnel::<R, _>(
+                                &self.outbound,
+                                &self.expiring_outbound,
+                            ) {
+                                Some((obgw_tunnel_id, tunnel)) => (obgw_tunnel_id, tunnel),
                                 None => {
                                     tracing::warn!(
                                         target: LOG_TARGET,
@@ -1236,9 +1387,10 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
                                     );
                                     debug_assert!(false);
 
-                                    let Some((outbound_gateway, tunnel)) =
-                                        self.outbound.iter().next()
-                                    else {
+                                    let Some((outbound_gateway, tunnel)) = select_tunnel::<R, _>(
+                                        &self.outbound,
+                                        &self.expiring_outbound,
+                                    ) else {
                                         tracing::warn!(
                                             target: LOG_TARGET,
                                             name = %self.config.name,
@@ -1247,7 +1399,7 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
                                         continue;
                                     };
 
-                                    (*outbound_gateway, tunnel)
+                                    (outbound_gateway, tunnel)
                                 }
                             },
                         };
@@ -1310,6 +1462,9 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
 
                         self.selector.register_tunnel_test_failure(&outbound, &inbound);
                         self.router_ctx.metrics_handle().counter(NUM_TEST_FAILURES).increment(1);
+
+                        self.on_outbound_tunnel_test_failed(outbound);
+                        self.on_inbound_tunnel_test_failed(inbound);
                     }
                     Ok(elapsed) => {
                         tracing::trace!(
@@ -1323,6 +1478,8 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
 
                         self.selector.register_tunnel_test_success(&outbound, &inbound);
                         self.router_ctx.metrics_handle().counter(NUM_TEST_SUCCESSES).increment(1);
+                        self.test_failed_outbound.remove(&outbound);
+                        self.test_failed_inbound.remove(&inbound);
                         self.router_ctx
                             .metrics_handle()
                             .histogram(TUNNEL_TEST_DURATIONS)
@@ -1348,31 +1505,27 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
             match event {
                 None => return Poll::Ready(()),
                 Some(TunnelTimerEvent::Destroy { tunnel_id }) => {
+                    // tunnel may have been retired earlier after failed tunnel tests
+                    if !self.outbound.contains_key(&tunnel_id) {
+                        continue;
+                    }
+
                     tracing::info!(
                         target: LOG_TARGET,
                         name = %self.config.name,
                         %tunnel_id,
                         "outbound tunnel expired",
                     );
-                    self.outbound.remove(&tunnel_id);
-                    self.expiring_outbound.remove(&tunnel_id);
-                    self.selector.remove_outbound_tunnel(&tunnel_id);
-                    self.router_ctx.metrics_handle().gauge(NUM_OUTBOUND_TUNNELS).decrement(1);
-
-                    // inform the owner of the tunnel pool that an inbound tunnel has expired
-                    if let Err(error) = self.context.register_outbound_tunnel_expired(tunnel_id) {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            name = %self.config.name,
-                            %tunnel_id,
-                            ?error,
-                            "failed to register expired outbound tunnel to owner",
-                        );
-                    }
+                    self.remove_outbound_tunnel(tunnel_id);
                 }
                 Some(TunnelTimerEvent::Rebuild {
                     kind: TunnelKind::Outbound { tunnel_id },
                 }) => {
+                    // tunnel may have been retired earlier after failed tunnel tests
+                    if !self.outbound.contains_key(&tunnel_id) {
+                        continue;
+                    }
+
                     tracing::debug!(
                         target: LOG_TARGET,
                         name = %self.config.name,
@@ -1394,6 +1547,11 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
                 Some(TunnelTimerEvent::Rebuild {
                     kind: TunnelKind::Inbound { tunnel_id },
                 }) => {
+                    // tunnel may have been retired earlier after failed tunnel tests
+                    if !self.inbound_tunnels.contains_key(&tunnel_id) {
+                        continue;
+                    }
+
                     tracing::debug!(
                         target: LOG_TARGET,
                         name = %self.config.name,
@@ -1477,6 +1635,29 @@ impl<R: Runtime, S: TunnelSelector + HopSelector> Future for TunnelPool<R, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn select_tunnel_avoids_expiring_and_spreads_load() {
+        let tunnels = (1..=3u32).map(|i| (TunnelId::from(i), i)).collect::<HashMap<_, _>>();
+        let expiring = HashSet::from_iter([TunnelId::from(3u32)]);
+
+        // expiring tunnel is never selected while active tunnels exist and the active tunnels
+        // are all used
+        let selected = (0..200)
+            .map(|_| select_tunnel::<MockRuntime, _>(&tunnels, &expiring).unwrap().0)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            selected,
+            HashSet::from_iter([TunnelId::from(1u32), TunnelId::from(2u32)])
+        );
+
+        // if all tunnels are expiring, one of them is still selected
+        let expiring = tunnels.keys().copied().collect::<HashSet<_>>();
+        assert!(select_tunnel::<MockRuntime, _>(&tunnels, &expiring).is_some());
+
+        // no tunnels, nothing to select
+        assert!(select_tunnel::<MockRuntime, u32>(&HashMap::new(), &HashSet::new()).is_none());
+    }
     use crate::{
         error::RoutingError,
         events::EventManager,
@@ -3223,6 +3404,234 @@ mod tests {
         // don't route the test message any further and verify the test timeouts
         assert!(tokio::time::timeout(Duration::from_secs(9), &mut tunnel_pool).await.is_err());
         assert_eq!(MockRuntime::get_counter_value(NUM_TEST_FAILURES), Some(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tunnels_retired_after_consecutive_failed_tests() {
+        // create 10 routers and add them to local `ProfileStorage`
+        let mut routers = (0..10)
+            .map(|i| {
+                let transit = TestTransitTunnelManager::new(if i % 2 == 0 { true } else { false });
+
+                (transit.router(), transit)
+            })
+            .collect::<HashMap<_, _>>();
+        let profile_storage = ProfileStorage::<MockRuntime>::from_random(
+            routers.iter().map(|(_, transit)| transit.router_info()).collect(),
+        );
+
+        let pool_config = TunnelPoolConfig {
+            num_inbound: 1usize,
+            num_inbound_hops: 2usize,
+            num_outbound: 1usize,
+            num_outbound_hops: 2usize,
+            ..Default::default()
+        };
+        let (router_info, static_key, signing_key) = RouterInfoBuilder::default().build();
+        let handle = MockRuntime::register_metrics(Vec::new(), None);
+        let SubsystemManagerContext {
+            dial_rx: _dial_rx,
+            handle: subsys_handle,
+            manager,
+            netdb_rx: _netdb_rx,
+            transit_rx: _transport_rx,
+            transport_tx,
+            ..
+        } = SubsystemManager::<MockRuntime>::new(
+            router_info.identity.id(),
+            NoiseContext::new(
+                static_key.clone(),
+                Bytes::from(router_info.identity.id().to_vec()),
+            ),
+            Default::default(),
+            MockRuntime::register_metrics(vec![], None),
+        );
+
+        // spawn subsystem manager in the background
+        tokio::spawn(manager);
+
+        // connect all routers together
+        connect_routers(routers.iter_mut().map(|(_, router)| router));
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let parameters = TunnelPoolBuildParameters::new(pool_config);
+        let pool_handle = parameters.context_handle.clone();
+        let (_event_mgr, _event_subscriber, event_handle) = EventManager::new(None, handle.clone());
+
+        let (mut tunnel_pool, _handle) = TunnelPool::<MockRuntime, _>::new(
+            parameters,
+            ExploratorySelector::new(profile_storage.clone(), pool_handle, false),
+            subsys_handle.clone(),
+            RouterContext::new(
+                handle.clone(),
+                profile_storage,
+                router_info.identity.id(),
+                Bytes::from(router_info.serialize(&signing_key)),
+                static_key,
+                signing_key,
+                2u8,
+                event_handle.clone(),
+            ),
+        );
+
+        assert!(tokio::time::timeout(Duration::from_secs(2), &mut tunnel_pool).await.is_err());
+        assert_eq!(tunnel_pool.pending_outbound.len(), 1);
+
+        // connect all routers
+        let (msg_tx, msg_rx) = channel(128);
+
+        for (router_id, router) in &mut routers {
+            let (tx, rx) = with_recycle(100, OutboundMessageRecycle::default());
+            let conn_tx = msg_tx.clone();
+
+            transport_tx
+                .send(SubsystemEvent::ConnectionEstablished {
+                    router_id: router_id.clone(),
+                    tx,
+                })
+                .await
+                .unwrap();
+            router.connect_router(&router_info.identity.id());
+
+            let router_id = router_id.clone();
+            tokio::spawn(async move {
+                while let Some(message) = rx.recv().await {
+                    match message {
+                        OutboundMessage::Message(message) => {
+                            conn_tx.send((router_id.clone(), message)).await.unwrap();
+                        }
+                        OutboundMessage::MessageWithFeedback(message, tx) => {
+                            tx.send(()).unwrap();
+                            conn_tx.send((router_id.clone(), message)).await.unwrap();
+                        }
+                        OutboundMessage::Messages(_) => panic!("not implemented"),
+                        OutboundMessage::Dummy => unreachable!(),
+                    }
+                }
+            });
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // build one inbound and one outbound tunnel
+        for _ in 0..2 {
+            let (router, message) = msg_rx.try_recv().unwrap();
+
+            // 1st outbound hop
+            let message = match message.message_type {
+                MessageType::Garlic => match routers
+                    .get_mut(&router)
+                    .unwrap()
+                    .garlic()
+                    .handle_message(message)
+                    .unwrap()
+                    .next()
+                {
+                    Some(GarlicDeliveryInstructions::Local { message }) => message,
+                    _ => panic!("invalid delivery instructions"),
+                },
+                _ => message,
+            };
+            let (router, message, tx) =
+                routers.get_mut(&router).unwrap().handle_short_tunnel_build(message).unwrap();
+            if let Some(tx) = tx {
+                let _ = tx.send(());
+            }
+
+            // 2nd outbound hop
+            let (router, message, tx) =
+                routers.get_mut(&router).unwrap().handle_short_tunnel_build(message).unwrap();
+            if let Some(tx) = tx {
+                let _ = tx.send(());
+            }
+
+            subsys_handle.send(&router, message).unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), &mut tunnel_pool)
+                    .await
+                    .is_err()
+            );
+        }
+
+        assert_eq!(tunnel_pool.outbound.len(), 1);
+        assert_eq!(tunnel_pool.inbound.len(), 1);
+        assert_eq!(tunnel_pool.pending_outbound.len(), 0);
+        assert_eq!(tunnel_pool.pending_inbound.len(), 0);
+        assert_eq!(MockRuntime::get_gauge_value(NUM_OUTBOUND_TUNNELS), Some(1));
+        assert_eq!(MockRuntime::get_gauge_value(NUM_INBOUND_TUNNELS), Some(1));
+
+        assert!(tokio::time::timeout(Duration::from_secs(20), &mut tunnel_pool).await.is_err());
+        let (router, message) = msg_rx.try_recv().unwrap();
+
+        // 1st outbound hop (participant)
+        routers
+            .get_mut(&router)
+            .unwrap()
+            .subsystem_handle()
+            .send(&router, message)
+            .unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(250),
+            &mut routers.get_mut(&router).unwrap()
+        )
+        .await
+        .is_err());
+
+        let (router, message) = routers.get_mut(&router).unwrap().select_message().unwrap();
+        assert!(routers.get_mut(&router).unwrap().select_message().is_none());
+
+        // 2nd outbound hop (obep)
+        routers
+            .get_mut(&router)
+            .unwrap()
+            .subsystem_handle()
+            .send(&router, message)
+            .unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(250),
+            &mut routers.get_mut(&router).unwrap()
+        )
+        .await
+        .is_err());
+
+        // don't route the test message any further and verify the test timeouts
+        assert!(tokio::time::timeout(Duration::from_secs(9), &mut tunnel_pool).await.is_err());
+        assert_eq!(MockRuntime::get_counter_value(NUM_TEST_FAILURES), Some(1));
+
+        // one failed test only marks the tunnels, they remain in use
+        assert_eq!(tunnel_pool.outbound.len(), 1);
+        assert_eq!(tunnel_pool.inbound_tunnels.len(), 1);
+        assert_eq!(tunnel_pool.test_failed_outbound.len(), 1);
+        assert_eq!(tunnel_pool.test_failed_inbound.len(), 1);
+        assert_eq!(MockRuntime::get_gauge_value(NUM_OUTBOUND_TUNNELS), Some(1));
+        assert_eq!(MockRuntime::get_gauge_value(NUM_INBOUND_TUNNELS), Some(1));
+
+        // let the next test round fail as well, the message is not routed anywhere
+        assert!(tokio::time::timeout(
+            TUNNEL_TEST_INTERVAL + TUNNEL_TEST_EXPIRATION + Duration::from_secs(2),
+            &mut tunnel_pool
+        )
+        .await
+        .is_err());
+        assert_eq!(MockRuntime::get_counter_value(NUM_TEST_FAILURES), Some(2));
+
+        // both tunnels have been retired after two consecutive failed tests
+        assert!(tunnel_pool.outbound.is_empty());
+        assert!(tunnel_pool.inbound_tunnels.is_empty());
+        assert!(tunnel_pool.test_failed_outbound.is_empty());
+        assert!(tunnel_pool.test_failed_inbound.is_empty());
+        assert_eq!(MockRuntime::get_gauge_value(NUM_OUTBOUND_TUNNELS), Some(0));
+        assert_eq!(MockRuntime::get_gauge_value(NUM_INBOUND_TUNNELS), Some(0));
+
+        // removing the inbound tunnel from the routing table drops the sender of its message
+        // channel which ends the tunnel's event loop
+        assert_eq!(tunnel_pool.inbound.len(), 0);
+
+        // replacements for the retired tunnels are being built
+        assert!(tokio::time::timeout(Duration::from_secs(15), &mut tunnel_pool).await.is_err());
+        assert_eq!(tunnel_pool.pending_outbound.len(), 1);
+        assert_eq!(tunnel_pool.pending_inbound.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
