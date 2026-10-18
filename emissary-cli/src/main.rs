@@ -380,7 +380,7 @@ async fn router_event_loop(
     }
 }
 
-#[cfg(not(feature = "ui"))]
+#[cfg(not(feature = "web-ui"))]
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let (_tx, shutdown_rx) = channel(1);
@@ -396,7 +396,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "ui")]
+#[cfg(feature = "web-ui")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = channel(1);

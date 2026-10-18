@@ -690,5 +690,5 @@ textarea:focus { border-color: var(--em-focus); }
 "#;
 
 /// Script to remove right-click menu from desktop view.
-#[cfg(feature = "dioxus")]
+#[cfg(feature = "native-ui")]
 pub const DESKTOP_HEAD: &str = r#"<script>document.addEventListener('contextmenu',function(e){e.preventDefault();},true);</script>"#;

@@ -29,6 +29,7 @@ use crate::{
     },
 };
 
+#[cfg(feature = "native-ui")]
 use arboard::Clipboard;
 use dioxus::prelude::*;
 use emissary_core::{
@@ -52,6 +53,7 @@ mod bandwidth_monitor;
 mod config;
 mod dashboard;
 mod hidden_services;
+#[cfg(feature = "native-ui")]
 mod native;
 mod settings;
 mod sidebar;
@@ -67,6 +69,7 @@ const LOG_TARGET: &str = "emissary::ui";
 /// UI kind.
 enum UiKind {
     /// Native UI.
+    #[cfg(feature = "native-ui")]
     Native {
         /// Clipboard for UI
         ///
@@ -164,8 +167,10 @@ impl AppState {
             web_ui,
         } = options;
 
-        let ui = if !web_ui {
-            match Clipboard::new() {
+        let ui = match web_ui {
+            true => UiKind::Web,
+            #[cfg(feature = "native-ui")]
+            false => match Clipboard::new() {
                 Ok(clipboard) => UiKind::Native {
                     clipboard: Some(clipboard),
                 },
@@ -178,9 +183,9 @@ impl AppState {
 
                     UiKind::Native { clipboard: None }
                 }
-            }
-        } else {
-            UiKind::Web
+            },
+            #[cfg(not(feature = "native-ui"))]
+            false => UiKind::Web,
         };
 
         Self {
@@ -385,6 +390,7 @@ impl AppState {
     /// Copy value to clipboard.
     pub fn copy_to_clipboard(&mut self, value: &str) {
         match &mut self.ui {
+            #[cfg(feature = "native-ui")]
             UiKind::Native {
                 clipboard: Some(clipboard),
             } =>
@@ -395,6 +401,7 @@ impl AppState {
                         "failed to copy address to clipboard",
                     );
                 },
+            #[cfg(feature = "native-ui")]
             UiKind::Native { .. } => {}
             UiKind::Web => {
                 let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
@@ -735,9 +742,22 @@ pub async fn start(
         web_ui,
     };
 
-    if web_ui {
-        web::start(params).await;
-    } else {
-        native::start(params).await;
+    match web_ui {
+        true => web::start(params).await,
+        #[cfg(feature = "native-ui")]
+        false => native::start(params).await,
+        #[cfg(not(feature = "native-ui"))]
+        false => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                "native ui requested but emissary was built without the `native-ui` feature, starting web ui",
+            );
+
+            web::start(AppOptions {
+                web_ui: true,
+                ..params
+            })
+            .await
+        }
     }
 }

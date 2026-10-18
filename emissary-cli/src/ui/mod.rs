@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "ui")]
+#[cfg(feature = "web-ui")]
 pub mod dioxus;
 
 /// Router status.
