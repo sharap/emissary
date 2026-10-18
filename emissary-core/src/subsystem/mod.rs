@@ -1417,6 +1417,78 @@ mod tests {
         assert!(feedback_rx.await.is_ok());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn outbound_messages_limited_by_bandwidth() {
+        let private_key = StaticPrivateKey::random(MockRuntime::rng());
+        let router_id = RouterId::random();
+        let SubsystemManagerContext {
+            netdb_rx: _netdb_rx,
+            mut manager,
+            handle,
+            transit_rx: _transit_rx,
+            transport_tx: tx,
+            ..
+        } = SubsystemManager::<MockRuntime>::new(
+            router_id.clone(),
+            NoiseContext::new(private_key, Bytes::from(router_id.to_vec())),
+            BandwidthConfig {
+                bandwidth: 1000,
+                share_ratio: 0.5,
+            },
+            MockRuntime::register_metrics(vec![], None),
+        );
+        let router_id = RouterId::random();
+
+        let (msg_tx, msg_rx) = with_recycle(16, OutboundMessageRecycle::default());
+        tx.send(SubsystemEvent::ConnectionEstablished {
+            router_id: router_id.clone(),
+            tx: msg_tx,
+        })
+        .await
+        .unwrap();
+        poll_manager!(manager);
+
+        let message = |message_id: u32| Message {
+            message_id,
+            payload: vec![0xaa; 400],
+            ..Default::default()
+        };
+        let received = |msg_rx: &Receiver<OutboundMessage, OutboundMessageRecycle>| {
+            match msg_rx.try_recv() {
+                Ok(OutboundMessage::Message(message)) => Some(message.message_id),
+                Ok(_) => panic!("invalid message type"),
+                Err(_) => None,
+            }
+        };
+
+        // transit traffic may use half of the budget: the first message fits, the second doesn't
+        let transit = handle.clone().with_source(Source::Transit);
+        transit.send(&router_id, message(1)).unwrap();
+        transit.send(&router_id, message(2)).unwrap();
+        poll_manager!(manager);
+        assert_eq!(received(&msg_rx), Some(1));
+        assert_eq!(received(&msg_rx), None);
+
+        // local traffic may use the rest of the budget plus 10% headroom
+        let client = handle.clone().with_source(Source::Client);
+        client.send(&router_id, message(3)).unwrap();
+        client.send(&router_id, message(4)).unwrap();
+        poll_manager!(manager);
+        assert_eq!(received(&msg_rx), Some(3));
+        assert_eq!(received(&msg_rx), None);
+
+        // a second later the budget is replenished
+        tokio::time::sleep(core::time::Duration::from_millis(1100)).await;
+        poll_manager!(manager);
+
+        transit.send(&router_id, message(5)).unwrap();
+        client.send(&router_id, message(6)).unwrap();
+        poll_manager!(manager);
+        assert_eq!(received(&msg_rx), Some(5));
+        assert_eq!(received(&msg_rx), Some(6));
+        assert_eq!(received(&msg_rx), None);
+    }
+
     #[tokio::test]
     async fn send_pending_messages_to_router() {
         let private_key = StaticPrivateKey::random(MockRuntime::rng());
