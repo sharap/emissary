@@ -16,11 +16,12 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use crate::ui::dioxus::{App, AppOptions};
+use crate::ui::dioxus::{util::load_router_config, App, AppOptions, LOG_TARGET};
 
 use axum::{
     extract::{State, WebSocketUpgrade},
-    response::{Html, IntoResponse},
+    http::{header, HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -28,7 +29,10 @@ use dioxus::prelude::*;
 use dioxus_liveview::{axum_socket, interpreter_glue, LiveViewPool};
 use tokio::net::TcpListener;
 
-use std::sync::{Arc, Mutex};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{Arc, Mutex},
+};
 
 /// Application data.
 struct AppData {
@@ -39,6 +43,12 @@ struct AppData {
 /// Start the web UI.
 pub async fn start(params: AppOptions) {
     let port = params.config.router_ui.as_ref().and_then(|config| config.port).unwrap_or(7657);
+    let host = params
+        .config
+        .router_ui
+        .as_ref()
+        .and_then(|config| config.host)
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let router = Router::new()
         .route("/", get(index_handler))
         .route("/ws", get(ws_handler))
@@ -47,13 +57,60 @@ pub async fn start(params: AppOptions) {
             params,
         }));
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
-        .await
-        .expect("to bind liveview port");
+    // a failure to start the web ui must not take the router down with it
+    let listener = match TcpListener::bind(SocketAddr::new(host, port)).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(
+                target: LOG_TARGET,
+                %host,
+                %port,
+                ?error,
+                "failed to bind web ui listener, running without web ui",
+            );
+            return std::future::pending::<()>().await;
+        }
+    };
 
-    axum::serve(listener, router.into_make_service())
-        .await
-        .expect("liveview server exited");
+    tracing::info!(
+        target: LOG_TARGET,
+        %host,
+        %port,
+        "web ui listening",
+    );
+
+    if let Err(error) = axum::serve(listener, router.into_make_service()).await {
+        tracing::error!(
+            target: LOG_TARGET,
+            ?error,
+            "web ui server exited, running without web ui",
+        );
+        std::future::pending::<()>().await
+    }
+}
+
+/// Check that the `Origin` of a WebSocket upgrade matches the `Host` the request was sent to.
+///
+/// Browsers always send `Origin` on WebSocket upgrades, so a mismatch means a page served from
+/// another site is trying to open the console's socket. Requests without `Origin` are not from a
+/// browser and are allowed.
+fn origin_allowed(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()) else {
+        return true;
+    };
+
+    let allowed = || {
+        let host = headers.get(header::HOST)?.to_str().ok()?;
+        let origin = url::Url::parse(origin).ok()?;
+        let origin_authority = match origin.port() {
+            Some(port) => format!("{}:{port}", origin.host_str()?),
+            None => origin.host_str()?.to_string(),
+        };
+
+        Some(origin_authority.eq_ignore_ascii_case(host))
+    };
+
+    allowed().unwrap_or(false)
 }
 
 async fn index_handler() -> Html<String> {
@@ -74,9 +131,34 @@ async fn index_handler() -> Html<String> {
     ))
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(data): State<Arc<AppData>>) -> impl IntoResponse {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    State(data): State<Arc<AppData>>,
+) -> Response {
+    if !origin_allowed(&headers) {
+        tracing::warn!(
+            target: LOG_TARGET,
+            origin = ?headers.get(header::ORIGIN),
+            host = ?headers.get(header::HOST),
+            "rejecting web ui connection from another origin",
+        );
+        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    }
+
     ws.on_upgrade(move |socket| async move {
-        let params = Arc::new(Mutex::new(Some(data.params.clone())));
+        // every connection starts from the configuration currently on disk so that settings
+        // saved by another tab or an earlier connection are not overwritten with stale values
+        let mut options = data.params.clone();
+        match load_router_config(&options.base_path.join("router.toml")) {
+            Some(config) => options.config = config,
+            None => tracing::warn!(
+                target: LOG_TARGET,
+                "failed to reload router configuration, using the configuration from startup",
+            ),
+        }
+
+        let params = Arc::new(Mutex::new(Some(options)));
         let _ = data
             .pool
             .launch_virtualdom(axum_socket(socket), move || {
@@ -86,4 +168,53 @@ async fn ws_handler(ws: WebSocketUpgrade, State(data): State<Arc<AppData>>) -> i
             })
             .await;
     })
+    .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn headers(origin: Option<&'static str>, host: Option<&'static str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(origin) = origin {
+            headers.insert(header::ORIGIN, HeaderValue::from_static(origin));
+        }
+        if let Some(host) = host {
+            headers.insert(header::HOST, HeaderValue::from_static(host));
+        }
+        headers
+    }
+
+    #[test]
+    fn origin_must_match_host() {
+        // browser on the same origin
+        assert!(origin_allowed(&headers(
+            Some("http://127.0.0.1:7657"),
+            Some("127.0.0.1:7657")
+        )));
+        assert!(origin_allowed(&headers(
+            Some("http://localhost:7657"),
+            Some("LOCALHOST:7657")
+        )));
+        assert!(origin_allowed(&headers(Some("http://[::1]:7657"), Some("[::1]:7657"))));
+        assert!(origin_allowed(&headers(Some("http://console.i2p"), Some("console.i2p"))));
+
+        // page served from another site
+        assert!(!origin_allowed(&headers(
+            Some("http://evil.example"),
+            Some("127.0.0.1:7657")
+        )));
+        assert!(!origin_allowed(&headers(
+            Some("http://127.0.0.1:8080"),
+            Some("127.0.0.1:7657")
+        )));
+        assert!(!origin_allowed(&headers(Some("null"), Some("127.0.0.1:7657"))));
+        assert!(!origin_allowed(&headers(Some("http://127.0.0.1:7657"), None)));
+
+        // non-browser client without `Origin`
+        assert!(origin_allowed(&headers(None, Some("127.0.0.1:7657"))));
+        assert!(origin_allowed(&headers(None, None)));
+    }
 }

@@ -33,7 +33,7 @@ use tokio::io::AsyncWriteExt;
 
 use std::{
     collections::HashSet,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroUsize,
     path::PathBuf,
 };
@@ -219,6 +219,8 @@ pub struct RouterUiConfig {
     pub native: Option<bool>,
     pub refresh_interval: usize,
     pub port: Option<u16>,
+    /// Listen address of the web UI, `127.0.0.1` if not specified.
+    pub host: Option<IpAddr>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -265,7 +267,7 @@ pub struct EmissaryConfig {
 }
 
 impl EmissaryConfig {
-    fn new<R: Runtime>() -> Self {
+    pub(crate) fn new<R: Runtime>() -> Self {
         // generate random port
         //
         // the same port is used for both ntcp2 and ssu2
@@ -349,6 +351,7 @@ impl EmissaryConfig {
                 refresh_interval: 5usize,
                 native: None,
                 port: None,
+                host: None,
             }),
             sam: Some(SamConfig {
                 tcp_port: 7656,
@@ -953,8 +956,13 @@ impl Config {
             refresh_interval,
             port,
             native,
+            host,
         }) = &mut self.router_ui
         {
+            if let Some(selected) = arguments.router_ui.web_ui_host {
+                *host = Some(selected);
+            }
+
             if let Some(selected) = arguments.router_ui.theme {
                 *theme = selected;
             }
@@ -1016,6 +1024,7 @@ mod tests {
                 refresh_interval: None,
                 theme: None,
                 web_ui_port: None,
+                web_ui_host: None,
                 native: None,
             },
             floodfill: None,

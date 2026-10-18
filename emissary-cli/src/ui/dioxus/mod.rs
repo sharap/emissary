@@ -22,7 +22,7 @@ use crate::{
     ui::dioxus::{
         style::global_css,
         types::{
-            AddressBook, HiddenServices, RouterState, RouterStatus, Settings, SettingsTab,
+            AddressBook, HiddenServices, RouterState, RouterStatus, Settings,
             SidebarSelection, Traffic,
         },
         util::{read_b32_address, save_router_config},
@@ -259,73 +259,10 @@ impl AppState {
     }
 
     /// Save settings.
+    ///
+    /// Settings of all tabs are validated and applied, not only those of the active tab.
     pub fn save_settings(&mut self) -> Result<(), String> {
-        match self.settings.active_tab {
-            SettingsTab::Transports => {
-                if !self.settings.ntcp2.enabled && !self.settings.ssu2.enabled {
-                    return Err(String::from(
-                        "At least one transport (NTCP2 or SSU2) must be enabled",
-                    ));
-                }
-
-                self.config.ntcp2 = TryInto::<Option<crate::config::Ntcp2Config>>::try_into(
-                    self.settings.ntcp2.clone(),
-                )?;
-                self.config.ssu2 = TryInto::<Option<crate::config::Ssu2Config>>::try_into(
-                    self.settings.ssu2.clone(),
-                )?;
-                self.config.port_forwarding =
-                    TryInto::<Option<crate::config::PortForwardingConfig>>::try_into(
-                        self.settings.port_forwarding.clone(),
-                    )?;
-            }
-            SettingsTab::Client => {
-                self.config.i2cp = TryInto::<Option<crate::config::I2cpConfig>>::try_into(
-                    self.settings.i2cp.clone(),
-                )?;
-                self.config.sam = TryInto::<Option<crate::config::SamConfig>>::try_into(
-                    self.settings.sam.clone(),
-                )?;
-            }
-            SettingsTab::Proxies => {
-                self.config.http_proxy =
-                    TryInto::<Option<crate::config::HttpProxyConfig>>::try_into(
-                        self.settings.http_proxy.clone(),
-                    )?;
-                self.config.socks_proxy =
-                    TryInto::<Option<crate::config::SocksProxyConfig>>::try_into(
-                        self.settings.socks_proxy.clone(),
-                    )?;
-            }
-            SettingsTab::Tunnels => {
-                self.config.exploratory =
-                    TryInto::<Option<crate::config::ExploratoryConfig>>::try_into(
-                        self.settings.exploratory.clone(),
-                    )?;
-                self.config.transit = TryInto::<Option<crate::config::TransitConfig>>::try_into(
-                    self.settings.transit.clone(),
-                )?;
-            }
-            SettingsTab::Advanced => {
-                self.config.floodfill = self.settings.advanced.floodfill;
-                self.config.allow_local = self.settings.advanced.allow_local;
-                self.config.insecure_tunnels = self.settings.advanced.insecure_tunnels;
-
-                match &mut self.config.router_ui {
-                    None => {
-                        self.config.router_ui = Some(crate::config::RouterUiConfig {
-                            theme: self.theme,
-                            refresh_interval: 5,
-                            port: None,
-                            native: None,
-                        });
-                    }
-                    Some(config) => {
-                        config.theme = self.theme;
-                    }
-                }
-            }
-        }
+        apply_settings(&self.settings, self.theme, &mut self.config)?;
 
         save_router_config(self.base_path.join("router.toml"), &self.config);
         self.settings.dirty = false;
@@ -759,5 +696,111 @@ pub async fn start(
             })
             .await
         }
+    }
+}
+
+/// Validate `settings` and apply them to `config`.
+///
+/// Nothing is applied if any of the settings is invalid.
+fn apply_settings(
+    settings: &Settings,
+    theme: Theme,
+    config: &mut EmissaryConfig,
+) -> Result<(), String> {
+    if !settings.ntcp2.enabled && !settings.ssu2.enabled {
+        return Err(String::from(
+            "At least one transport (NTCP2 or SSU2) must be enabled",
+        ));
+    }
+
+    let ntcp2 = TryInto::<Option<crate::config::Ntcp2Config>>::try_into(settings.ntcp2.clone())?;
+    let ssu2 = TryInto::<Option<crate::config::Ssu2Config>>::try_into(settings.ssu2.clone())?;
+    let port_forwarding = TryInto::<Option<crate::config::PortForwardingConfig>>::try_into(
+        settings.port_forwarding.clone(),
+    )?;
+    let i2cp = TryInto::<Option<crate::config::I2cpConfig>>::try_into(settings.i2cp.clone())?;
+    let sam = TryInto::<Option<crate::config::SamConfig>>::try_into(settings.sam.clone())?;
+    let http_proxy =
+        TryInto::<Option<crate::config::HttpProxyConfig>>::try_into(settings.http_proxy.clone())?;
+    let socks_proxy = TryInto::<Option<crate::config::SocksProxyConfig>>::try_into(
+        settings.socks_proxy.clone(),
+    )?;
+    let exploratory = TryInto::<Option<crate::config::ExploratoryConfig>>::try_into(
+        settings.exploratory.clone(),
+    )?;
+    let transit =
+        TryInto::<Option<crate::config::TransitConfig>>::try_into(settings.transit.clone())?;
+
+    config.ntcp2 = ntcp2;
+    config.ssu2 = ssu2;
+    config.port_forwarding = port_forwarding;
+    config.i2cp = i2cp;
+    config.sam = sam;
+    config.http_proxy = http_proxy;
+    config.socks_proxy = socks_proxy;
+    config.exploratory = exploratory;
+    config.transit = transit;
+    config.floodfill = settings.advanced.floodfill;
+    config.allow_local = settings.advanced.allow_local;
+    config.insecure_tunnels = settings.advanced.insecure_tunnels;
+
+    match &mut config.router_ui {
+        None => {
+            config.router_ui = Some(crate::config::RouterUiConfig {
+                theme,
+                refresh_interval: 5,
+                port: None,
+                native: None,
+                host: None,
+            });
+        }
+        Some(router_ui) => {
+            router_ui.theme = theme;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::dioxus::types::SettingsTab;
+    use emissary_util::runtime::tokio::Runtime as TokioRuntime;
+
+    #[test]
+    fn settings_of_all_tabs_are_applied() {
+        let mut config = EmissaryConfig::new::<TokioRuntime>();
+        let mut settings = Settings::new(&config);
+
+        // changes on the transports tab and on the advanced tab, only transports is active
+        settings.active_tab = SettingsTab::Transports;
+        settings.ntcp2.port = Some(String::from("12345"));
+        settings.advanced.floodfill = !config.floodfill;
+        settings.transit.enabled = false;
+
+        apply_settings(&settings, Theme::Light, &mut config).unwrap();
+
+        assert_eq!(config.ntcp2.as_ref().unwrap().port, 12345);
+        assert_eq!(config.floodfill, settings.advanced.floodfill);
+        assert!(config.transit.is_none());
+        assert_eq!(config.router_ui.as_ref().unwrap().theme, Theme::Light);
+    }
+
+    #[test]
+    fn invalid_setting_on_inactive_tab_is_rejected() {
+        let mut config = EmissaryConfig::new::<TokioRuntime>();
+        let original_port = config.ntcp2.as_ref().unwrap().port;
+        let mut settings = Settings::new(&config);
+
+        settings.active_tab = SettingsTab::Advanced;
+        settings.ntcp2.port = Some(String::from("not a port"));
+        settings.advanced.floodfill = !config.floodfill;
+
+        assert!(apply_settings(&settings, Theme::Dark, &mut config).is_err());
+
+        // nothing was applied
+        assert_eq!(config.ntcp2.as_ref().unwrap().port, original_port);
+        assert_ne!(config.floodfill, settings.advanced.floodfill);
     }
 }

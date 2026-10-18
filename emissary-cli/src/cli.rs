@@ -18,6 +18,8 @@
 
 use clap::{Args, Parser};
 
+use std::net::IpAddr;
+
 use crate::{config::Theme, tools::RouterCommand};
 
 #[derive(Args, Default)]
@@ -175,6 +177,13 @@ pub struct RouterUiOptions {
     /// Has an effect only if web UI was enabled during compilation.
     #[arg(long, value_name = "PORT")]
     pub web_ui_port: Option<u16>,
+
+    /// Router UI listen address.
+    ///
+    /// Defaults to 127.0.0.1 so that the UI is reachable only from this machine. Has an effect
+    /// only if web UI was enabled during compilation.
+    #[arg(long, value_name = "HOST")]
+    pub web_ui_host: Option<IpAddr>,
 }
 
 #[derive(Args, Default)]

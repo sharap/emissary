@@ -735,6 +735,11 @@ Server tunnels require SAM to be enabled. Each tunnel must have a unique name, p
       <td><code>--web-ui-port</code></td>
       <td>The port to start the webserver on. (default: 7657)</td>
     </tr>
+    <tr>
+      <td><code>host</code></td>
+      <td><code>--web-ui-host</code></td>
+      <td>The address to bind the webserver to. The UI has no authentication, so expose it to other machines only behind a reverse proxy that adds some. (default: <code>127.0.0.1</code>)</td>
+    </tr>
   </tbody>
 </table>
 

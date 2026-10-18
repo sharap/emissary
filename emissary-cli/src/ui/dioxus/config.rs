@@ -109,17 +109,12 @@ impl TryInto<Option<crate::config::Ntcp2Config>> for Ntcp2Config {
             },
             publish: None,
             disable_pq: self.disable_pq,
-            ml_kem: match self.ml_kem {
-                None => None,
-                Some(value) => {
-                    let value = value.parse::<usize>().expect("valid value");
-
-                    if !(3..5).contains(&value) {
-                        return Err(String::from("ML-KEM only accepts 3, 4 or 5"));
-                    }
-
-                    Some(value)
-                }
+            ml_kem: match self.ml_kem.as_deref().map(str::trim) {
+                None | Some("") => None,
+                Some(value) => match value.parse::<usize>() {
+                    Ok(value @ 3..=5) => Some(value),
+                    _ => return Err(String::from("ML-KEM only accepts 3, 4 or 5")),
+                },
             },
         }))
     }
@@ -716,5 +711,39 @@ impl From<&EmissaryConfig> for AdvancedConfig {
             allow_local: value.allow_local,
             insecure_tunnels: value.insecure_tunnels,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ntcp2_with_ml_kem(ml_kem: Option<&str>) -> Ntcp2Config {
+        Ntcp2Config {
+            port: Some(String::from("8888")),
+            ml_kem: ml_kem.map(String::from),
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ntcp2_ml_kem_parsing() {
+        let convert = |ml_kem: Option<&str>| {
+            TryInto::<Option<crate::config::Ntcp2Config>>::try_into(ntcp2_with_ml_kem(ml_kem))
+        };
+
+        assert_eq!(convert(None).unwrap().unwrap().ml_kem, None);
+        assert_eq!(convert(Some("")).unwrap().unwrap().ml_kem, None);
+        assert_eq!(convert(Some(" ")).unwrap().unwrap().ml_kem, None);
+        assert_eq!(convert(Some("3")).unwrap().unwrap().ml_kem, Some(3));
+        assert_eq!(convert(Some("4")).unwrap().unwrap().ml_kem, Some(4));
+        assert_eq!(convert(Some(" 5 ")).unwrap().unwrap().ml_kem, Some(5));
+
+        // invalid values are errors, not panics
+        assert!(convert(Some("2")).is_err());
+        assert!(convert(Some("6")).is_err());
+        assert!(convert(Some("abc")).is_err());
+        assert!(convert(Some("-1")).is_err());
     }
 }
