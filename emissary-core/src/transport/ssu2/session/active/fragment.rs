@@ -40,10 +40,19 @@ use core::{
 /// the [`Fragment`] is destroyed.
 ///
 /// This is to prevent unbounded accumulation of incomplete I2NP messages.
+/// Logging target for the file.
+const LOG_TARGET: &str = "emissary::ssu2::fragment";
+
 const MSG_EXPIRATION_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// Garbage collection interval.
 const GARBAGE_COLLECTION_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Maximum number of incomplete messages kept per session.
+///
+/// When the limit is reached, the oldest incomplete message is dropped to make room for a new one
+/// so that a peer cannot grow the buffer without bound before garbage collection runs.
+const MAX_INCOMPLETE_MESSAGES: usize = 128;
 
 /// Fragmented I2NP message.
 struct Fragment<R: Runtime> {
@@ -131,6 +140,30 @@ impl<R: Runtime> FragmentHandler<R> {
         }
     }
 
+    /// Drop the oldest incomplete message if a new message for `message_id` would exceed
+    /// [`MAX_INCOMPLETE_MESSAGES`].
+    fn make_room(&mut self, message_id: &MessageId) {
+        if self.messages.len() < MAX_INCOMPLETE_MESSAGES || self.messages.contains_key(message_id)
+        {
+            return;
+        }
+
+        if let Some(oldest) = self
+            .messages
+            .iter()
+            .max_by_key(|(_, message)| message.created.elapsed())
+            .map(|(message_id, _)| *message_id)
+        {
+            tracing::debug!(
+                target: LOG_TARGET,
+                ?oldest,
+                "too many incomplete messages, dropping the oldest",
+            );
+            self.metrics.counter(GARBAGE_COLLECTED_COUNT).increment(1);
+            self.messages.remove(&oldest);
+        }
+    }
+
     /// Handle first fragment.
     ///
     /// If all fragments have been received, the constructed message is received.
@@ -141,6 +174,7 @@ impl<R: Runtime> FragmentHandler<R> {
         expiration: u32,
         payload: Vec<u8>,
     ) -> Option<Message> {
+        self.make_room(&message_id);
         let message = self.messages.entry(message_id).or_default();
 
         message.total_size += payload.len();
@@ -168,6 +202,7 @@ impl<R: Runtime> FragmentHandler<R> {
         last: bool,
         payload: Vec<u8>,
     ) -> Option<Message> {
+        self.make_room(&message_id);
         let message = self.messages.entry(message_id).or_default();
 
         message.total_size += payload.len();
@@ -241,6 +276,38 @@ mod tests {
         fragments.push_back(second_to_last);
 
         fragments
+    }
+
+    #[tokio::test]
+    async fn incomplete_messages_are_capped() {
+        let expiration = MockRuntime::time_since_epoch().as_secs() as u32;
+        let mut handler =
+            FragmentHandler::<MockRuntime>::new(MockRuntime::register_metrics(vec![], None));
+
+        // first fragments without the last fragment leave the messages incomplete
+        for i in 0..MAX_INCOMPLETE_MESSAGES as u32 {
+            assert!(handler
+                .first_fragment(MessageType::Data, MessageId::from(i), expiration, vec![i as u8])
+                .is_none());
+        }
+        assert_eq!(handler.messages.len(), MAX_INCOMPLETE_MESSAGES);
+
+        // a fragment of a known message doesn't evict anything
+        assert!(handler.follow_on_fragment(MessageId::from(5u32), 1, false, vec![5]).is_none());
+        assert_eq!(handler.messages.len(), MAX_INCOMPLETE_MESSAGES);
+
+        // a new message evicts the oldest incomplete message
+        let new_id = MessageId::from(MAX_INCOMPLETE_MESSAGES as u32);
+        assert!(handler.first_fragment(MessageType::Data, new_id, expiration, vec![1]).is_none());
+        assert_eq!(handler.messages.len(), MAX_INCOMPLETE_MESSAGES);
+        assert!(handler.messages.contains_key(&new_id));
+        assert!(!handler.messages.contains_key(&MessageId::from(0u32)));
+
+        // follow-on fragment of an unknown message is capped as well
+        let newer_id = MessageId::from(MAX_INCOMPLETE_MESSAGES as u32 + 1);
+        assert!(handler.follow_on_fragment(newer_id, 1, false, vec![1]).is_none());
+        assert_eq!(handler.messages.len(), MAX_INCOMPLETE_MESSAGES);
+        assert!(handler.messages.contains_key(&newer_id));
     }
 
     #[tokio::test]

@@ -48,7 +48,16 @@ use core::{
 /// the [`Fragment`] is destroyed.
 ///
 /// This is to prevent unbounded accumulation of incomplete I2NP messages.
+/// Logging target for the file.
+const LOG_TARGET: &str = "emissary::tunnel::fragment";
+
 const MSG_EXPIRATION_THRESHOLD: Duration = Duration::from_secs(45);
+
+/// Maximum number of incomplete messages kept per tunnel.
+///
+/// When the limit is reached, the oldest incomplete message is dropped to make room for a new one
+/// so that a peer cannot grow the buffer without bound before the messages expire.
+const MAX_INCOMPLETE_MESSAGES: usize = 256;
 
 /// Owned delivery instructions.
 pub enum OwnedDeliveryInstructions {
@@ -202,6 +211,23 @@ impl<R: Runtime> FragmentHandler<R> {
         &mut self,
         message_id: MessageId,
     ) -> OccupiedEntry<'_, MessageId, Fragment<R>> {
+        // drop the oldest incomplete message if a new message would exceed the limit
+        if !self.messages.contains_key(&message_id)
+            && self.messages.len() >= MAX_INCOMPLETE_MESSAGES
+        {
+            while let Some(oldest) = self.message_first_seen_queue.pop_front() {
+                if self.messages.remove(&oldest).is_some() {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        ?oldest,
+                        "too many incomplete messages, dropping the oldest",
+                    );
+                    self.metrics_handle.counter(NUM_DROPPED_FRAGMENTS).increment(1);
+                    break;
+                }
+            }
+        }
+
         match self.messages.entry(message_id) {
             Entry::Occupied(entry) => entry,
             Entry::Vacant(vacant_entry) => {
@@ -332,6 +358,32 @@ mod tests {
         fragments.push_back(second_to_last);
 
         fragments
+    }
+
+    #[test]
+    fn incomplete_messages_are_capped() {
+        let mut handler =
+            FragmentHandler::<MockRuntime>::new(MockRuntime::register_metrics(vec![], None));
+
+        // first fragments without the last fragment leave the messages incomplete
+        for i in 0..MAX_INCOMPLETE_MESSAGES as u32 {
+            assert!(handler
+                .first_fragment(MessageId::from(i), &DeliveryInstructions::Local, &[i as u8])
+                .is_none());
+        }
+        assert_eq!(handler.messages.len(), MAX_INCOMPLETE_MESSAGES);
+
+        // a fragment of a known message doesn't evict anything
+        assert!(handler.middle_fragment(MessageId::from(5u32), 1, &[5]).is_none());
+        assert_eq!(handler.messages.len(), MAX_INCOMPLETE_MESSAGES);
+
+        // a new message evicts the oldest incomplete message
+        let new_id = MessageId::from(MAX_INCOMPLETE_MESSAGES as u32);
+        assert!(handler.first_fragment(new_id, &DeliveryInstructions::Local, &[1]).is_none());
+        assert_eq!(handler.messages.len(), MAX_INCOMPLETE_MESSAGES);
+        assert!(handler.messages.contains_key(&new_id));
+        assert!(!handler.messages.contains_key(&MessageId::from(0u32)));
+        assert!(handler.messages.contains_key(&MessageId::from(1u32)));
     }
 
     #[test]
