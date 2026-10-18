@@ -541,6 +541,12 @@ pub enum StreamingError {
     /// are active or vice versa.
     ListenerMismatch,
 
+    /// Too many pending inbound streams.
+    TooManyPendingStreams,
+
+    /// Too many active streams.
+    TooManyStreams,
+
     /// Stream closed.
     Closed,
 
@@ -572,6 +578,8 @@ impl fmt::Display for StreamingError {
             Self::InvalidSignature => write!(f, "invalid signature"),
             Self::Malformed(error) => write!(f, "malformed packet: {error:?}"),
             Self::ListenerMismatch => write!(f, "listener kind mismatch"),
+            Self::TooManyPendingStreams => write!(f, "too many pending inbound streams"),
+            Self::TooManyStreams => write!(f, "too many active streams"),
             Self::Closed => write!(f, "stream closed"),
             Self::ReceiveWindowFull => write!(f, "receive window is full"),
             Self::SequenceNumberTooHigh => {

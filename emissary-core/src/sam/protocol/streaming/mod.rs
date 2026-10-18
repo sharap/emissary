@@ -88,6 +88,14 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum `SYN` retries before the remote destination is considered unreachable.
 const MAX_SYN_RETRIES: usize = 5usize;
 
+/// Maximum number of pending inbound streams, same as i2pd.
+///
+/// Further `SYN`s are ignored while the limit is reached.
+const MAX_PENDING_INBOUND_STREAMS: usize = 1024;
+
+/// Maximum number of active streams.
+const MAX_STREAMS: usize = 4096;
+
 /// Direction of stream.
 pub enum Direction {
     /// Inbound stream.
@@ -476,6 +484,30 @@ impl<R: Runtime> StreamManager<R> {
 
         if constructed_destination_id != self.destination_id.to_vec() {
             return Err(StreamingError::ReplayProtectionCheckFailed);
+        }
+
+        if self.active.len() >= MAX_STREAMS {
+            tracing::warn!(
+                target: LOG_TARGET,
+                local = %self.destination_id,
+                remote = %destination_id,
+                ?recv_stream_id,
+                num_streams = ?self.active.len(),
+                "too many active streams, ignoring syn",
+            );
+            return Err(StreamingError::TooManyStreams);
+        }
+
+        if self.listener.is_empty() && self.pending_inbound.len() >= MAX_PENDING_INBOUND_STREAMS {
+            tracing::warn!(
+                target: LOG_TARGET,
+                local = %self.destination_id,
+                remote = %destination_id,
+                ?recv_stream_id,
+                num_pending = ?self.pending_inbound.len(),
+                "too many pending inbound streams, ignoring syn",
+            );
+            return Err(StreamingError::TooManyPendingStreams);
         }
 
         tracing::info!(
@@ -1343,6 +1375,53 @@ mod tests {
                 pending_routing_path_handle: PendingRoutingPathHandle::create(),
             })
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn pending_inbound_streams_are_capped() {
+        let signing_key = SigningPrivateKey::from_bytes(&[0u8; 32]).unwrap();
+        let destination = Destination::new::<MockRuntime>(signing_key.public());
+        let destination_id = destination.id();
+        let mut manager = StreamManager::<MockRuntime>::new(destination, signing_key);
+
+        let make_syn = |stream_id: u32| {
+            let signing_key = SigningPrivateKey::random(MockRuntime::rng());
+            let destination = Destination::new::<MockRuntime>(signing_key.public());
+
+            PacketBuilder::new(stream_id)
+                .with_synchronize()
+                .with_send_stream_id(0u32)
+                .with_replay_protection(&destination_id)
+                .with_from_included(&destination)
+                .with_signature()
+                .build_and_sign(&signing_key)
+                .to_vec()
+        };
+
+        // without a listener every syn creates a pending stream, up to the limit
+        for stream_id in 0..MAX_PENDING_INBOUND_STREAMS as u32 {
+            assert!(manager
+                .on_packet(I2cpPayload {
+                    src_port: 13u16,
+                    dst_port: 37u16,
+                    protocol: Protocol::Streaming,
+                    payload: make_syn(stream_id),
+                })
+                .is_ok());
+        }
+        assert_eq!(manager.pending_inbound.len(), MAX_PENDING_INBOUND_STREAMS);
+
+        // one more is ignored
+        match manager.on_packet(I2cpPayload {
+            src_port: 13u16,
+            dst_port: 37u16,
+            protocol: Protocol::Streaming,
+            payload: make_syn(MAX_PENDING_INBOUND_STREAMS as u32),
+        }) {
+            Err(StreamingError::TooManyPendingStreams) => {}
+            result => panic!("unexpected result: {result:?}"),
+        }
+        assert_eq!(manager.pending_inbound.len(), MAX_PENDING_INBOUND_STREAMS);
     }
 
     #[tokio::test]

@@ -262,6 +262,11 @@ impl<R: Runtime> StreamListener<R> {
         }
     }
 
+    /// Is the listener uninitialized, i.e., would [`StreamListener::pop_socket()`] return `None`.
+    pub fn is_empty(&self) -> bool {
+        core::matches!(self.state, ListenerState::Uninitialized)
+    }
+
     /// Attempt to acquire a socket for an active listener.
     ///
     /// If there is a ready listener, it's returned to the caller via [`SocketKind`] which has
