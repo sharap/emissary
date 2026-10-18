@@ -459,15 +459,18 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
         // initialize the return value for a possible tunnel build failure
         //
         // each value in `hop_results` contains the `RouterId` of the hop and the result of handling
-        // their response to the build request. `None` indicates that the record could not be parsed
-        // because a hop preceeding this hop failed to parse
+        // their response to the build request, in the same order as `self.hops`. `None` indicates
+        // that the record could not be parsed because a hop succeeding this hop failed to parse
         //
-        // the hops are in reverse order as the tunnel's last hop (participant for inbound tunnels
-        // and OBEP for outbound tunnels) is the router from whom the tunnel build response is
-        // received and their record is decrypted and handled first
+        // the records are processed in reverse order as the tunnel's last hop (participant for
+        // inbound tunnels and OBEP for outbound tunnels) is the router from whom the tunnel build
+        // response is received and their record is decrypted and handled first
         let mut hop_results = Vec::<(RouterId, Option<Result<(), TunnelError>>)>::from_iter(
-            self.hops.iter().rev().map(|hop| (hop.router_id().clone(), None)),
+            self.hops.iter().map(|hop| (hop.router_id().clone(), None)),
         );
+
+        // failures to parse the reply itself are attributed to the last hop which sent it
+        let last_hop_idx = hop_results.len() - 1;
 
         let mut payload = match (T::direction(), message.message_type) {
             // for inbound build the message type doesn't change from `ShortTunnelBuild`
@@ -489,7 +492,7 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
                         "tunnel build record is too short",
                     );
 
-                    hop_results[0].1 = Some(Err(TunnelError::InvalidMessage));
+                    hop_results[last_hop_idx].1 = Some(Err(TunnelError::InvalidMessage));
                     return Err(hop_results);
                 }
 
@@ -506,7 +509,7 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
                             "fake local record not found in tunnel build reply",
                         );
 
-                        hop_results[0].1 = Some(Err(TunnelError::InvalidMessage));
+                        hop_results[last_hop_idx].1 = Some(Err(TunnelError::InvalidMessage));
                         return Err(hop_results);
                     }
                     Some(record) =>
@@ -518,7 +521,7 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
                                 "fake local record has been modified",
                             );
 
-                            hop_results[0].1 = Some(Err(TunnelError::InvalidMessage));
+                            hop_results[last_hop_idx].1 = Some(Err(TunnelError::InvalidMessage));
                             return Err(hop_results);
                         },
                 }
@@ -544,7 +547,7 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
                         "tunnel build record is too short",
                     );
 
-                    hop_results[0].1 = Some(Err(TunnelError::InvalidMessage));
+                    hop_results[last_hop_idx].1 = Some(Err(TunnelError::InvalidMessage));
                     return Err(hop_results);
                 }
 
@@ -556,12 +559,12 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
                 {
                     tracing::warn!(
                         target: LOG_TARGET,
-                        router_id = %hop_results[0].0,
+                        router_id = %hop_results[last_hop_idx].0,
                         ?error,
                         "failed to decrypt tunnel build reply garlic message",
                     );
 
-                    hop_results[0].1 = Some(Err(TunnelError::InvalidMessage));
+                    hop_results[last_hop_idx].1 = Some(Err(TunnelError::InvalidMessage));
                     return Err(hop_results);
                 }
 
@@ -575,7 +578,7 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
                             "malformed garlic message as tunnel build reply",
                         );
 
-                        hop_results[0].1 = Some(Err(TunnelError::InvalidMessage));
+                        hop_results[last_hop_idx].1 = Some(Err(TunnelError::InvalidMessage));
                         return Err(hop_results);
                     }
                 };
@@ -600,7 +603,7 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
                             "garlic messge didn't contain valid tunnel reply",
                         );
 
-                        hop_results[0].1 = Some(Err(TunnelError::InvalidMessage));
+                        hop_results[last_hop_idx].1 = Some(Err(TunnelError::InvalidMessage));
                         return Err(hop_results);
                     }
                 }
@@ -614,7 +617,7 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
                     "invalid build message reply",
                 );
 
-                hop_results[0].1 = Some(Err(TunnelError::InvalidMessage));
+                hop_results[last_hop_idx].1 = Some(Err(TunnelError::InvalidMessage));
                 return Err(hop_results);
             }
         };
@@ -629,7 +632,7 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
                 "malformed tunnel build reply"
             );
 
-            hop_results[0].1 = Some(Err(TunnelError::InvalidMessage));
+            hop_results[last_hop_idx].1 = Some(Err(TunnelError::InvalidMessage));
             return Err(hop_results);
         }
 
@@ -734,6 +737,31 @@ impl<R: Runtime, T: Tunnel<R>> PendingTunnel<R, T> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Assert that build results are reported in the same order as `hops`.
+    fn assert_hop_order(
+        results: &[(RouterId, Option<Result<(), TunnelError>>)],
+        hops: &[(Bytes, StaticPublicKey)],
+    ) {
+        assert_eq!(results.len(), hops.len());
+
+        for ((router_id, _), (router_hash, _)) in results.iter().zip(hops) {
+            assert_eq!(router_id, &RouterId::from(router_hash.to_vec()));
+        }
+    }
+
+    /// Assert that only the last hop was penalized for an unparseable reply and that the results
+    /// of all other hops are undetermined.
+    fn assert_only_last_hop_failed(
+        results: &[(RouterId, Option<Result<(), TunnelError>>)],
+        hops: &[(Bytes, StaticPublicKey)],
+    ) {
+        assert_hop_order(results, hops);
+
+        let (last, rest) = results.split_last().unwrap();
+        assert_eq!(last.1, Some(Err(TunnelError::InvalidMessage)));
+        assert!(rest.iter().all(|(_, result)| result.is_none()));
+    }
     use crate::{
         config::TransitConfig,
         crypto::{EphemeralPublicKey, StaticPublicKey},
@@ -1062,12 +1090,9 @@ mod test {
         // try to parse the tunnel build request as a reply, ciphertexsts won't decrypt correctly
         match pending_tunnel.try_build_tunnel(message) {
             Err(error) => {
-                assert_eq!(error[0].1, Some(Err(TunnelError::InvalidMessage)));
-
                 // cipher text for the first hop was invalid so the status of later hops couldn't be
                 // determined
-                assert_eq!(error[1].1, None);
-                assert_eq!(error[2].1, None);
+                assert_only_last_hop_failed(&error, &hops);
             }
             _ => panic!("invalid result"),
         }
@@ -1113,11 +1138,8 @@ mod test {
 
         match pending_tunnel.try_build_tunnel(message) {
             Err(error) => {
-                assert_eq!(error[0].1, Some(Err(TunnelError::InvalidMessage)));
-
                 // length was too short so the records couldn't be parsed
-                assert_eq!(error[1].1, None);
-                assert_eq!(error[2].1, None);
+                assert_only_last_hop_failed(&error, &hops);
             }
             _ => panic!("invalid result"),
         }
@@ -1220,11 +1242,8 @@ mod test {
 
         match pending_tunnel.try_build_tunnel(message) {
             Err(error) => {
-                assert_eq!(error[0].1, Some(Err(TunnelError::InvalidMessage)));
-
                 // only the last hop is penalized
-                assert_eq!(error[1].1, None);
-                assert_eq!(error[2].1, None);
+                assert_only_last_hop_failed(&error, &hops);
             }
             _ => panic!("invalid result"),
         }
@@ -1320,11 +1339,8 @@ mod test {
 
         match pending_tunnel.try_build_tunnel(message) {
             Err(error) => {
-                assert_eq!(error[0].1, Some(Err(TunnelError::InvalidMessage)));
-
                 // only the last hop is penalized
-                assert_eq!(error[1].1, None);
-                assert_eq!(error[2].1, None);
+                assert_only_last_hop_failed(&error, &hops);
             }
             _ => panic!("invalid result"),
         }
@@ -1395,11 +1411,8 @@ mod test {
 
         match pending_tunnel.try_build_tunnel(message) {
             Err(error) => {
-                assert_eq!(error[0].1, Some(Err(TunnelError::InvalidMessage)));
-
                 // only the last hop is penalized
-                assert_eq!(error[1].1, None);
-                assert_eq!(error[2].1, None);
+                assert_only_last_hop_failed(&error, &hops);
             }
             _ => panic!("invalid result"),
         }
@@ -1465,11 +1478,8 @@ mod test {
 
         match pending_tunnel.try_build_tunnel(message) {
             Err(error) => {
-                assert_eq!(error[0].1, Some(Err(TunnelError::InvalidMessage)));
-
                 // only the last hop is penalized
-                assert_eq!(error[1].1, None);
-                assert_eq!(error[2].1, None);
+                assert_only_last_hop_failed(&error, &hops);
             }
             _ => panic!("invalid result"),
         }
@@ -1581,6 +1591,9 @@ mod test {
 
         match pending_tunnel.try_build_tunnel(message) {
             Err(error) => {
+                // results must be attributed to the hops in tunnel order
+                assert_hop_order(&error, &hops);
+
                 assert_eq!(error[0].1, Some(Err(TunnelError::InvalidMessage)));
                 assert_eq!(error[1].1, Some(Ok(())));
                 assert_eq!(error[2].1, Some(Ok(())));
@@ -1735,9 +1748,8 @@ mod test {
 
         match pending_tunnel.try_build_tunnel(message) {
             Err(error) => {
-                assert_eq!(error[0].1, Some(Err(TunnelError::InvalidMessage)));
-                assert_eq!(error[1].1, None);
-                assert_eq!(error[2].1, None);
+                // only the last hop is penalized
+                assert_only_last_hop_failed(&error, &hops);
             }
             _ => panic!("invalid result"),
         }
@@ -1851,9 +1863,8 @@ mod test {
 
         match pending_tunnel.try_build_tunnel(message) {
             Err(error) => {
-                assert_eq!(error[0].1, Some(Err(TunnelError::InvalidMessage)));
-                assert_eq!(error[1].1, None);
-                assert_eq!(error[2].1, None);
+                // only the last hop is penalized
+                assert_only_last_hop_failed(&error, &hops);
             }
             _ => panic!("invalid result"),
         }
@@ -1963,9 +1974,8 @@ mod test {
 
         match pending_tunnel.try_build_tunnel(message) {
             Err(error) => {
-                assert_eq!(error[0].1, Some(Err(TunnelError::InvalidMessage)));
-                assert_eq!(error[1].1, None);
-                assert_eq!(error[2].1, None);
+                // only the last hop is penalized
+                assert_only_last_hop_failed(&error, &hops);
             }
             _ => panic!("invalid result"),
         }
@@ -2031,9 +2041,8 @@ mod test {
 
         match pending_tunnel.try_build_tunnel(message) {
             Err(error) => {
-                assert_eq!(error[0].1, Some(Err(TunnelError::InvalidMessage)));
-                assert_eq!(error[1].1, None);
-                assert_eq!(error[2].1, None);
+                // only the last hop is penalized
+                assert_only_last_hop_failed(&error, &hops);
             }
             _ => panic!("invalid result"),
         }

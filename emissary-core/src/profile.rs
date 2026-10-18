@@ -174,10 +174,10 @@ impl Profile {
 
     /// Is the router considered always inactive.
     ///
-    /// The router is considered always inactive if it's at least 30 minutes old and has had no
-    /// recorded activity.
-    fn is_always_inactive(&self) -> bool {
-        if self.last_activity < Duration::from_secs(30 * 60) {
+    /// The router is considered always inactive if it has been known for at least 30 minutes and
+    /// has had no recorded activity.
+    fn is_always_inactive<R: Runtime>(&self) -> bool {
+        if R::time_since_epoch().saturating_sub(self.last_activity) < Duration::from_secs(30 * 60) {
             return false;
         }
 
@@ -211,8 +211,9 @@ impl Profile {
     ///
     /// This is different from `is_always_inactive()` as the router may have had activity at some
     /// point in time but hasn't any activity in the last 2 hours and is not actively connected.
-    fn is_recently_inactive(&self) -> bool {
-        self.last_activity > Duration::from_secs(2 * 60 * 60) && !self.is_connected
+    fn is_recently_inactive<R: Runtime>(&self) -> bool {
+        R::time_since_epoch().saturating_sub(self.last_activity) > Duration::from_secs(2 * 60 * 60)
+            && !self.is_connected
     }
 
     /// Has the router recently declined a tunnel.
@@ -1107,7 +1108,7 @@ impl<R: Runtime> ProfileManager<R> {
                     inner.iter().for_each(|router_id| {
                         if profiles
                             .get(router_id)
-                            .is_some_and(|profile| profile.is_always_inactive())
+                            .is_some_and(|profile| profile.is_always_inactive::<R>())
                         {
                             always_inactive.push(router_id.clone());
                         }
@@ -1131,7 +1132,7 @@ impl<R: Runtime> ProfileManager<R> {
                         inner.iter().for_each(|router_id| {
                             if profiles
                                 .get(router_id)
-                                .is_some_and(|profile| profile.is_recently_inactive())
+                                .is_some_and(|profile| profile.is_recently_inactive::<R>())
                             {
                                 recently_inactive.push(router_id.clone());
                             }
@@ -1169,9 +1170,9 @@ impl<R: Runtime> ProfileManager<R> {
                             };
 
                             let should_remove = !profile.is_connected
-                                && (profile.is_always_inactive()
+                                && (profile.is_always_inactive::<R>()
                                     || profile.is_always_unreachable()
-                                    || profile.is_recently_inactive());
+                                    || profile.is_recently_inactive::<R>());
 
                             if !should_remove || !untracked.contains(&router_id) {
                                 continue;
@@ -1235,6 +1236,39 @@ impl<R: Runtime> ProfileManager<R> {
 mod tests {
     use super::*;
     use crate::{crypto::base64_encode, primitives::RouterInfoBuilder, runtime::mock::MockRuntime};
+
+    #[test]
+    fn inactivity_heuristics_use_elapsed_time() {
+        let now = Duration::from_secs(1_700_000_000);
+        MockRuntime::set_time(Some(now));
+
+        // router discovered just now with no activity is neither always nor recently inactive
+        let mut profile = Profile::new_with_activity::<MockRuntime>();
+        assert!(!profile.is_always_inactive::<MockRuntime>());
+        assert!(!profile.is_recently_inactive::<MockRuntime>());
+
+        // 31 minutes later it's always inactive but not yet recently inactive
+        MockRuntime::set_time(Some(now + Duration::from_secs(31 * 60)));
+        assert!(profile.is_always_inactive::<MockRuntime>());
+        assert!(!profile.is_recently_inactive::<MockRuntime>());
+
+        // 3 hours later it's both
+        MockRuntime::set_time(Some(now + Duration::from_secs(3 * 60 * 60)));
+        assert!(profile.is_always_inactive::<MockRuntime>());
+        assert!(profile.is_recently_inactive::<MockRuntime>());
+
+        // any recorded activity clears "always inactive", a connection clears "recently inactive"
+        profile.num_accepted = 1;
+        assert!(!profile.is_always_inactive::<MockRuntime>());
+        assert!(profile.is_recently_inactive::<MockRuntime>());
+        profile.is_connected = true;
+        assert!(!profile.is_recently_inactive::<MockRuntime>());
+
+        // profile without any known activity counts as always inactive
+        assert!(Profile::new().is_always_inactive::<MockRuntime>());
+
+        MockRuntime::set_time(None);
+    }
 
     #[tokio::test]
     async fn initialize_with_infos_without_profiles() {
