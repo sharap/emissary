@@ -183,7 +183,14 @@ pub struct MetricsConfig {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct BandwidthConfig {
+    /// Bandwidth per second in bytes, used for both directions unless overridden below.
     bandwidth: usize,
+    /// Inbound bandwidth per second in bytes, zero disables the limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inbound: Option<usize>,
+    /// Outbound bandwidth per second in bytes, zero disables the limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outbound: Option<usize>,
     share_ratio: f64,
 }
 
@@ -289,6 +296,8 @@ impl EmissaryConfig {
             caps: None,
             bandwidth: Some(BandwidthConfig {
                 bandwidth: 1000 * 1000,
+                inbound: None,
+                outbound: None,
                 share_ratio: 0.9f64,
             }),
             http_proxy: Some(HttpProxyConfig {
@@ -666,7 +675,8 @@ impl Config {
             allow_local: config.allow_local,
             base_path,
             bandwidth: config.bandwidth.map(|config| emissary_core::BandwidthConfig {
-                bandwidth: config.bandwidth,
+                inbound: config.inbound.unwrap_or(config.bandwidth),
+                outbound: config.outbound.unwrap_or(config.bandwidth),
                 share_ratio: config.share_ratio,
             }),
             caps: config.caps,
@@ -985,12 +995,22 @@ impl Config {
         }
 
         if let Some(emissary_core::BandwidthConfig {
-            bandwidth,
+            inbound,
+            outbound,
             share_ratio,
         }) = &mut self.bandwidth
         {
             if let Some(selected) = arguments.bandwidth.bandwidth {
-                *bandwidth = selected;
+                *inbound = selected;
+                *outbound = selected;
+            }
+
+            if let Some(selected) = arguments.bandwidth.inbound_bandwidth {
+                *inbound = selected;
+            }
+
+            if let Some(selected) = arguments.bandwidth.outbound_bandwidth {
+                *outbound = selected;
             }
 
             if let Some(selected) = arguments.bandwidth.share_ratio {
@@ -1071,6 +1091,8 @@ mod tests {
             },
             bandwidth: BandwidthOptions {
                 bandwidth: None,
+                inbound_bandwidth: None,
+                outbound_bandwidth: None,
                 share_ratio: None,
             },
         }
@@ -1202,6 +1224,59 @@ mod tests {
         assert_eq!(ntcp2_config.iv, ntcp2_iv);
         assert!(ntcp2_config.ipv4);
         assert!(!ntcp2_config.ipv6);
+    }
+
+    #[tokio::test]
+    async fn bandwidth_config_parsed_and_overridden() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::new::<TokioRuntime>(Some(dir.path().to_owned())).await.unwrap();
+
+        // the default config has a single limit for both directions
+        let config = Config::parse::<TokioRuntime>(&make_arguments(), &storage).await.unwrap();
+        let bandwidth = config.bandwidth.unwrap();
+        assert_eq!(bandwidth.inbound, 1000 * 1000);
+        assert_eq!(bandwidth.outbound, 1000 * 1000);
+        assert_eq!(bandwidth.share_ratio, 0.9);
+
+        // `bandwidth` applies to both directions unless a direction is given explicitly
+        let write_config = |contents: String| {
+            let path = dir.path().to_owned().join("router.toml");
+            async move {
+                let mut file = tokio::fs::File::create(path).await.unwrap();
+                file.write_all(contents.as_bytes()).await.unwrap();
+                file.flush().await.unwrap();
+            }
+        };
+        write_config(String::from(
+            "[bandwidth]\nbandwidth = 5000\noutbound = 0\nshare_ratio = 0.5\n",
+        ))
+        .await;
+
+        let config = Config::parse::<TokioRuntime>(&make_arguments(), &storage).await.unwrap();
+        let bandwidth = config.bandwidth.unwrap();
+        assert_eq!(bandwidth.inbound, 5000);
+        assert_eq!(bandwidth.outbound, 0);
+        assert_eq!(bandwidth.share_ratio, 0.5);
+
+        // command line arguments override the config file, per-direction arguments win
+        let mut arguments = make_arguments();
+        arguments.bandwidth.bandwidth = Some(7000);
+        arguments.bandwidth.inbound_bandwidth = Some(1234);
+        arguments.bandwidth.share_ratio = Some(0.25);
+
+        let config = Config::parse::<TokioRuntime>(&arguments, &storage).await.unwrap();
+        let bandwidth = config.bandwidth.unwrap();
+        assert_eq!(bandwidth.inbound, 1234);
+        assert_eq!(bandwidth.outbound, 7000);
+        assert_eq!(bandwidth.share_ratio, 0.25);
+
+        // the config file written on first boot still round-trips through the parser
+        let contents = toml::to_string(&EmissaryConfig::new::<TokioRuntime>()).unwrap();
+        assert!(!contents.contains("inbound"));
+        assert!(!contents.contains("outbound"));
+        write_config(contents).await;
+        let config = Config::parse::<TokioRuntime>(&make_arguments(), &storage).await.unwrap();
+        assert_eq!(config.bandwidth.unwrap().outbound, 1000 * 1000);
     }
 
     #[tokio::test]

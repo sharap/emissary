@@ -188,9 +188,17 @@ pub struct RouterUiOptions {
 
 #[derive(Args, Default)]
 pub struct BandwidthOptions {
-    /// Bandwidth per second in bytes.
+    /// Bandwidth per second in bytes, applied to both directions.
     #[arg(long, value_name = "BANDWIDTH")]
     pub bandwidth: Option<usize>,
+
+    /// Inbound bandwidth per second in bytes, overrides `--bandwidth`. Zero disables the limit.
+    #[arg(long, value_name = "BANDWIDTH")]
+    pub inbound_bandwidth: Option<usize>,
+
+    /// Outbound bandwidth per second in bytes, overrides `--bandwidth`. Zero disables the limit.
+    #[arg(long, value_name = "BANDWIDTH")]
+    pub outbound_bandwidth: Option<usize>,
 
     /// Share ratio.
     #[arg(long, value_name = "SHARE_RATIO")]

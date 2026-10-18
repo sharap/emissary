@@ -21,7 +21,7 @@ use crate::primitives::Str;
 use core::fmt;
 
 /// Specified bandwidth of the router.
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bandwidth {
     /// Under 12 KBps shared bandwidth.
     K,

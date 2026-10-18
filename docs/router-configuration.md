@@ -197,12 +197,22 @@ ml_kem = "3,4"
     <tr>
       <td><code>bandwidth</code></td>
       <td><code>--bandwidth</code></td>
-      <td>Bandwidth limit in bytes (default: 1000000)</td>
+      <td>Bandwidth limit in bytes per second, applied to both directions unless overridden below (default: 1000000)</td>
+    </tr>
+    <tr>
+      <td><code>inbound</code></td>
+      <td><code>--inbound-bandwidth</code></td>
+      <td>Inbound bandwidth limit in bytes per second. <code>0</code> disables the limit. (default: <code>bandwidth</code>)</td>
+    </tr>
+    <tr>
+      <td><code>outbound</code></td>
+      <td><code>--outbound-bandwidth</code></td>
+      <td>Outbound bandwidth limit in bytes per second. Outbound traffic over the limit is queued and sent later, so the limit shapes the traffic rather than dropping it. <code>0</code> disables the limit. (default: <code>bandwidth</code>)</td>
     </tr>
     <tr>
       <td><code>share_ratio</code></td>
       <td><code>--share-ratio</code></td>
-      <td>How much of <code>bandwdith</code> can be allocated for transit traffic (default: 90%)</td>
+      <td>How much of the bandwidth can be allocated for transit traffic (default: 90%)</td>
     </tr>
   </tbody>
 </table>

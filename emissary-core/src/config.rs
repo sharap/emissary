@@ -197,12 +197,19 @@ pub struct TransitConfig {
 /// Bandwidth configuration.
 #[derive(Debug, Clone)]
 pub struct BandwidthConfig {
-    /// Maximum bandwidth, bytes per second.
+    /// Maximum inbound bandwidth, bytes per second. Zero disables the limit.
     ///
     /// Default is 1 MB/s.
-    pub bandwidth: usize,
+    pub inbound: usize,
 
-    /// Share ratio, i.e., how much of `bandwidth` is allocated to transit traffic.
+    /// Maximum outbound bandwidth, bytes per second. Zero disables the limit.
+    ///
+    /// Outbound traffic over the limit is queued and sent later, not dropped.
+    ///
+    /// Default is 1 MB/s.
+    pub outbound: usize,
+
+    /// Share ratio, i.e., how much of the bandwidth is allocated to transit traffic.
     ///
     /// Default is 90%.
     pub share_ratio: f64,
@@ -211,7 +218,8 @@ pub struct BandwidthConfig {
 impl Default for BandwidthConfig {
     fn default() -> Self {
         Self {
-            bandwidth: 1000 * 1000,
+            inbound: 1000 * 1000,
+            outbound: 1000 * 1000,
             share_ratio: 0.9,
         }
     }

@@ -16,35 +16,65 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use crate::{config::BandwidthConfig, primitives::Bandwidth, runtime::Runtime, subsystem::Source};
+//! Bandwidth metering and limiting.
+//!
+//! Limits are enforced with token buckets, one per direction and one per direction for transit
+//! traffic. Outbound messages that don't fit are queued by `SubsystemManager` and sent once
+//! tokens have accumulated, so a limit shapes the traffic instead of dropping it. Inbound
+//! messages have already been received by the time they are checked, so inbound traffic is only
+//! metered and dropped when the limit is exceeded: transit traffic first, local traffic once it
+//! is more than 10% over the limit.
+//!
+//! Bandwidth usage is also averaged over 5-second and 5-minute windows to compute the router's
+//! congestion level which `TransitTunnelManager` uses to reject tunnel build requests and
+//! `TransportManager` uses to publish the congestion caps.
+
+use crate::{
+    config::BandwidthConfig,
+    primitives::Bandwidth,
+    runtime::{Instant, Runtime},
+    subsystem::Source,
+};
 
 use futures::FutureExt;
 
 use alloc::sync::Arc;
 use core::{
-    future::Future,
-    pin::Pin,
     sync::atomic::{AtomicU8, Ordering},
-    task::{Context, Poll},
+    task::Context,
     time::Duration,
 };
 
-/// How often is router's bandwidth usage calculated.
-const BANDWIDTH_MEASUREMENT_INTERVAL: Duration = Duration::from_secs(1);
+/// Logging target for the file.
+const LOG_TARGET: &str = "emissary::bandwidth";
 
-/// Number of slots for the 5-second meter.
+/// How often token buckets are refilled.
+const REFILL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Number of refills per metering slot (one second).
+const REFILLS_PER_SLOT: usize = 10usize;
+
+/// Maximum number of refills done at once when the tracker has not been polled for a while.
+///
+/// Buckets are full and meters are empty after this many refills anyway.
+const MAX_CATCH_UP_REFILLS: usize = REFILLS_PER_SLOT * MEDIUM_WINDOW_LEN;
+
+/// Length of the short-term metering window, in seconds.
 const SHORT_WINDOW_LEN: usize = 5usize;
 
-/// Number of slots for the 5-minute meter.
+/// Length of the medium-term metering window, in seconds.
 const MEDIUM_WINDOW_LEN: usize = 300usize;
 
-/// High congestion threshold.
+/// Usage above this fraction of the limit is high congestion.
 const HIGH_CONGESTION_THRESHOLD: f64 = 0.9f64;
 
-/// Medium congestion threshold.
+/// Usage above this fraction of the limit is medium congestion.
 const MEDIUM_CONGESTION_THRESHOLD: f64 = 0.7f64;
 
-/// Congestion level based on bandwidth usage.
+/// How far over the inbound limit local traffic may go before it's dropped.
+const INBOUND_HEADROOM: f64 = 0.1f64;
+
+/// Congestion level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum CongestionLevel {
@@ -69,11 +99,26 @@ impl CongestionLevel {
             _ => Self::Low,
         }
     }
+
+    /// Congestion level for `usage` bytes per second against `limit` bytes per second.
+    fn for_usage(usage: usize, limit: usize) -> Self {
+        if limit == 0 {
+            return Self::Low;
+        }
+
+        let usage = usage as f64 / limit as f64;
+
+        if usage > HIGH_CONGESTION_THRESHOLD {
+            Self::High
+        } else if usage > MEDIUM_CONGESTION_THRESHOLD {
+            Self::Medium
+        } else {
+            Self::Low
+        }
+    }
 }
 
-/// Current congestion level of the router.
-///
-/// Either short or medium-term congestion, depending on which meter this object is bound to.
+/// Congestion state shared between `BandwidthTracker` and its users.
 #[derive(Debug, Default, Clone)]
 pub struct Congestion {
     /// Curren congestion.
@@ -108,7 +153,97 @@ impl Congestion {
     }
 }
 
-/// Bandwidth slot.
+/// Verdict for an outbound message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Message can be sent now.
+    Send,
+
+    /// Message must wait for the limit to allow it.
+    Wait,
+
+    /// Message must be dropped, there is no budget for its kind of traffic.
+    Drop,
+}
+
+/// Token bucket.
+///
+/// Tokens are bytes. The bucket is refilled with a fixed amount every [`REFILL_INTERVAL`] and
+/// holds at most one second of traffic. Consuming is allowed whenever the bucket isn't in debt
+/// and may push it into debt so that a message larger than the burst still gets sent once enough
+/// tokens have accumulated.
+#[derive(Debug)]
+struct TokenBucket {
+    /// Maximum number of tokens, one second of traffic.
+    burst: i64,
+
+    /// Tokens added per refill.
+    refill: i64,
+
+    /// Available tokens, negative if the bucket is in debt.
+    tokens: i64,
+
+    /// Is the bucket unlimited.
+    unlimited: bool,
+}
+
+impl TokenBucket {
+    /// Create new `TokenBucket` with `rate` bytes per second.
+    ///
+    /// A rate of zero means that nothing is allowed through.
+    fn new(rate: usize) -> Self {
+        Self {
+            burst: rate as i64,
+            refill: rate.div_ceil(REFILLS_PER_SLOT) as i64,
+            tokens: rate as i64,
+            unlimited: false,
+        }
+    }
+
+    /// Create a bucket that allows everything.
+    fn unlimited() -> Self {
+        Self {
+            burst: 0,
+            refill: 0,
+            tokens: 0,
+            unlimited: true,
+        }
+    }
+
+    /// Does the bucket allow nothing through.
+    fn is_closed(&self) -> bool {
+        !self.unlimited && self.burst == 0
+    }
+
+    /// Does the bucket currently allow a message through.
+    ///
+    /// A message is allowed as long as there are tokens left, even if it is larger than the
+    /// remaining tokens, in which case the bucket goes into debt.
+    fn allows(&self) -> bool {
+        self.unlimited || self.tokens > 0
+    }
+
+    /// Is the bucket in debt by more than `fraction` of its burst.
+    fn in_debt_over(&self, fraction: f64) -> bool {
+        !self.unlimited && (self.tokens as f64) < -(self.burst as f64 * fraction)
+    }
+
+    /// Consume `size` tokens.
+    fn consume(&mut self, size: usize) {
+        if !self.unlimited {
+            self.tokens -= size as i64;
+        }
+    }
+
+    /// Refill the bucket.
+    fn refill(&mut self) {
+        if !self.unlimited {
+            self.tokens = (self.tokens + self.refill).min(self.burst);
+        }
+    }
+}
+
+/// Bandwidth usage during one second.
 #[derive(Debug, Default, Clone, Copy)]
 struct BandwidthSlot {
     /// Total inbound bytes in this slot.
@@ -127,19 +262,11 @@ struct BandwidthSlot {
 impl BandwidthSlot {
     /// Reset the slot to zero.
     fn reset(&mut self) {
-        self.inbound = 0;
-        self.outbound = 0;
-        self.transit_inbound = 0;
-        self.transit_outbound = 0;
-    }
-
-    /// Get total bandwidth.
-    fn total(&self) -> usize {
-        self.inbound + self.outbound
+        *self = Self::default();
     }
 }
 
-/// Bandwidth meter.
+/// Bandwidth meter, a ring buffer of per-second usage.
 #[derive(Debug)]
 struct BandwidthMeter<const N: usize> {
     /// Ring buffer of bandwidth slots.
@@ -192,47 +319,68 @@ impl<const N: usize> BandwidthMeter<N> {
         }
     }
 
-    /// Calculate the average bandwidth per second.
-    fn average_bandwidth_per_second(&self) -> usize {
-        self.slots.iter().take(self.filled_slots).map(|s| s.total()).sum::<usize>()
+    /// Average inbound bytes per second.
+    fn average_inbound(&self) -> usize {
+        self.slots.iter().take(self.filled_slots).map(|slot| slot.inbound).sum::<usize>()
             / self.filled_slots
+    }
+
+    /// Average outbound bytes per second.
+    fn average_outbound(&self) -> usize {
+        self.slots.iter().take(self.filled_slots).map(|slot| slot.outbound).sum::<usize>()
+            / self.filled_slots
+    }
+
+    /// Average total bytes per second.
+    #[cfg(test)]
+    fn average_bandwidth_per_second(&self) -> usize {
+        self.average_inbound() + self.average_outbound()
     }
 }
 
 /// Bandwidth tracker.
 pub struct BandwidthTracker<R: Runtime> {
-    /// Maximum amount of traffic per second, in bytes.
-    bandwidth: usize,
-
-    /// Timer for collecting bandwidth measurements.
-    bandwidth_timer: R::Timer,
-
-    /// Current short-term congestion level.
+    /// Current medium-term congestion level.
     congestion_medium: Congestion,
 
     /// Current short-term congestion level.
     congestion_short: Congestion,
 
-    /// Current second's inbound bandwidth (for real-time decisions).
-    current_inbound: usize,
+    /// Token bucket for all inbound traffic.
+    inbound: TokenBucket,
 
-    /// Current second's outbound bandwidth (for real-time decisions).
-    current_outbound: usize,
-
-    /// Current second's transit inbound bandwidth.
-    current_transit_inbound: usize,
-
-    /// Current second's transit outbound bandwidth.
-    current_transit_outbound: usize,
-
-    /// Maximum amount of transit traffic per second, in bytes.
-    max_transit: usize,
+    /// Inbound limit, bytes per second.
+    inbound_limit: usize,
 
     /// 5-minute bandwidth meter.
     meter_medium: BandwidthMeter<MEDIUM_WINDOW_LEN>,
 
     /// 5-second bandwidth meter.
     meter_short: BandwidthMeter<SHORT_WINDOW_LEN>,
+
+    /// Token bucket for all outbound traffic.
+    outbound: TokenBucket,
+
+    /// Outbound limit, bytes per second.
+    outbound_limit: usize,
+
+    /// Elapsed time not yet accounted for by a refill.
+    carry: Duration,
+
+    /// When the buckets were last refilled.
+    last_refill: R::Instant,
+
+    /// Number of refills since the meters were last advanced.
+    refills: usize,
+
+    /// Timer for refilling the buckets.
+    timer: R::Timer,
+
+    /// Token bucket for inbound transit traffic.
+    transit_inbound: TokenBucket,
+
+    /// Token bucket for outbound transit traffic.
+    transit_outbound: TokenBucket,
 }
 
 impl<R: Runtime> BandwidthTracker<R> {
@@ -250,149 +398,197 @@ impl<R: Runtime> BandwidthTracker<R> {
     /// `TransportManager` uses the `Congestion` object to publish correct congestion caps and
     /// bandwidth class.
     pub fn new(config: BandwidthConfig) -> (Self, Congestion, Congestion) {
-        let max_transit = (config.bandwidth as f64 * config.share_ratio) as usize;
-        let congestion_short = Congestion::new(Bandwidth::from(max_transit));
-        let congestion_medium = Congestion::new(Bandwidth::from(max_transit));
+        let transit_rate =
+            |limit: usize| (limit as f64 * config.share_ratio.clamp(0.0, 1.0)) as usize;
+        let bucket = |limit: usize| {
+            if limit == 0 {
+                TokenBucket::unlimited()
+            } else {
+                TokenBucket::new(limit)
+            }
+        };
+        let transit_bucket = |limit: usize| {
+            if limit == 0 {
+                TokenBucket::unlimited()
+            } else {
+                TokenBucket::new(transit_rate(limit))
+            }
+        };
+
+        // advertised bandwidth class is what transit traffic can get in the slower direction
+        let class = match (config.inbound, config.outbound) {
+            (0, 0) => Bandwidth::X,
+            (0, limit) | (limit, 0) => Bandwidth::from(transit_rate(limit)),
+            (inbound, outbound) => Bandwidth::from(transit_rate(inbound.min(outbound))),
+        };
+        let congestion_short = Congestion::new(class);
+        let congestion_medium = Congestion::new(class);
 
         (
             Self {
-                bandwidth: config.bandwidth,
-                bandwidth_timer: R::timer(BANDWIDTH_MEASUREMENT_INTERVAL),
                 congestion_medium: congestion_medium.clone(),
                 congestion_short: congestion_short.clone(),
-                current_inbound: 0,
-                current_outbound: 0,
-                current_transit_inbound: 0,
-                current_transit_outbound: 0,
-                max_transit,
+                inbound: bucket(config.inbound),
+                inbound_limit: config.inbound,
                 meter_medium: BandwidthMeter::new(),
                 meter_short: BandwidthMeter::new(),
+                outbound: bucket(config.outbound),
+                outbound_limit: config.outbound,
+                carry: Duration::ZERO,
+                last_refill: R::now(),
+                refills: 0usize,
+                timer: R::timer(REFILL_INTERVAL),
+                transit_inbound: transit_bucket(config.inbound),
+                transit_outbound: transit_bucket(config.outbound),
             },
             congestion_short,
             congestion_medium,
         )
     }
 
-    /// Get the current bandwidth usage.
-    fn current_bandwidth(&self) -> usize {
-        self.current_inbound + self.current_outbound
-    }
-
-    /// Get the current transit bandwidth usage.
-    fn current_transit_bandwidth(&self) -> usize {
-        self.current_transit_inbound + self.current_transit_outbound
-    }
-
-    /// Check if we should drop this message based on bandwidth limits.
+    /// Get verdict for an outbound message of `size` bytes from `source`.
     ///
-    /// Transit traffic is dropped first if bandwidth is exceeded.
-    fn should_drop(&self, size: usize, source: Source) -> bool {
-        let projected = self.current_bandwidth() + size;
-
-        if projected <= self.bandwidth {
-            if source.is_transit() {
-                let projected = self.current_transit_bandwidth() + size;
-                return projected > self.max_transit;
-            }
-            return false;
-        }
-
-        // always drop transit traffic when over the limit
+    /// If the message can be sent, its bytes are consumed from the buckets and recorded.
+    pub fn outbound_verdict(&mut self, size: usize, source: Source) -> Verdict {
         if source.is_transit() {
-            return true;
+            if self.transit_outbound.is_closed() {
+                return Verdict::Drop;
+            }
+
+            if !self.transit_outbound.allows() {
+                return Verdict::Wait;
+            }
         }
 
-        // start dropping local traffic if we're 10% over the limit to give some headroom
-        projected > self.bandwidth + (self.bandwidth / 10)
-    }
-
-    /// Updated outbound bandwidth.
-    ///
-    /// Returns `true` if the message should be dropped because bandwidth limits have been exceeded.
-    pub fn update_outbound(&mut self, size: usize, source: Source) -> bool {
-        if self.should_drop(size, source) {
-            return true;
+        if !self.outbound.allows() {
+            return Verdict::Wait;
         }
 
-        self.current_outbound += size;
+        self.outbound.consume(size);
+        if source.is_transit() {
+            self.transit_outbound.consume(size);
+        }
         self.meter_short.record_outbound(size, source.is_transit());
         self.meter_medium.record_outbound(size, source.is_transit());
 
-        if source.is_transit() {
-            self.current_transit_outbound += size;
-        }
-
-        false
+        Verdict::Send
     }
 
-    /// Update inbound bandwidth.
+    /// Record an inbound message of `size` bytes from `source`.
     ///
-    /// Returns `true` if the message should be dropped because bandwidth limits have been exceeded.
-    pub fn update_inbound(&mut self, bandwidth: usize, source: Source) -> bool {
-        if self.should_drop(bandwidth, source) {
+    /// Returns `true` if the message must be dropped because the limit has been exceeded:
+    /// transit traffic is dropped as soon as its budget is in debt, local traffic once the
+    /// inbound limit has been exceeded by more than 10%.
+    pub fn inbound_exceeded(&mut self, size: usize, source: Source) -> bool {
+        let exceeded = if source.is_transit() {
+            self.transit_inbound.is_closed()
+                || !self.transit_inbound.allows()
+                || !self.inbound.allows()
+        } else {
+            self.inbound.in_debt_over(INBOUND_HEADROOM)
+        };
+
+        if exceeded {
             return true;
         }
 
-        self.current_inbound += bandwidth;
-        self.meter_short.record_inbound(bandwidth, source.is_transit());
-        self.meter_medium.record_inbound(bandwidth, source.is_transit());
-
+        self.inbound.consume(size);
         if source.is_transit() {
-            self.current_transit_inbound += bandwidth;
+            self.transit_inbound.consume(size);
         }
+        self.meter_short.record_inbound(size, source.is_transit());
+        self.meter_medium.record_inbound(size, source.is_transit());
 
         false
     }
 
-    /// Calculate congestion and update congestion states.
+    /// Refill the buckets and, once a second, advance the meters and update congestion.
+    fn refill(&mut self) {
+        self.inbound.refill();
+        self.outbound.refill();
+        self.transit_inbound.refill();
+        self.transit_outbound.refill();
+        self.refills += 1;
+
+        if self.refills >= REFILLS_PER_SLOT {
+            self.refills = 0;
+            self.calculate_congestion();
+            self.meter_short.advance();
+            self.meter_medium.advance();
+        }
+    }
+
+    /// Calculate congestion from the meters and update congestion states.
     fn calculate_congestion(&mut self) {
-        // calculate average short and medium-term bandwidths
-        let avg_short = self.meter_short.average_bandwidth_per_second();
-        let avg_medium = self.meter_medium.average_bandwidth_per_second();
-
-        let get_congestion_level = |avg: usize| -> CongestionLevel {
-            let high_threshold = (self.bandwidth as f64 * HIGH_CONGESTION_THRESHOLD) as usize;
-            let medium_threshold = (self.bandwidth as f64 * MEDIUM_CONGESTION_THRESHOLD) as usize;
-
-            if avg > high_threshold {
-                CongestionLevel::High
-            } else if avg > medium_threshold {
-                CongestionLevel::Medium
-            } else {
-                CongestionLevel::Low
-            }
+        let level = |inbound: usize, outbound: usize| {
+            CongestionLevel::for_usage(inbound, self.inbound_limit)
+                .max(CongestionLevel::for_usage(outbound, self.outbound_limit))
         };
 
-        // calculate congestion levels
-        self.congestion_short.store(get_congestion_level(avg_short));
-        self.congestion_medium.store(get_congestion_level(avg_medium));
+        self.congestion_short.store(level(
+            self.meter_short.average_inbound(),
+            self.meter_short.average_outbound(),
+        ));
+        self.congestion_medium.store(level(
+            self.meter_medium.average_inbound(),
+            self.meter_medium.average_outbound(),
+        ));
+    }
 
-        // reset current measurements and advance meters
-        self.current_inbound = 0;
-        self.current_outbound = 0;
-        self.current_transit_inbound = 0;
-        self.current_transit_outbound = 0;
+    /// Poll the refill timer.
+    ///
+    /// Returns `true` if the buckets were refilled, in which case queued outbound messages may
+    /// now be sendable.
+    pub fn poll_refill(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.timer.poll_unpin(cx).is_pending() {
+            return false;
+        }
 
-        self.meter_short.advance();
-        self.meter_medium.advance();
+        self.catch_up(self.last_refill.elapsed());
+        self.last_refill = R::now();
+        self.timer = R::timer(REFILL_INTERVAL);
+
+        tracing::trace!(
+            target: LOG_TARGET,
+            inbound = ?self.inbound.tokens,
+            outbound = ?self.outbound.tokens,
+            "buckets refilled",
+        );
+
+        true
+    }
+
+    /// Refill the buckets once per `REFILL_INTERVAL` of `elapsed` time.
+    ///
+    /// The timer has fired so at least one refill is done. Time left over is carried to the next
+    /// call so a late poll doesn't lose bandwidth.
+    fn catch_up(&mut self, elapsed: Duration) {
+        let total = self.carry.saturating_add(elapsed);
+        let (refills, carry) = match (total.as_millis() / REFILL_INTERVAL.as_millis()) as usize {
+            0 => (1usize, Duration::ZERO),
+            refills if refills > MAX_CATCH_UP_REFILLS => (MAX_CATCH_UP_REFILLS, Duration::ZERO),
+            refills => (
+                refills,
+                Duration::from_millis((total.as_millis() % REFILL_INTERVAL.as_millis()) as u64),
+            ),
+        };
+
+        for _ in 0..refills {
+            self.refill();
+        }
+        self.carry = carry;
     }
 }
 
-impl<R: Runtime> Future for BandwidthTracker<R> {
-    type Output = ();
+impl PartialOrd for CongestionLevel {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            match self.bandwidth_timer.poll_unpin(cx) {
-                Poll::Pending => break,
-                Poll::Ready(()) => {
-                    self.calculate_congestion();
-                    self.bandwidth_timer = R::timer(BANDWIDTH_MEASUREMENT_INTERVAL);
-                }
-            }
-        }
-
-        Poll::Pending
+impl Ord for CongestionLevel {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (*self as u8).cmp(&(*other as u8))
     }
 }
 
@@ -401,140 +597,224 @@ mod tests {
     use super::*;
     use crate::runtime::mock::MockRuntime;
 
-    #[tokio::test]
-    async fn no_bandwidth_shared() {
-        let (tracker, ..) = BandwidthTracker::<MockRuntime>::new(BandwidthConfig {
-            bandwidth: 100 * 1024,
-            share_ratio: 0.0,
-        });
+    fn config(inbound: usize, outbound: usize, share_ratio: f64) -> BandwidthConfig {
+        BandwidthConfig {
+            inbound,
+            outbound,
+            share_ratio,
+        }
+    }
 
-        assert_eq!(tracker.bandwidth, 100 * 1024);
-        assert_eq!(tracker.max_transit, 0);
+    #[test]
+    fn token_bucket_refills_and_allows_debt() {
+        let mut bucket = TokenBucket::new(1000);
+        assert!(bucket.allows());
+
+        // a message larger than the burst is allowed and leaves the bucket in debt
+        bucket.consume(1500);
+        assert!(!bucket.allows());
+        assert_eq!(bucket.tokens, -500);
+
+        // five refills of 100 bytes bring the bucket back to zero, the sixth makes it positive
+        for _ in 0..5 {
+            bucket.refill();
+            assert!(!bucket.allows());
+        }
+        bucket.refill();
+        assert!(bucket.allows());
+
+        // tokens never exceed the burst
+        for _ in 0..100 {
+            bucket.refill();
+        }
+        assert_eq!(bucket.tokens, 1000);
+
+        // closed and unlimited buckets
+        assert!(TokenBucket::new(0).is_closed());
+        assert!(!TokenBucket::new(0).allows());
+        assert!(TokenBucket::unlimited().allows());
+        let mut unlimited = TokenBucket::unlimited();
+        unlimited.consume(usize::MAX / 2);
+        assert!(unlimited.allows());
     }
 
     #[tokio::test]
-    async fn all_bandwidth_shared() {
-        let (tracker, ..) = BandwidthTracker::<MockRuntime>::new(BandwidthConfig {
-            bandwidth: 100 * 1024,
-            share_ratio: 1.0,
-        });
+    async fn bandwidth_class_from_slower_direction() {
+        let (tracker, congestion, _) =
+            BandwidthTracker::<MockRuntime>::new(config(100_000, 2_000_000, 0.5));
+        assert_eq!(congestion.bandwidth(), Bandwidth::from(50_000));
+        assert_eq!(tracker.transit_outbound.burst, 1_000_000);
+        assert_eq!(tracker.transit_inbound.burst, 50_000);
 
-        assert_eq!(tracker.bandwidth, 100 * 1024);
-        assert_eq!(tracker.max_transit, 100 * 1024);
+        let (_, congestion, _) = BandwidthTracker::<MockRuntime>::new(config(0, 0, 0.9));
+        assert_eq!(congestion.bandwidth(), Bandwidth::X);
     }
 
     #[tokio::test]
-    async fn transit_dropped_when_over_transit_limit() {
-        let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(BandwidthConfig {
-            bandwidth: 1000,
-            share_ratio: 0.5,
-        });
+    async fn outbound_transit_waits_for_its_share() {
+        let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(config(1000, 1000, 0.5));
 
-        assert!(!tracker.update_inbound(400, Source::Transit));
-        assert!(!tracker.update_inbound(100, Source::Transit));
+        // transit may use 500 bytes per second
+        assert_eq!(tracker.outbound_verdict(400, Source::Transit), Verdict::Send);
+        assert_eq!(tracker.outbound_verdict(400, Source::Transit), Verdict::Send);
+        assert_eq!(tracker.outbound_verdict(100, Source::Transit), Verdict::Wait);
 
-        // transit dropped as it's over the transit limit (500 bytes)
-        //
-        // local traffic has capacity left
-        assert!(tracker.update_inbound(100, Source::Transit));
-        assert!(!tracker.update_inbound(100, Source::Client));
+        // local traffic has the rest of the total budget
+        assert_eq!(tracker.outbound_verdict(200, Source::Client), Verdict::Send);
+        assert_eq!(tracker.outbound_verdict(200, Source::Client), Verdict::Wait);
+
+        // after a second everything is allowed again
+        for _ in 0..REFILLS_PER_SLOT {
+            tracker.refill();
+        }
+        assert_eq!(tracker.outbound_verdict(100, Source::Transit), Verdict::Send);
+        assert_eq!(tracker.outbound_verdict(100, Source::Client), Verdict::Send);
     }
 
     #[tokio::test]
-    async fn transit_dropped_first_when_over_total_limit() {
-        let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(BandwidthConfig {
-            bandwidth: 1000,
-            share_ratio: 1.0,
-        });
+    async fn outbound_transit_dropped_without_share() {
+        let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(config(1000, 1000, 0.0));
 
-        assert!(!tracker.update_inbound(900, Source::Client));
+        assert_eq!(tracker.outbound_verdict(100, Source::Transit), Verdict::Drop);
+        assert_eq!(tracker.outbound_verdict(100, Source::Client), Verdict::Send);
+    }
 
-        // tarnsit traffic is dropped as it's over the limit by 100 bytes
-        //
-        // local traffit has 10% of headroom
-        assert!(tracker.update_inbound(200, Source::Transit));
-        assert!(!tracker.update_inbound(200, Source::Client));
+    #[tokio::test]
+    async fn unlimited_outbound_always_sends() {
+        let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(config(1000, 0, 0.5));
+
+        for _ in 0..100 {
+            assert_eq!(tracker.outbound_verdict(10_000, Source::Client), Verdict::Send);
+            assert_eq!(tracker.outbound_verdict(10_000, Source::Transit), Verdict::Send);
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_transit_dropped_first() {
+        let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(config(1000, 1000, 0.5));
+
+        // transit budget is 500 bytes, the bucket may go into debt once
+        assert!(!tracker.inbound_exceeded(400, Source::Transit));
+        assert!(!tracker.inbound_exceeded(400, Source::Transit));
+        assert!(tracker.inbound_exceeded(100, Source::Transit));
+
+        // local traffic may exceed the total limit by 10%
+        assert!(!tracker.inbound_exceeded(250, Source::Client));
+        assert!(!tracker.inbound_exceeded(100, Source::Client));
+        assert!(tracker.inbound_exceeded(1, Source::Client));
+
+        // and transit is dropped while the total budget is exhausted
+        for _ in 0..REFILLS_PER_SLOT {
+            tracker.refill();
+        }
+        assert!(!tracker.inbound_exceeded(1000, Source::Client));
+        assert!(tracker.inbound_exceeded(1, Source::Transit));
     }
 
     #[tokio::test]
     async fn bandwidth_recorded_in_meters() {
-        let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(BandwidthConfig {
-            bandwidth: 10000,
-            share_ratio: 0.8,
-        });
+        let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(config(10000, 10000, 0.8));
 
-        tracker.update_inbound(100, Source::Client);
-        tracker.update_outbound(1000, Source::Transit);
+        assert!(!tracker.inbound_exceeded(100, Source::Client));
+        assert_eq!(tracker.outbound_verdict(1000, Source::Transit), Verdict::Send);
 
-        // both meters should have the same value
         assert_eq!(tracker.meter_short.average_bandwidth_per_second(), 1100);
         assert_eq!(tracker.meter_medium.average_bandwidth_per_second(), 1100);
+        assert_eq!(tracker.meter_short.slots[0].transit_outbound, 1000);
+        assert_eq!(tracker.meter_short.slots[0].transit_inbound, 0);
     }
 
     #[tokio::test]
-    async fn congestion_low_when_under_70_percent() {
-        let (mut tracker, congestion, _) = BandwidthTracker::<MockRuntime>::new(BandwidthConfig {
-            bandwidth: 1000,
-            share_ratio: 0.8,
-        });
+    async fn congestion_levels() {
+        let (mut tracker, congestion, _) =
+            BandwidthTracker::<MockRuntime>::new(config(1000, 1000, 0.8));
 
-        tracker.update_inbound(600, Source::Client);
+        assert!(!tracker.inbound_exceeded(600, Source::Client));
         tracker.calculate_congestion();
+        assert_eq!(congestion.load(), CongestionLevel::Low);
 
+        assert!(!tracker.inbound_exceeded(200, Source::Client));
+        tracker.calculate_congestion();
+        assert_eq!(congestion.load(), CongestionLevel::Medium);
+
+        // congestion follows the busier direction
+        assert_eq!(tracker.outbound_verdict(950, Source::Client), Verdict::Send);
+        tracker.calculate_congestion();
+        assert_eq!(congestion.load(), CongestionLevel::High);
+
+        // unlimited directions never count as congested
+        let (mut tracker, congestion, _) = BandwidthTracker::<MockRuntime>::new(config(0, 0, 0.8));
+        assert_eq!(tracker.outbound_verdict(1_000_000, Source::Client), Verdict::Send);
+        tracker.calculate_congestion();
         assert_eq!(congestion.load(), CongestionLevel::Low);
     }
 
-    #[tokio::test]
-    async fn congestion_medium_when_between_70_and_90_percent() {
-        let (mut tracker, congestion, _) = BandwidthTracker::<MockRuntime>::new(BandwidthConfig {
-            bandwidth: 1000,
-            share_ratio: 0.8,
-        });
-
-        tracker.update_inbound(800, Source::Client);
-        tracker.calculate_congestion();
-
-        assert_eq!(congestion.load(), CongestionLevel::Medium);
-    }
-
-    #[tokio::test]
-    async fn congestion_high_when_over_90_percent() {
-        let (mut tracker, congestion, _) = BandwidthTracker::<MockRuntime>::new(BandwidthConfig {
-            bandwidth: 1000,
-            share_ratio: 0.8,
-        });
-
-        tracker.update_inbound(950, Source::Client);
-        tracker.calculate_congestion();
-
-        assert_eq!(congestion.load(), CongestionLevel::High);
-    }
-
-    #[tokio::test]
-    async fn meter_average_calculation() {
+    #[test]
+    fn meter_average_calculation() {
         let mut meter = BandwidthMeter::<5>::new();
-
         meter.record_inbound(100, false);
         meter.advance();
-
         meter.record_inbound(200, false);
 
         assert_eq!(meter.average_bandwidth_per_second(), 150);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn refill_timer_advances_meters() {
+        let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(config(1000, 1000, 0.5));
+        assert_eq!(tracker.outbound_verdict(1000, Source::Client), Verdict::Send);
+        assert_eq!(tracker.outbound_verdict(1, Source::Client), Verdict::Wait);
+
+        // nothing refilled yet
+        assert!(!futures::future::poll_fn(|cx| core::task::Poll::Ready(tracker.poll_refill(cx)))
+            .await);
+
+        // one refill interval later the bucket has 100 bytes again
+        tokio::time::sleep(REFILL_INTERVAL + Duration::from_millis(1)).await;
+        assert!(futures::future::poll_fn(|cx| core::task::Poll::Ready(tracker.poll_refill(cx)))
+            .await);
+        assert_eq!(tracker.outbound.tokens, 100);
+        assert_eq!(tracker.outbound_verdict(100, Source::Client), Verdict::Send);
+        assert_eq!(tracker.outbound_verdict(1, Source::Client), Verdict::Wait);
+        assert_eq!(tracker.refills, 1);
+
+        // ten refills later the meters have advanced
+        for _ in 0..REFILLS_PER_SLOT {
+            tokio::time::sleep(REFILL_INTERVAL).await;
+            assert!(futures::future::poll_fn(|cx| core::task::Poll::Ready(
+                tracker.poll_refill(cx)
+            ))
+            .await);
+        }
+        assert_eq!(tracker.refills, 1);
+        assert_eq!(tracker.meter_short.filled_slots, 2);
+    }
+
     #[tokio::test]
-    async fn meter_transit_tracking() {
-        let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(BandwidthConfig {
-            bandwidth: 1000,
-            share_ratio: 0.8,
-        });
+    async fn late_poll_catches_up() {
+        let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(config(1000, 1000, 0.5));
+        assert_eq!(tracker.outbound_verdict(1000, Source::Client), Verdict::Send);
+        assert_eq!(tracker.outbound.tokens, 0);
 
-        tracker.update_inbound(100, Source::Transit);
-        tracker.update_inbound(50, Source::Exploratory);
-        tracker.update_outbound(75, Source::Transit);
-        tracker.update_outbound(25, Source::NetDb);
+        // the timer fired early or mock time stood still: still one refill
+        tracker.catch_up(Duration::ZERO);
+        assert_eq!(tracker.outbound.tokens, 100);
+        assert_eq!(tracker.carry, Duration::ZERO);
 
-        assert_eq!(tracker.current_bandwidth(), 250);
-        assert_eq!(tracker.current_transit_bandwidth(), 175);
+        // 250 ms late: two refills, 50 ms carried over
+        tracker.catch_up(Duration::from_millis(250));
+        assert_eq!(tracker.outbound.tokens, 300);
+        assert_eq!(tracker.carry, Duration::from_millis(50));
+
+        // the carry completes the next interval
+        tracker.catch_up(Duration::from_millis(50));
+        assert_eq!(tracker.outbound.tokens, 400);
+        assert_eq!(tracker.carry, Duration::ZERO);
+
+        // a long pause refills at most the bucket, the meters have been advanced and reset
+        tracker.catch_up(Duration::from_secs(3600));
+        assert_eq!(tracker.outbound.tokens, 1000);
+        assert_eq!(tracker.carry, Duration::ZERO);
+        assert_eq!(tracker.meter_short.average_outbound(), 0);
     }
 }

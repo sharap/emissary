@@ -30,13 +30,12 @@ use crate::{
     primitives::{MessageId, RouterId, TunnelId},
     runtime::{Gauge, MetricType, MetricsHandle, Runtime},
     subsystem::{
-        bandwidth::{BandwidthTracker, Congestion, CongestionLevel},
+        bandwidth::{BandwidthTracker, Congestion, CongestionLevel, Verdict},
         metrics::*,
     },
     tunnel::{DeliveryInstructions, NoiseContext},
 };
 
-use futures::FutureExt;
 use futures_channel::oneshot;
 use hashbrown::HashMap;
 use rand::{CryptoRng, Rng};
@@ -63,6 +62,24 @@ const LOG_TARGET: &str = "emissary::subsystem";
 
 /// NetDb event queue maximum size.
 const NETDB_EVENT_QUEUE_LEN: usize = 512usize;
+
+/// How many seconds of outbound local traffic may be queued while waiting for bandwidth.
+const LOCAL_QUEUE_SECONDS: usize = 2usize;
+
+/// How many seconds of outbound transit traffic may be queued while waiting for bandwidth.
+const TRANSIT_QUEUE_SECONDS: usize = 1usize;
+
+/// Outbound message waiting for the bandwidth limit to allow it.
+struct QueuedMessage {
+    /// Router the message is sent to.
+    router_id: RouterId,
+
+    /// Message.
+    message: OutboundMessage,
+
+    /// Source of the message.
+    source: Source,
+}
 
 /// Subsystem event.
 #[derive(Default, Debug, Clone)]
@@ -456,6 +473,18 @@ pub struct SubsystemManager<R: Runtime> {
     /// build-related messages.
     listeners: Arc<RwLock<HashMap<MessageId, oneshot::Sender<Message>>>>,
 
+    /// Outbound local messages waiting for the bandwidth limit, in order.
+    local_queue: VecDeque<QueuedMessage>,
+
+    /// Bytes queued in `local_queue`.
+    local_queue_bytes: usize,
+
+    /// Maximum number of bytes queued in `local_queue`.
+    max_local_queue_bytes: usize,
+
+    /// Maximum number of bytes queued in `transit_queue`.
+    max_transit_queue_bytes: usize,
+
     /// TX channel for routing messages to `NetDb`.
     netdb_tx: Sender<NetDbEvent>,
 
@@ -470,6 +499,12 @@ pub struct SubsystemManager<R: Runtime> {
 
     /// Connected routers.
     routers: HashMap<RouterId, RouterState>,
+
+    /// Outbound transit messages waiting for the bandwidth limit, in order.
+    transit_queue: VecDeque<QueuedMessage>,
+
+    /// Bytes queued in `transit_queue`.
+    transit_queue_bytes: usize,
 
     /// TX channel for routing messages to `TransitTunnelManager`
     transit_tx: Sender<Vec<(RouterId, Message)>>,
@@ -493,16 +528,27 @@ impl<R: Runtime> SubsystemManager<R> {
 
         tracing::info!(
             target: LOG_TARGET,
-            bandwidth = config.bandwidth,
+            inbound = config.inbound,
+            outbound = config.outbound,
             share_ratio = %format!("{}%", config.share_ratio * 100.0),
             "starting SubsystemManager",
         );
 
         // set gauges for max (transit) bandwidth so they can be used in grafana
-        metrics_handle.gauge(MAX_BANDWIDTH).increment(config.bandwidth);
+        metrics_handle.gauge(MAX_BANDWIDTH).increment(config.outbound);
         metrics_handle
             .gauge(MAX_TRANSIT_BANDWIDTH)
-            .increment((config.bandwidth as f64 * config.share_ratio) as usize);
+            .increment((config.outbound as f64 * config.share_ratio) as usize);
+
+        // outbound queues hold a few seconds of traffic, an unlimited direction never queues
+        let (max_local_queue_bytes, max_transit_queue_bytes) = match config.outbound {
+            0 => (usize::MAX, usize::MAX),
+            outbound => (
+                outbound.saturating_mul(LOCAL_QUEUE_SECONDS),
+                ((outbound as f64 * config.share_ratio) as usize)
+                    .saturating_mul(TRANSIT_QUEUE_SECONDS),
+            ),
+        };
 
         let (event_tx, event_rx) = with_recycle(8192, SubsystemManagerEventRecycle::default());
         let (transit_tx, transit_rx) = channel(256);
@@ -525,11 +571,17 @@ impl<R: Runtime> SubsystemManager<R> {
                 dial_tx,
                 event_rx,
                 listeners: Arc::clone(&listeners),
+                local_queue: VecDeque::new(),
+                local_queue_bytes: 0usize,
+                max_local_queue_bytes,
+                max_transit_queue_bytes,
                 netdb_tx,
                 noise,
                 pending_netdb_events: VecDeque::new(),
                 router_id,
                 routers: HashMap::new(),
+                transit_queue: VecDeque::new(),
+                transit_queue_bytes: 0usize,
                 transit_tx,
                 transport_rx,
                 tunnels: Arc::clone(&tunnels),
@@ -564,10 +616,7 @@ impl<R: Runtime> SubsystemManager<R> {
         message: OutboundMessage,
         source: Source,
     ) {
-        if self.bandwidth_tracker.update_outbound(message.len(), source) {
-            return;
-        }
-
+        // messages to ourselves don't use the network
         if router_id == self.router_id {
             tracing::trace!(
                 target: LOG_TARGET,
@@ -589,6 +638,108 @@ impl<R: Runtime> SubsystemManager<R> {
             };
         }
 
+        // keep messages of a class in order: if something is already waiting, queue behind it
+        let waiting = if source.is_transit() {
+            !self.transit_queue.is_empty()
+        } else {
+            !self.local_queue.is_empty()
+        };
+
+        if waiting {
+            return self.enqueue_outbound_message(router_id, message, source);
+        }
+
+        match self.bandwidth_tracker.outbound_verdict(message.len(), source) {
+            Verdict::Send => self.deliver_outbound_message(router_id, message),
+            Verdict::Wait => self.enqueue_outbound_message(router_id, message, source),
+            Verdict::Drop => tracing::trace!(
+                target: LOG_TARGET,
+                %router_id,
+                ?source,
+                "no bandwidth for transit traffic, dropping message",
+            ),
+        }
+    }
+
+    /// Queue outbound `message` until the bandwidth limit allows sending it.
+    ///
+    /// The message is dropped if the queue of its class already holds its maximum amount of
+    /// bytes.
+    fn enqueue_outbound_message(
+        &mut self,
+        router_id: RouterId,
+        message: OutboundMessage,
+        source: Source,
+    ) {
+        let len = message.len();
+        let (queue, queued_bytes, max_bytes) = if source.is_transit() {
+            (
+                &mut self.transit_queue,
+                &mut self.transit_queue_bytes,
+                self.max_transit_queue_bytes,
+            )
+        } else {
+            (
+                &mut self.local_queue,
+                &mut self.local_queue_bytes,
+                self.max_local_queue_bytes,
+            )
+        };
+
+        if queued_bytes.saturating_add(len) > max_bytes {
+            tracing::debug!(
+                target: LOG_TARGET,
+                %router_id,
+                ?source,
+                queued_bytes = ?*queued_bytes,
+                "outbound queue is full, dropping message",
+            );
+            return;
+        }
+
+        *queued_bytes += len;
+        queue.push_back(QueuedMessage {
+            router_id,
+            message,
+            source,
+        });
+    }
+
+    /// Send queued outbound messages that the bandwidth limit now allows.
+    ///
+    /// Local traffic is served before transit traffic.
+    fn drain_outbound_queues(&mut self) {
+        for is_transit in [false, true] {
+            loop {
+                let (queue, queued_bytes) = if is_transit {
+                    (&mut self.transit_queue, &mut self.transit_queue_bytes)
+                } else {
+                    (&mut self.local_queue, &mut self.local_queue_bytes)
+                };
+                let Some(front) = queue.front() else {
+                    break;
+                };
+                let (len, source) = (front.message.len(), front.source);
+
+                let verdict = self.bandwidth_tracker.outbound_verdict(len, source);
+                if verdict == Verdict::Wait {
+                    break;
+                }
+
+                let QueuedMessage {
+                    router_id, message, ..
+                } = queue.pop_front().expect("message to exist");
+                *queued_bytes -= len;
+
+                if verdict == Verdict::Send {
+                    self.deliver_outbound_message(router_id, message);
+                }
+            }
+        }
+    }
+
+    /// Deliver outbound `message` to the router identified by `router_id`.
+    fn deliver_outbound_message(&mut self, router_id: RouterId, message: OutboundMessage) {
         match self.routers.get_mut(&router_id) {
             Some(RouterState::Dialing { pending }) => {
                 tracing::trace!(
@@ -651,7 +802,7 @@ impl<R: Runtime> SubsystemManager<R> {
                 | MessageType::DeliveryStatus =>
                     if !self
                         .bandwidth_tracker
-                        .update_inbound(message.serialized_len_long(), Source::NetDb)
+                        .inbound_exceeded(message.serialized_len_long(), Source::NetDb)
                     {
                         netdb.push((router_id, message));
                     },
@@ -700,7 +851,7 @@ impl<R: Runtime> SubsystemManager<R> {
                 | MessageType::TunnelBuild => {
                     if !self
                         .bandwidth_tracker
-                        .update_inbound(message.serialized_len_short(), Source::Unknown)
+                        .inbound_exceeded(message.serialized_len_short(), Source::Unknown)
                     {
                         if let Ok(Some(message)) = self.route_tunnel_build_message(message) {
                             transit.push((router_id.clone(), message));
@@ -716,7 +867,7 @@ impl<R: Runtime> SubsystemManager<R> {
                         "unhandled message type",
                     );
                     self.bandwidth_tracker
-                        .update_inbound(message.serialized_len_short(), Source::Unknown);
+                        .inbound_exceeded(message.serialized_len_short(), Source::Unknown);
                 }
             }
         }
@@ -751,7 +902,7 @@ impl<R: Runtime> SubsystemManager<R> {
                 for message in messages {
                     if self
                         .bandwidth_tracker
-                        .update_inbound(message.serialized_len_short(), *source)
+                        .inbound_exceeded(message.serialized_len_short(), *source)
                     {
                         continue;
                     }
@@ -989,7 +1140,9 @@ impl<R: Runtime> Future for SubsystemManager<R> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let _ = self.bandwidth_tracker.poll_unpin(cx);
+        if self.bandwidth_tracker.poll_refill(cx) {
+            self.drain_outbound_queues();
+        }
 
         loop {
             match self.event_rx.poll_recv(cx) {
@@ -1418,7 +1571,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn outbound_messages_limited_by_bandwidth() {
+    async fn outbound_messages_shaped_by_bandwidth() {
         let private_key = StaticPrivateKey::random(MockRuntime::rng());
         let router_id = RouterId::random();
         let SubsystemManagerContext {
@@ -1432,14 +1585,15 @@ mod tests {
             router_id.clone(),
             NoiseContext::new(private_key, Bytes::from(router_id.to_vec())),
             BandwidthConfig {
-                bandwidth: 1000,
+                inbound: 1000,
+                outbound: 1000,
                 share_ratio: 0.5,
             },
             MockRuntime::register_metrics(vec![], None),
         );
         let router_id = RouterId::random();
 
-        let (msg_tx, msg_rx) = with_recycle(16, OutboundMessageRecycle::default());
+        let (msg_tx, msg_rx) = with_recycle(64, OutboundMessageRecycle::default());
         tx.send(SubsystemEvent::ConnectionEstablished {
             router_id: router_id.clone(),
             tx: msg_tx,
@@ -1448,45 +1602,142 @@ mod tests {
         .unwrap();
         poll_manager!(manager);
 
+        // every message is 400 bytes on the wire
         let message = |message_id: u32| Message {
             message_id,
-            payload: vec![0xaa; 400],
+            payload: vec![0xaa; 389],
             ..Default::default()
         };
+        assert_eq!(message(0).serialized_len_short(), 400);
+
         let received = |msg_rx: &Receiver<OutboundMessage, OutboundMessageRecycle>| {
-            match msg_rx.try_recv() {
-                Ok(OutboundMessage::Message(message)) => Some(message.message_id),
-                Ok(_) => panic!("invalid message type"),
-                Err(_) => None,
+            let mut ids = Vec::new();
+            while let Ok(message) = msg_rx.try_recv() {
+                match message {
+                    OutboundMessage::Message(message) => ids.push(message.message_id),
+                    _ => panic!("invalid message type"),
+                }
             }
+            ids
         };
-
-        // transit traffic may use half of the budget: the first message fits, the second doesn't
         let transit = handle.clone().with_source(Source::Transit);
-        transit.send(&router_id, message(1)).unwrap();
-        transit.send(&router_id, message(2)).unwrap();
-        poll_manager!(manager);
-        assert_eq!(received(&msg_rx), Some(1));
-        assert_eq!(received(&msg_rx), None);
-
-        // local traffic may use the rest of the budget plus 10% headroom
         let client = handle.clone().with_source(Source::Client);
-        client.send(&router_id, message(3)).unwrap();
-        client.send(&router_id, message(4)).unwrap();
-        poll_manager!(manager);
-        assert_eq!(received(&msg_rx), Some(3));
-        assert_eq!(received(&msg_rx), None);
 
-        // a second later the budget is replenished
-        tokio::time::sleep(core::time::Duration::from_millis(1100)).await;
+        // transit has 500 bytes per second: two messages pass (the second leaves the bucket in
+        // debt), the third waits
+        for id in 1..=3 {
+            transit.send(&router_id, message(id)).unwrap();
+        }
+        poll_manager!(manager);
+        assert_eq!(received(&msg_rx), vec![1, 2]);
+        assert_eq!(manager.transit_queue.len(), 1);
+
+        // the total budget has 200 bytes left: one local message passes, the next waits
+        for id in 4..=5 {
+            client.send(&router_id, message(id)).unwrap();
+        }
+        poll_manager!(manager);
+        assert_eq!(received(&msg_rx), vec![4]);
+        assert_eq!(manager.local_queue.len(), 1);
+
+        // local traffic may queue two seconds worth of bytes, the rest is dropped
+        for id in 6..=10 {
+            client.send(&router_id, message(id)).unwrap();
+        }
+        poll_manager!(manager);
+        assert_eq!(received(&msg_rx), Vec::<u32>::new());
+        assert_eq!(manager.local_queue.len(), 5);
+        assert_eq!(manager.local_queue_bytes, 2000);
+
+        // mock instants use wall-clock time, so the buckets are refilled once per poll
+        // and the manager is polled once per refill interval
+        macro_rules! advance {
+            ($ms:expr) => {
+                for _ in 0..($ms / 100) {
+                    tokio::time::sleep(core::time::Duration::from_millis(100)).await;
+                    poll_manager!(manager);
+                }
+            };
+        }
+
+        // after 300 ms the total bucket is positive again: the first queued local message goes
+        advance!(200);
+        assert_eq!(received(&msg_rx), Vec::<u32>::new());
+        advance!(100);
+        assert_eq!(received(&msg_rx), vec![5]);
+
+        // 800 ms in, the transit bucket is out of debt but local traffic is served first
+        advance!(500);
+        assert_eq!(received(&msg_rx), vec![6]);
+        assert_eq!(manager.transit_queue.len(), 1);
+
+        // eventually everything that was queued is delivered, in order and without duplicates
+        let mut all = Vec::new();
+        for _ in 0..30 {
+            advance!(100);
+            all.extend(received(&msg_rx));
+        }
+        assert_eq!(all, vec![7, 8, 9, 3]);
+        assert!(manager.local_queue.is_empty());
+        assert!(manager.transit_queue.is_empty());
+        assert_eq!(manager.local_queue_bytes, 0);
+        assert_eq!(manager.transit_queue_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn outbound_unlimited_when_bandwidth_is_zero() {
+        let private_key = StaticPrivateKey::random(MockRuntime::rng());
+        let router_id = RouterId::random();
+        let SubsystemManagerContext {
+            netdb_rx: _netdb_rx,
+            mut manager,
+            handle,
+            transit_rx: _transit_rx,
+            transport_tx: tx,
+            ..
+        } = SubsystemManager::<MockRuntime>::new(
+            router_id.clone(),
+            NoiseContext::new(private_key, Bytes::from(router_id.to_vec())),
+            BandwidthConfig {
+                inbound: 0,
+                outbound: 0,
+                share_ratio: 0.9,
+            },
+            MockRuntime::register_metrics(vec![], None),
+        );
+        let router_id = RouterId::random();
+
+        let (msg_tx, msg_rx) = with_recycle(64, OutboundMessageRecycle::default());
+        tx.send(SubsystemEvent::ConnectionEstablished {
+            router_id: router_id.clone(),
+            tx: msg_tx,
+        })
+        .await
+        .unwrap();
         poll_manager!(manager);
 
-        transit.send(&router_id, message(5)).unwrap();
-        client.send(&router_id, message(6)).unwrap();
+        let transit = handle.clone().with_source(Source::Transit);
+        for id in 0..20u32 {
+            transit
+                .send(
+                    &router_id,
+                    Message {
+                        message_id: id,
+                        payload: vec![0xaa; 60_000],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
         poll_manager!(manager);
-        assert_eq!(received(&msg_rx), Some(5));
-        assert_eq!(received(&msg_rx), Some(6));
-        assert_eq!(received(&msg_rx), None);
+
+        for id in 0..20u32 {
+            match msg_rx.try_recv().unwrap() {
+                OutboundMessage::Message(message) => assert_eq!(message.message_id, id),
+                _ => panic!("invalid message type"),
+            }
+        }
+        assert!(manager.local_queue.is_empty() && manager.transit_queue.is_empty());
     }
 
     #[tokio::test]
