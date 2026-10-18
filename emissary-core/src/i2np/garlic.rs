@@ -607,50 +607,54 @@ impl<'a> GarlicMessage<'a> {
     }
 
     /// Attempt to parse [`GarlicMessageBlock`] from `input`.
-    fn parse_frame(input: &'a [u8]) -> IResult<&'a [u8], GarlicMessageBlock<'a>, GarlicParseError> {
-        let (rest, message_type) = be_u8(input)?;
+    ///
+    /// Unsupported blocks are skipped iteratively until a supported block is found.
+    fn parse_frame(
+        mut input: &'a [u8],
+    ) -> IResult<&'a [u8], GarlicMessageBlock<'a>, GarlicParseError> {
+        loop {
+            let (rest, message_type) = be_u8(input)?;
 
-        match GarlicMessageType::from_u8(message_type) {
-            Some(GarlicMessageType::DateTime) => Self::parse_date_time(rest),
-            Some(GarlicMessageType::GarlicClove) => Self::parse_garlic_clove(rest),
-            Some(GarlicMessageType::Padding) => Self::parse_padding(rest),
-            Some(GarlicMessageType::NextKey) => Self::parse_next_key(rest),
-            Some(GarlicMessageType::AckRequest) => Self::parse_ack_request(rest),
-            Some(GarlicMessageType::Ack) => Self::parse_ack(rest),
-            parsed_message_type => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    ?message_type,
-                    ?parsed_message_type,
-                    "unsupported garlic message block",
-                );
-                let (rest, size) = be_u16(rest)?;
-                let (rest, _) = take(size)(rest)?;
+            match GarlicMessageType::from_u8(message_type) {
+                Some(GarlicMessageType::DateTime) => return Self::parse_date_time(rest),
+                Some(GarlicMessageType::GarlicClove) => return Self::parse_garlic_clove(rest),
+                Some(GarlicMessageType::Padding) => return Self::parse_padding(rest),
+                Some(GarlicMessageType::NextKey) => return Self::parse_next_key(rest),
+                Some(GarlicMessageType::AckRequest) => return Self::parse_ack_request(rest),
+                Some(GarlicMessageType::Ack) => return Self::parse_ack(rest),
+                parsed_message_type => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        ?message_type,
+                        ?parsed_message_type,
+                        "unsupported garlic message block",
+                    );
+                    let (rest, size) = be_u16(rest)?;
+                    let (rest, _) = take(size)(rest)?;
 
-                Self::parse_frame(rest)
+                    input = rest;
+                }
             }
         }
     }
 
-    /// Recursively parse `input` into a vector of [`GarlicMessageBlock`]s
-    fn parse_inner(
-        input: &'a [u8],
-        mut messages: Vec<GarlicMessageBlock<'a>>,
-    ) -> Result<Vec<GarlicMessageBlock<'a>>, GarlicParseError> {
-        let (rest, message) = Self::parse_frame(input)?;
-        messages.push(message);
-
-        match rest.is_empty() {
-            true => Ok(messages),
-            false => Self::parse_inner(rest, messages),
-        }
-    }
-
     /// Attempt to parse `input` into [`GarlicMessage`].
-    pub fn parse(input: &'a [u8]) -> Result<Self, GarlicParseError> {
-        Ok(Self {
-            blocks: Self::parse_inner(input, Vec::new())?,
-        })
+    ///
+    /// Blocks are parsed iteratively so that a message consisting of thousands of tiny blocks
+    /// cannot exhaust the stack.
+    pub fn parse(mut input: &'a [u8]) -> Result<Self, GarlicParseError> {
+        let mut blocks = Vec::new();
+
+        loop {
+            let (rest, block) = Self::parse_frame(input)?;
+            blocks.push(block);
+
+            if rest.is_empty() {
+                return Ok(Self { blocks });
+            }
+
+            input = rest;
+        }
     }
 
     /// Extract garlic tag from `message`.
@@ -927,5 +931,36 @@ mod tests {
             GarlicMessageBlock::DateTime { timestamp } => assert_eq!(timestamp, 1338u32),
             _ => panic!("invalid garlic block"),
         }
+    }
+
+    #[test]
+    fn parse_message_of_many_tiny_blocks() {
+        // maximum-size garlic message filled with empty padding blocks (type + zero size)
+        let num_blocks = u16::MAX as usize / 3;
+        let input = [254u8, 0u8, 0u8].repeat(num_blocks);
+
+        let message = GarlicMessage::parse(&input).unwrap();
+
+        assert_eq!(message.blocks.len(), num_blocks);
+        assert!(message
+            .blocks
+            .iter()
+            .all(|block| core::matches!(block, GarlicMessageBlock::Padding { .. })));
+    }
+
+    #[test]
+    fn parse_message_of_many_unsupported_blocks() {
+        // thousands of unsupported blocks followed by one padding block
+        let num_blocks = u16::MAX as usize / 3;
+        let mut input = [0x7fu8, 0u8, 0u8].repeat(num_blocks);
+        input.extend([254u8, 0u8, 0u8]);
+
+        let message = GarlicMessage::parse(&input).unwrap();
+
+        assert_eq!(message.blocks.len(), 1);
+        assert!(core::matches!(message.blocks[0], GarlicMessageBlock::Padding { .. }));
+
+        // unsupported block at the end of the message is an error
+        assert!(GarlicMessage::parse(&[0x7fu8, 0u8, 0u8]).is_err());
     }
 }

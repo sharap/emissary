@@ -330,22 +330,23 @@ impl<'a> MessageBlock<'a> {
         }
     }
 
-    fn parse_multiple_inner(
-        input: &'a [u8],
-        mut messages: Vec<MessageBlock<'a>>,
-    ) -> Result<Vec<MessageBlock<'a>>, Ntcp2ParseError> {
-        let (rest, message) = Self::parse_inner(input)?;
-        messages.push(message);
-
-        match rest.is_empty() {
-            true => Ok(messages),
-            false => Self::parse_multiple_inner(rest, messages),
-        }
-    }
-
     /// Try to parse `input` into one or more NTCP2 message blocks.
-    pub fn parse_multiple(input: &'a [u8]) -> Result<Vec<MessageBlock<'a>>, Ntcp2ParseError> {
-        MessageBlock::parse_multiple_inner(input, Vec::new())
+    ///
+    /// Blocks are parsed iteratively so that a frame consisting of thousands of tiny blocks
+    /// cannot exhaust the stack.
+    pub fn parse_multiple(mut input: &'a [u8]) -> Result<Vec<MessageBlock<'a>>, Ntcp2ParseError> {
+        let mut messages = Vec::new();
+
+        loop {
+            let (rest, message) = Self::parse_inner(input)?;
+            messages.push(message);
+
+            if rest.is_empty() {
+                return Ok(messages);
+            }
+
+            input = rest;
+        }
     }
 
     /// Try to parse `input` into an NTCP2 message block
@@ -388,5 +389,29 @@ impl<'a> MessageBlock<'a> {
         out[1..].copy_from_slice(message);
 
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_frame_of_many_tiny_blocks() {
+        // maximum-size frame filled with empty padding blocks (type + zero size)
+        let num_blocks = u16::MAX as usize / 3;
+        let input = [BlockType::Padding.as_u8(), 0u8, 0u8].repeat(num_blocks);
+
+        let blocks = MessageBlock::parse_multiple(&input).unwrap();
+
+        assert_eq!(blocks.len(), num_blocks);
+        assert!(blocks.iter().all(|block| core::matches!(block, MessageBlock::Padding { .. })));
+    }
+
+    #[test]
+    fn parse_empty_and_truncated_frames() {
+        assert!(MessageBlock::parse_multiple(&[]).is_err());
+        assert!(MessageBlock::parse_multiple(&[BlockType::Padding.as_u8(), 0u8]).is_err());
+        assert!(MessageBlock::parse_multiple(&[BlockType::Padding.as_u8(), 0u8, 5u8, 1u8]).is_err());
     }
 }

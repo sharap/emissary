@@ -216,7 +216,10 @@ pub trait Runtime: Clone + Unpin + Send + 'static {
     fn gzip_compress(bytes: impl AsRef<[u8]>) -> Option<Vec<u8>>;
 
     /// GZIP-decompress `bytes` and return the decompressed byte vector.
-    fn gzip_decompress(bytes: impl AsRef<[u8]>) -> Option<Vec<u8>>;
+    ///
+    /// Returns `None` if decompression fails or if the decompressed data would be larger than
+    /// `max_size` bytes.
+    fn gzip_decompress(bytes: impl AsRef<[u8]>, max_size: usize) -> Option<Vec<u8>>;
 }
 
 pub trait AddressBook: Unpin + Send + Sync + 'static {

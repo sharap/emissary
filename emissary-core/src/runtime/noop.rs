@@ -283,7 +283,7 @@ impl Runtime for NoopRuntime {
         None
     }
 
-    fn gzip_decompress(_bytes: impl AsRef<[u8]>) -> Option<Vec<u8>> {
+    fn gzip_decompress(_bytes: impl AsRef<[u8]>, _max_size: usize) -> Option<Vec<u8>> {
         None
     }
 }

@@ -25,7 +25,7 @@ use crate::{
 };
 
 use flate2::{
-    write::{GzDecoder, GzEncoder},
+    write::GzEncoder,
     Compression,
 };
 use futures::Stream;
@@ -436,17 +436,48 @@ impl Runtime for MockRuntime {
         e.finish().ok()
     }
 
-    fn gzip_decompress(bytes: impl AsRef<[u8]>) -> Option<Vec<u8>> {
-        let mut e = GzDecoder::new(Vec::new());
-        e.write_all(bytes.as_ref()).ok()?;
+    fn gzip_decompress(bytes: impl AsRef<[u8]>, max_size: usize) -> Option<Vec<u8>> {
+        use std::io::Read;
 
-        e.finish().ok()
+        // read at most one byte more than allowed to detect oversized output
+        let mut decompressed = Vec::new();
+        flate2::read::GzDecoder::new(bytes.as_ref())
+            .take(max_size as u64 + 1)
+            .read_to_end(&mut decompressed)
+            .ok()?;
+
+        (decompressed.len() <= max_size).then_some(decompressed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gzip_decompress_respects_max_size() {
+        let payload = vec![0u8; 1024 * 1024];
+        let compressed = MockRuntime::gzip_compress(&payload).unwrap();
+        assert!(compressed.len() < 2048);
+
+        // a 1 MiB payload compressed to a few kilobytes is rejected if the cap is lower
+        assert!(MockRuntime::gzip_decompress(&compressed, 64 * 1024).is_none());
+        assert!(MockRuntime::gzip_decompress(&compressed, payload.len() - 1).is_none());
+
+        // and accepted if the cap is large enough
+        assert_eq!(
+            MockRuntime::gzip_decompress(&compressed, payload.len()),
+            Some(payload.clone())
+        );
+        assert_eq!(
+            MockRuntime::gzip_decompress(&compressed, 2 * payload.len()),
+            Some(payload)
+        );
+
+        // corrupted data is rejected
+        assert!(MockRuntime::gzip_decompress(&compressed[..compressed.len() / 2], 1024 * 1024)
+            .is_none());
+    }
 
     #[test]
     fn test_custom_time() {

@@ -21,3 +21,47 @@ pub mod tokio;
 
 #[cfg(feature = "smol")]
 pub mod smol;
+
+/// GZIP-decompress `bytes`, rejecting output larger than `max_size` bytes.
+#[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) fn gzip_decompress(bytes: &[u8], max_size: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    // read at most one byte more than allowed to detect oversized output
+    let mut decompressed = Vec::new();
+    flate2::read::GzDecoder::new(bytes)
+        .take(max_size as u64 + 1)
+        .read_to_end(&mut decompressed)
+        .ok()?;
+
+    (decompressed.len() <= max_size).then_some(decompressed)
+}
+
+#[cfg(all(test, any(feature = "tokio", feature = "smol")))]
+mod tests {
+    use super::*;
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+
+    fn compress(payload: &[u8]) -> Vec<u8> {
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(payload).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn gzip_decompress_respects_max_size() {
+        let payload = vec![0u8; 1024 * 1024];
+        let compressed = compress(&payload);
+        assert!(compressed.len() < 2048);
+
+        assert!(gzip_decompress(&compressed, 64 * 1024).is_none());
+        assert!(gzip_decompress(&compressed, payload.len() - 1).is_none());
+        assert_eq!(gzip_decompress(&compressed, payload.len()), Some(payload.clone()));
+        assert_eq!(gzip_decompress(&compressed, 2 * payload.len()), Some(payload));
+
+        assert!(gzip_decompress(&compressed[..compressed.len() / 2], 1024 * 1024).is_none());
+        assert_eq!(gzip_decompress(&compress(b"hello"), 5), Some(b"hello".to_vec()));
+        assert!(gzip_decompress(&compress(b"hello"), 4).is_none());
+    }
+}

@@ -21,7 +21,7 @@ use emissary_core::runtime::{
     MetricsHandle, Runtime as RuntimeT, TcpListener, TcpStream, UdpSocket,
 };
 use flate2::{
-    write::{GzDecoder, GzEncoder},
+    write::GzEncoder,
     Compression,
 };
 use futures::{
@@ -653,10 +653,7 @@ impl RuntimeT for Runtime {
     }
 
     #[inline]
-    fn gzip_decompress(bytes: impl AsRef<[u8]>) -> Option<Vec<u8>> {
-        let mut e = GzDecoder::new(Vec::new());
-        e.write_all(bytes.as_ref()).ok()?;
-
-        e.finish().ok()
+    fn gzip_decompress(bytes: impl AsRef<[u8]>, max_size: usize) -> Option<Vec<u8>> {
+        super::gzip_decompress(bytes.as_ref(), max_size)
     }
 }

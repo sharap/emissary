@@ -21,6 +21,7 @@
 //! https://geti2p.net/spec/ssu2#noise-payload
 
 use crate::{
+    constants::limits::MAX_ROUTER_INFO_SIZE,
     crypto::{
         chachapoly::{ChaCha, ChaChaPoly},
         EphemeralPublicKey,
@@ -669,7 +670,7 @@ impl Block {
         }
 
         let (serialized, parsed) = if (flag >> 1) & 1 == 1 {
-            let router_info = R::gzip_decompress(router_info)
+            let router_info = R::gzip_decompress(router_info, MAX_ROUTER_INFO_SIZE)
                 .ok_or(Err::Error(Ssu2ParseError::CompressionFailure))?;
 
             (
@@ -1392,24 +1393,23 @@ impl Block {
         }
     }
 
-    /// Attempt to parse `input` into an SSU2 message [`Block`] and recursive call
-    /// `Block::parse_multiple()` until there are no bytes or an error was encountered.
-    fn parse_multiple<R: Runtime>(
-        input: &[u8],
-        mut messages: Vec<Block>,
-    ) -> Result<Vec<Block>, Ssu2ParseError> {
-        let (rest, message) = Self::parse_inner::<R>(input)?;
-        messages.push(message);
-
-        match rest.is_empty() {
-            true => Ok(messages),
-            false => Self::parse_multiple::<R>(rest, messages),
-        }
-    }
-
     /// Attempt to parse `input` into one or more SSU2 message [`Block`]s.
-    pub fn parse<R: Runtime>(input: &[u8]) -> Result<Vec<Block>, Ssu2ParseError> {
-        Self::parse_multiple::<R>(input, Vec::new())
+    ///
+    /// Blocks are parsed iteratively so that a packet consisting of thousands of tiny blocks
+    /// cannot exhaust the stack.
+    pub fn parse<R: Runtime>(mut input: &[u8]) -> Result<Vec<Block>, Ssu2ParseError> {
+        let mut messages = Vec::new();
+
+        loop {
+            let (rest, message) = Self::parse_inner::<R>(input)?;
+            messages.push(message);
+
+            if rest.is_empty() {
+                return Ok(messages);
+            }
+
+            input = rest;
+        }
     }
 
     /// Get serialized length of a [`Block`].
@@ -2446,5 +2446,21 @@ mod tests {
                 error => panic!("unexpected failure: {error:?}"),
             }
         }
+    }
+
+    #[test]
+    fn parse_packet_of_many_tiny_blocks() {
+        // packet filled with empty padding blocks (type + zero size), far beyond any real mtu
+        let num_blocks = u16::MAX as usize / 3;
+        let input = [254u8, 0u8, 0u8].repeat(num_blocks);
+
+        let blocks = Block::parse::<MockRuntime>(&input).unwrap();
+
+        assert_eq!(blocks.len(), num_blocks);
+        assert!(blocks.iter().all(|block| core::matches!(block, Block::Padding { .. })));
+
+        // empty and truncated inputs are errors
+        assert!(Block::parse::<MockRuntime>(&[]).is_err());
+        assert!(Block::parse::<MockRuntime>(&[254u8, 0u8]).is_err());
     }
 }

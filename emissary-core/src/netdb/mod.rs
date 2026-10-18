@@ -17,6 +17,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::{
+    constants::limits::MAX_ROUTER_INFO_SIZE,
     crypto::{base32_encode, base64_encode, StaticPublicKey},
     error::{
         parser::{DatabaseStoreParseError, RouterIdentityParseError, RouterInfoParseError},
@@ -321,7 +322,7 @@ impl<R: Runtime> NetDb<R> {
         //
         // `raw_router_info` is used for flooding (if requested)
         let raw_router_info = DatabaseStore::<R>::extract_raw_router_info(message);
-        let decompressed = match R::gzip_decompress(&raw_router_info) {
+        let decompressed = match R::gzip_decompress(&raw_router_info, MAX_ROUTER_INFO_SIZE) {
             None => {
                 tracing::warn!(
                     target: LOG_TARGET,
@@ -973,6 +974,7 @@ impl<R: Runtime> NetDb<R> {
                     // the latter is used when a backup of profile storage is made to disk
                     let decompressed = match R::gzip_decompress(
                         DatabaseStore::<R>::extract_raw_router_info(&message.payload),
+                        MAX_ROUTER_INFO_SIZE,
                     ) {
                         None => {
                             tracing::warn!(
@@ -1031,6 +1033,7 @@ impl<R: Runtime> NetDb<R> {
                     // the latter is used when a backup of profile storage is made to disk
                     let decompressed = match R::gzip_decompress(
                         DatabaseStore::<R>::extract_raw_router_info(&message.payload),
+                        MAX_ROUTER_INFO_SIZE,
                     ) {
                         None => {
                             tracing::warn!(
@@ -3939,7 +3942,7 @@ mod tests {
                                     &message.payload,
                                 );
                             let decompressed =
-                                MockRuntime::gzip_decompress(&raw_router_info).unwrap();
+                                MockRuntime::gzip_decompress(&raw_router_info, MAX_ROUTER_INFO_SIZE).unwrap();
 
                             assert_eq!(&decompressed, &serialized);
 

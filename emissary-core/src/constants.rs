@@ -57,3 +57,16 @@ pub mod ssu2 {
     /// IPv6 header (40 bytes) + UDP header (8 bytes).
     pub const IPV6_OVERHEAD: usize = 48usize;
 }
+
+/// Size limits for data received from the network or from local clients.
+pub mod limits {
+    /// Maximum size of a decompressed `RouterInfo`.
+    ///
+    /// Router infos seen in the network are 1-3 KB, i2pd rejects anything above 3 KB.
+    pub const MAX_ROUTER_INFO_SIZE: usize = 16 * 1024;
+
+    /// Maximum size of a decompressed I2CP payload.
+    ///
+    /// Bounded by the maximum size of an I2NP message.
+    pub const MAX_I2CP_PAYLOAD_SIZE: usize = 64 * 1024;
+}

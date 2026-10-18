@@ -16,7 +16,7 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use crate::{protocol::Protocol, runtime::Runtime};
+use crate::{constants::limits::MAX_I2CP_PAYLOAD_SIZE, protocol::Protocol, runtime::Runtime};
 
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -123,7 +123,7 @@ impl I2cpPayload {
             src_port: u16::from_be_bytes(src_port),
             dst_port: u16::from_be_bytes(dst_port),
             protocol: Protocol::from_u8(protocol)?,
-            payload: R::gzip_decompress(&payload)?,
+            payload: R::gzip_decompress(&payload, MAX_I2CP_PAYLOAD_SIZE)?,
         })
     }
 }
@@ -170,6 +170,25 @@ mod tests {
     use crate::runtime::{mock::MockRuntime, Runtime};
 
     #[test]
+    fn oversized_payload_is_rejected() {
+        let build = |size: usize| {
+            I2cpPayloadBuilder::<MockRuntime>::new(&vec![0u8; size])
+                .with_protocol(Protocol::Datagram)
+                .build()
+                .unwrap()
+        };
+
+        // payload larger than the limit is rejected
+        assert!(I2cpPayload::decompress::<MockRuntime>(&build(MAX_I2CP_PAYLOAD_SIZE + 1)).is_none());
+        assert!(I2cpPayload::decompress::<MockRuntime>(&build(16 * 1024 * 1024)).is_none());
+
+        // payload of exactly the limit is accepted
+        let payload = I2cpPayload::decompress::<MockRuntime>(&build(MAX_I2CP_PAYLOAD_SIZE)).unwrap();
+        assert_eq!(payload.payload.len(), MAX_I2CP_PAYLOAD_SIZE);
+        assert_eq!(payload.protocol, Protocol::Datagram);
+    }
+
+    #[test]
     fn compress_and_decompress() {
         let payload = "hello, world".as_bytes();
 
@@ -180,7 +199,8 @@ mod tests {
             .unwrap();
 
         // normal compression works
-        let decompressed = MockRuntime::gzip_decompress(&compressed).unwrap();
+        let decompressed =
+            MockRuntime::gzip_decompress(&compressed, MAX_I2CP_PAYLOAD_SIZE).unwrap();
         assert_eq!(decompressed, "hello, world".as_bytes());
 
         // extracing i2cp data + decompression works

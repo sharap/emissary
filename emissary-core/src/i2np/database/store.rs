@@ -17,6 +17,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::{
+    constants::limits::MAX_ROUTER_INFO_SIZE,
     error::parser::DatabaseStoreParseError,
     i2np::{database::DATABASE_KEY_SIZE, ROUTER_HASH_LEN},
     primitives::{LeaseSet2, RouterId, RouterInfo, TunnelId},
@@ -255,7 +256,7 @@ impl<R: Runtime> DatabaseStore<R> {
                 let (rest, size) = be_u16(rest)?;
                 let (rest, data) = take(size)(rest)?;
 
-                let data = R::gzip_decompress(data)
+                let data = R::gzip_decompress(data, MAX_ROUTER_INFO_SIZE)
                     .ok_or(Err::Error(DatabaseStoreParseError::CompressionFailed))?;
 
                 let router_info = RouterInfo::parse::<R>(&data)
@@ -448,6 +449,37 @@ mod tests {
     use super::*;
     use crate::runtime::mock::MockRuntime;
     use rand::Rng;
+
+    #[test]
+    fn oversized_router_info_is_rejected() {
+        let build = |decompressed_size: usize| {
+            DatabaseStoreBuilder::new(
+                Bytes::from(vec![0u8; 32]),
+                DatabaseStoreKind::RouterInfo {
+                    router_info: Bytes::from(
+                        MockRuntime::gzip_compress(vec![0u8; decompressed_size]).unwrap(),
+                    ),
+                },
+            )
+            .build()
+        };
+
+        // decompressed router info larger than the limit is rejected before parsing
+        assert_eq!(
+            DatabaseStore::<MockRuntime>::parse(&build(MAX_ROUTER_INFO_SIZE + 1)).err(),
+            Some(DatabaseStoreParseError::CompressionFailed)
+        );
+        assert_eq!(
+            DatabaseStore::<MockRuntime>::parse(&build(1024 * 1024)).err(),
+            Some(DatabaseStoreParseError::CompressionFailed)
+        );
+
+        // router info within the limit is decompressed and fails only because it's garbage
+        assert!(core::matches!(
+            DatabaseStore::<MockRuntime>::parse(&build(MAX_ROUTER_INFO_SIZE)),
+            Err(DatabaseStoreParseError::RouterInfo(_))
+        ));
+    }
 
     #[test]
     fn parse_database_store() {
