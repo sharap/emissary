@@ -200,6 +200,18 @@ impl<R: Runtime> Stream for I2cpSocket<R> {
                                 return Poll::Ready(Some(message));
                             }
 
+                            // the frame must fit into the read buffer
+                            if size as usize > this.read_buffer.len() {
+                                tracing::warn!(
+                                    target: LOG_TARGET,
+                                    ?size,
+                                    ?msg_type,
+                                    "i2cp message is too large, closing connection",
+                                );
+
+                                return Poll::Ready(None);
+                            }
+
                             this.read_state = ReadState::ReadFrame {
                                 size: size as usize,
                                 msg_type,
@@ -329,5 +341,46 @@ impl<R: Runtime> Stream for I2cpSocket<R> {
 
         self.waker = Some(cx.waker().clone());
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::mock::{MockRuntime, MockTcpStream};
+    use futures::StreamExt;
+    use tokio::{
+        io::AsyncWriteExt,
+        net::{TcpListener, TcpStream},
+    };
+
+    #[tokio::test]
+    async fn oversized_frame_closes_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = I2cpSocket::<MockRuntime>::new(MockTcpStream::new(stream));
+
+        // header claims a 64 KiB + 1 byte payload which doesn't fit in the read buffer
+        client.write_all(&[0x00, 0x01, 0x00, 0x00, 0x01]).await.unwrap();
+
+        assert!(socket.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn largest_frame_is_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = I2cpSocket::<MockRuntime>::new(MockTcpStream::new(stream));
+
+        // payload of exactly the buffer size is read in full, the message itself is garbage
+        // and is dropped, after which the client closes the connection
+        let mut frame = vec![0x00, 0x00, 0xff, 0xff, 0x01];
+        frame.extend(vec![0xaa; 0xffff]);
+        client.write_all(&frame).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        assert!(socket.next().await.is_none());
     }
 }

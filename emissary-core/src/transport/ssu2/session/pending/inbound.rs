@@ -69,6 +69,10 @@ use core::{
 /// Logging target for the file.
 const LOG_TARGET: &str = "emissary::ssu2::pending::inbound";
 
+/// Minimum size of an unfragmented or reassembled `SessionConfirmed`: 16-byte header, 32-byte
+/// static key with its 16-byte mac and at least the 16-byte mac of the (possibly empty) payload.
+const SESSION_CONFIRMED_MIN_SIZE: usize = 16 + 32 + POLY1305_MAC_SIZE + POLY1305_MAC_SIZE;
+
 /// Timeout for receicing [`SessionRequest`] from Bob.
 const SESSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -829,6 +833,18 @@ impl<R: Runtime> InboundSsu2Session<R> {
             "handle SessionConfirmed",
         );
 
+        // header, encrypted static key and at least the mac of the payload must be present
+        if pkt.len() < SESSION_CONFIRMED_MIN_SIZE {
+            tracing::warn!(
+                target: LOG_TARGET,
+                dst_id = ?self.dst_id,
+                src_id = ?self.src_id,
+                pkt_len = ?pkt.len(),
+                "SessionConfirmed is too short",
+            );
+            return Err(Ssu2Error::NotEnoughBytes);
+        }
+
         // MixHash(header)
         self.encryption_ctx.noise_ctx().mix_hash(&pkt[..16]);
 
@@ -1042,13 +1058,15 @@ impl<R: Runtime> InboundSsu2Session<R> {
         }
     }
 
-    /// Run the event loop of [`InboundSsu2Session`].
+    /// Handle the initial state of the session.
     ///
-    /// Polls the inner future and after it completes, flushes all pending packets.
-    pub async fn run(mut self) -> PendingSsu2SessionStatus<R> {
-        {
-            match core::mem::replace(&mut self.state, PendingSessionState::Poisoned) {
-                PendingSessionState::HandleTokenRequest { ref blocks } => {
+    /// Depending on how the session was created, either respond to `TokenRequest` with `Retry`
+    /// or handle the `SessionRequest` received directly.
+    ///
+    /// Returns an error if the session must be terminated.
+    async fn handle_initial_state(&mut self) -> Result<(), PendingSsu2SessionStatus<R>> {
+        match core::mem::replace(&mut self.state, PendingSessionState::Poisoned) {
+            PendingSessionState::HandleTokenRequest { ref blocks } => {
                     let Ok(()) = self.check_clock_skew(blocks) else {
                         // packet must exist since it was created by `check_clock_skew()`
                         let pkt = self.write_buffer.pop_back().expect("packet to exist");
@@ -1062,14 +1080,14 @@ impl<R: Runtime> InboundSsu2Session<R> {
                             );
                         }
 
-                        return PendingSsu2SessionStatus::SessionTerminated {
+                        return Err(PendingSsu2SessionStatus::SessionTerminated {
                             address: None,
                             connection_id: self.dst_id,
                             relay_tag: Some(self.relay_tag_requested.tag()),
                             router_id: None,
                             started: self.started,
                             reason: TerminationReason::ClockSkew,
-                        };
+                        });
                     };
 
                     let token = R::rng().next_u64();
@@ -1107,7 +1125,7 @@ impl<R: Runtime> InboundSsu2Session<R> {
                 PendingSessionState::HandleSessionRequest { payload } =>
                     match self.on_session_request(payload) {
                         Ok(None) => {}
-                        Ok(Some(status)) => return status,
+                        Ok(Some(status)) => return Err(status),
                         Err(error) => {
                             tracing::debug!(
                                 target: LOG_TARGET,
@@ -1117,18 +1135,28 @@ impl<R: Runtime> InboundSsu2Session<R> {
                                 "failed to handle direct session confirmed",
                             );
 
-                            return PendingSsu2SessionStatus::SessionTerminated {
+                            return Err(PendingSsu2SessionStatus::SessionTerminated {
                                 address: None,
                                 connection_id: self.dst_id,
                                 relay_tag: Some(self.relay_tag_requested.tag()),
                                 router_id: None,
                                 started: self.started,
                                 reason: error.into(),
-                            };
+                            });
                         }
                     },
                 _ => unreachable!(),
             }
+
+        Ok(())
+    }
+
+    /// Run the event loop of [`InboundSsu2Session`].
+    ///
+    /// Polls the inner future and after it completes, flushes all pending packets.
+    pub async fn run(mut self) -> PendingSsu2SessionStatus<R> {
+        if let Err(status) = self.handle_initial_state().await {
+            return status;
         }
 
         let result = (&mut self).await;
@@ -1242,7 +1270,7 @@ impl<R: Runtime> Future for InboundSsu2Session<R> {
 mod tests {
     use super::*;
     use crate::{
-        crypto::{base64_encode, noise::NoiseContext, sha256::Sha256},
+        crypto::{base64_encode, chachapoly::ChaCha, noise::NoiseContext, sha256::Sha256},
         primitives::{RouterInfoBuilder, Str},
         runtime::mock::MockRuntime,
         subsystem::SubsystemEvent,
@@ -2267,6 +2295,115 @@ mod tests {
             } => {
                 assert_eq!(reason, TerminationReason::InvalidRouterInfo);
                 assert!(router_id.is_none());
+            }
+            res => panic!("unexpected result: {res:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn short_session_confirmed_x25519() {
+        short_session_confirmed(None).await
+    }
+
+    #[tokio::test]
+    async fn short_session_confirmed_ml_kem_512() {
+        short_session_confirmed(Some(3)).await
+    }
+
+    #[tokio::test]
+    async fn short_session_confirmed_ml_kem_768() {
+        short_session_confirmed(Some(4)).await
+    }
+
+    // `SessionConfirmed` with a valid header but a body too short to hold the static key must
+    // terminate the session instead of panicking
+    async fn short_session_confirmed(ml_kem: Option<usize>) {
+        let (
+            InboundContext {
+                mut inbound_session,
+                inbound_socket_rx,
+                inbound_session_tx: ib_sess_tx,
+            },
+            OutboundContext {
+                outbound_session,
+                outbound_session_tx: ob_sess_tx,
+                outbound_socket_rx,
+                ..
+            },
+        ) = create_session(None, ml_kem).await;
+
+        let intro_key = inbound_session.intro_key;
+        let _outbound_session = tokio::spawn(outbound_session);
+
+        // the inbound session is driven manually so that its state can be inspected later
+        inbound_session.handle_initial_state().await.unwrap();
+
+        // send retry message to outbound session
+        {
+            let Packet { mut pkt, address } = tokio::select! {
+                pkt = outbound_socket_rx.recv() => pkt.unwrap(),
+                _ = &mut inbound_session => panic!("inbound session returned"),
+                _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("timeout"),
+            };
+            let mut reader = HeaderReader::new(intro_key, &mut pkt).unwrap();
+            let _connection_id = reader.dst_id();
+
+            ob_sess_tx.send(Packet { pkt, address }).await.unwrap();
+        }
+
+        // read session request from outbound session and send it to inbound session
+        {
+            let Packet { mut pkt, address } = inbound_socket_rx.recv().await.unwrap();
+            let mut reader = HeaderReader::new(intro_key, &mut pkt).unwrap();
+            let _connection_id = reader.dst_id();
+            ib_sess_tx.send(Packet { pkt, address }).await.unwrap();
+        }
+
+        // read session created from inbound session and send it to outbound session
+        {
+            let Packet { mut pkt, address } = tokio::select! {
+                pkt = outbound_socket_rx.recv() => pkt.unwrap(),
+                _ = &mut inbound_session => panic!("inbound session returned"),
+                _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("timeout"),
+            };
+            let mut reader = HeaderReader::new(intro_key, &mut pkt).unwrap();
+            let _connection_id = reader.dst_id();
+
+            ob_sess_tx.send(Packet { pkt, address }).await.unwrap();
+        }
+
+        // read and discard the real `SessionConfirmed` sent by the outbound session
+        let Packet { address, .. } = inbound_socket_rx.recv().await.unwrap();
+
+        // craft a `SessionConfirmed` with a valid header and a 32-byte body
+        let pkt = {
+            let PendingSessionState::AwaitingSessionConfirmed { k_header_2, .. } =
+                &inbound_session.state
+            else {
+                panic!("invalid state");
+            };
+            let k_header_2 = *k_header_2;
+
+            let mut pkt = vec![0u8; 48];
+            MockRuntime::rng().fill_bytes(&mut pkt[16..]);
+            pkt[..8].copy_from_slice(&inbound_session.dst_id.to_le_bytes());
+            pkt[12] = 2u8; // `SessionConfirmed`
+            pkt[13] = 1u8; // one fragment
+
+            // header obfuscation uses the last 24 bytes of the packet as ivs
+            let iv1 = TryInto::<[u8; 12]>::try_into(&pkt[24..36]).unwrap();
+            let iv2 = TryInto::<[u8; 12]>::try_into(&pkt[36..48]).unwrap();
+            ChaCha::with_iv(intro_key, iv1).decrypt_ref(&mut pkt[..8]);
+            ChaCha::with_iv(k_header_2, iv2).decrypt_ref(&mut pkt[8..16]);
+
+            pkt
+        };
+
+        ib_sess_tx.send(Packet { pkt, address }).await.unwrap();
+
+        match timeout!(&mut inbound_session).await.unwrap() {
+            PendingSsu2SessionStatus::SessionTerminated { reason, .. } => {
+                assert_eq!(reason, TerminationReason::PayloadFormatError);
             }
             res => panic!("unexpected result: {res:?}"),
         }

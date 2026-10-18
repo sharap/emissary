@@ -46,6 +46,11 @@ use core::{
 /// Logging target for the file.
 const LOG_TARGET: &str = "emissary::tunnel::context";
 
+/// Range of the garlic tag inside the payload of a garlic message.
+///
+/// Garlic message starts with a 4-byte length field, followed by the 8-byte garlic tag.
+const GARLIC_TAG_RANGE: core::ops::Range<usize> = 4..12;
+
 /// Channel size for the client -> pool channel size.
 ///
 /// The size of this channel needs to be large because it's shared by all of the outbound tunnels of
@@ -137,7 +142,18 @@ impl TunnelPoolContextHandle {
         // association context
         let message_id = match message.message_type {
             MessageType::Garlic => {
-                let garlic_tag = Bytes::from(message.payload[4..12].to_vec());
+                // garlic message must at least contain the length field and the garlic tag
+                if message.payload.len() < GARLIC_TAG_RANGE.end {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        ?message_id,
+                        payload_len = ?message.payload.len(),
+                        "garlic message is too short to contain a garlic tag",
+                    );
+                    return Err(RoutingError::FailedToParseRoute(message));
+                }
+
+                let garlic_tag = Bytes::from(message.payload[GARLIC_TAG_RANGE].to_vec());
 
                 match inner.garlic_tags.remove(&garlic_tag) {
                     Some(message_id) => {
@@ -545,6 +561,37 @@ impl TunnelPoolBuildParameters {
             },
             shutdown_rx,
             tunnel_pool_handle,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::time::Duration;
+
+    #[test]
+    fn short_garlic_message_is_rejected() {
+        let TunnelPoolBuildParameters {
+            context_handle: handle,
+            ..
+        } = TunnelPoolBuildParameters::new(TunnelPoolConfig::default());
+
+        // garlic message without a complete garlic tag must be rejected instead of panicking
+        for len in 0..GARLIC_TAG_RANGE.end {
+            let message = Message {
+                message_type: MessageType::Garlic,
+                message_id: 1337,
+                expiration: Duration::from_secs(10),
+                payload: vec![0xaa; len],
+            };
+
+            match handle.route_message(message) {
+                Err(RoutingError::FailedToParseRoute(message)) => {
+                    assert_eq!(message.payload.len(), len);
+                }
+                _ => panic!("invalid result"),
+            }
         }
     }
 }

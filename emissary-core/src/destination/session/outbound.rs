@@ -191,7 +191,6 @@ impl<R: Runtime> OutboundSession<R> {
                 payload_len = ?message.len(),
                 "`NewSessionReply` is too short",
             );
-            debug_assert!(false);
 
             return Err(SessionError::Malformed);
         }
@@ -236,11 +235,17 @@ impl<R: Runtime> OutboundSession<R> {
         let (mut chaining_key, state, offset) = match &self.ml_kem_context {
             None => (chaining_key, state, NSR_EPHEMERAL_PUBKEY_SECTION_END),
             Some(context) => {
-                if message.len() <= context.ciphertext_size() {
+                // ephemeral key section, kem ciphertext and its mac must fit in the message
+                if message.len()
+                    < NSR_EPHEMERAL_PUBKEY_SECTION_END
+                        + context.ciphertext_size()
+                        + POLY1035_MAC_SIZE
+                {
                     tracing::warn!(
                         target: LOG_TARGET,
                         remote = %self.destination_id,
                         kind = %context,
+                        payload_len = ?message.len(),
                         "NSR is too short",
                     );
                     return Err(SessionError::Malformed);
@@ -339,5 +344,83 @@ impl<R: Runtime> OutboundSession<R> {
         payload_key.zeroize();
 
         Ok((payload, send_tag_set, recv_tag_set))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{primitives::DestinationId, runtime::mock::MockRuntime};
+    use ml_kem::kem::Kem;
+
+    fn make_session(ml_kem_context: Option<MlKemContext>) -> OutboundSession<MockRuntime> {
+        OutboundSession::new(
+            DestinationId::random(),
+            Bytes::from(vec![0xaa; 32]),
+            StaticPrivateKey::random(MockRuntime::rng()),
+            StaticPrivateKey::random(MockRuntime::rng()),
+            vec![0xbb; 32],
+            ml_kem_context,
+        )
+    }
+
+    fn random_message(len: usize) -> Vec<u8> {
+        use rand::Rng;
+
+        let mut message = vec![0u8; len];
+        MockRuntime::rng().fill_bytes(&mut message);
+        message
+    }
+
+    #[test]
+    fn short_nsr_x25519() {
+        let mut session = make_session(None);
+
+        for len in [0, 1, NSR_MINIMUM_LEN - 1, NSR_MINIMUM_LEN, NSR_MINIMUM_LEN + 1] {
+            let entry = session.generate_new_session_reply_tags(100).next().unwrap();
+
+            assert!(session.handle_new_session_reply(entry, random_message(len), 100).is_err());
+        }
+    }
+
+    #[test]
+    fn short_nsr_ml_kem_512() {
+        let (decap_key, _) = MlKem512::generate_keypair_from_rng(&mut MockRuntime::rng());
+        short_nsr_ml_kem(MlKemContext::MlKem512X25519(Box::new(decap_key)));
+    }
+
+    #[test]
+    fn short_nsr_ml_kem_768() {
+        let (decap_key, _) = MlKem768::generate_keypair_from_rng(&mut MockRuntime::rng());
+        short_nsr_ml_kem(MlKemContext::MlKem768X25519(Box::new(decap_key)));
+    }
+
+    #[test]
+    fn short_nsr_ml_kem_1024() {
+        let (decap_key, _) = MlKem1024::generate_keypair_from_rng(&mut MockRuntime::rng());
+        short_nsr_ml_kem(MlKemContext::MlKem1024X25519(Box::new(decap_key)));
+    }
+
+    // NSR longer than the kem ciphertext but shorter than the ephemeral key section, kem
+    // ciphertext and its mac must be rejected, not cause an out-of-bounds slice
+    fn short_nsr_ml_kem(context: MlKemContext) {
+        let ciphertext_size = context.ciphertext_size();
+        let kem_section_end =
+            NSR_EPHEMERAL_PUBKEY_SECTION_END + ciphertext_size + POLY1035_MAC_SIZE;
+        let mut session = make_session(Some(context));
+
+        for len in [
+            NSR_MINIMUM_LEN,
+            ciphertext_size,
+            ciphertext_size + 1,
+            ciphertext_size + NSR_EPHEMERAL_PUBKEY_SECTION_END,
+            kem_section_end - 1,
+            kem_section_end,
+            kem_section_end + NSR_POLY1305_SECTION_SIZE + POLY1035_MAC_SIZE - 1,
+        ] {
+            let entry = session.generate_new_session_reply_tags(100).next().unwrap();
+
+            assert!(session.handle_new_session_reply(entry, random_message(len), 100).is_err());
+        }
     }
 }

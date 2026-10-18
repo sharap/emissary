@@ -195,6 +195,9 @@ impl<R: Runtime> DatagramManager<R> {
                 let (rest, destination) =
                     Destination::parse_frame(&payload).map_err(|_| Error::InvalidData)?;
 
+                // signed data starts right after the sender's destination
+                let signed_data_start = payload.len() - rest.len();
+
                 let (rest, flags) =
                     DatagramFlags::parse_frame(rest).map_err(|_| Error::InvalidData)?;
 
@@ -216,11 +219,23 @@ impl<R: Runtime> DatagramManager<R> {
                     (rest, Cow::Borrowed(destination.verifying_key()))
                 };
 
-                // allocate enough memory to store signed data and final output.
-                let signed_data = &payload[self.destination.len()
-                    ..payload.len() - self.destination.len() - verifying_key.signature_len()];
+                // signature is the last `signature_len` bytes of the datagram
+                let signature_len = verifying_key.signature_len();
 
-                // signed data = self destination hash + datagram2 content from flags to signature
+                if rest.len() < signature_len {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        datagram_len = ?payload.len(),
+                        ?signature_len,
+                        "datagram2 is too short to contain a signature",
+                    );
+                    return Err(Error::InvalidData);
+                }
+
+                // signed data = local destination hash + datagram2 content from flags to signature
+                let signed_data = &payload[signed_data_start..payload.len() - signature_len];
+
+                // allocate enough memory to store signed data and final output.
                 let mut out =
                     BytesMut::with_capacity(signed_data.len() + self.destination_hash.len());
 
@@ -228,9 +243,8 @@ impl<R: Runtime> DatagramManager<R> {
                 out.put_slice(signed_data);
 
                 // verify signature
-                let (signature, payload) =
-                    take::<_, _, ()>(rest.len() - verifying_key.signature_len())(rest)
-                        .map_err(|_| Error::InvalidData)?;
+                let (signature, payload) = take::<_, _, ()>(rest.len() - signature_len)(rest)
+                    .map_err(|_| Error::InvalidData)?;
 
                 match verifying_key.as_ref() {
                     SigningPublicKey::DsaSha1(_) => return Err(Error::NotSupported),
@@ -359,6 +373,95 @@ mod tests {
             DatagramManager::<MockRuntime>::new(destination, tx, HashMap::new(), signing_key);
 
         assert!(manager.listeners.is_empty());
+    }
+
+    #[test]
+    fn datagram2_roundtrip() {
+        let (sender_destination, sender_signing_key) = Destination::random();
+        let (receiver_destination, receiver_signing_key) = Destination::random();
+        let (sender_tx, _sender_rx) = channel(16);
+        let (receiver_tx, receiver_rx) = channel(16);
+
+        let mut sender = DatagramManager::<MockRuntime>::new(
+            sender_destination.clone(),
+            sender_tx,
+            HashMap::new(),
+            sender_signing_key,
+        );
+        let receiver = DatagramManager::<MockRuntime>::new(
+            receiver_destination,
+            receiver_tx,
+            HashMap::from_iter([("PORT".to_string(), "8888".to_string())]),
+            receiver_signing_key,
+        );
+
+        let datagram =
+            sender.make_datagram2(b"hello, world".to_vec(), &receiver.destination_hash, None);
+
+        receiver
+            .on_datagram(I2cpPayload {
+                dst_port: 0,
+                payload: datagram.to_vec(),
+                protocol: Protocol::Datagram2,
+                src_port: 0,
+            })
+            .unwrap();
+
+        let (port, data) = receiver_rx.try_recv().unwrap();
+        let info = format!("{} FROM_PORT=0 TO_PORT=0\n", base64_encode(&*sender_destination));
+
+        assert_eq!(port, 8888);
+        assert!(data.starts_with(info.as_bytes()));
+        assert_eq!(&data[info.len()..], b"hello, world");
+    }
+
+    #[test]
+    fn truncated_datagram2_is_rejected() {
+        let (sender_destination, sender_signing_key) = Destination::random();
+        let (receiver_destination, receiver_signing_key) = Destination::random();
+        let (sender_tx, _sender_rx) = channel(16);
+        let (receiver_tx, receiver_rx) = channel(16);
+
+        let mut sender = DatagramManager::<MockRuntime>::new(
+            sender_destination,
+            sender_tx,
+            HashMap::new(),
+            sender_signing_key,
+        );
+        let receiver = DatagramManager::<MockRuntime>::new(
+            receiver_destination,
+            receiver_tx,
+            HashMap::from_iter([("PORT".to_string(), "8888".to_string())]),
+            receiver_signing_key,
+        );
+
+        let datagram =
+            sender.make_datagram2(b"hello, world".to_vec(), &receiver.destination_hash, None);
+        let destination_len = sender.destination.serialized_len();
+
+        // every truncation must yield an error, never a panic
+        for len in [
+            0,
+            1,
+            destination_len - 1,
+            destination_len,
+            destination_len + 1,
+            destination_len + 2,
+            destination_len + 10,
+            datagram.len() - sender.signing_key.signature_len(),
+            datagram.len() - 1,
+        ] {
+            assert!(receiver
+                .on_datagram(I2cpPayload {
+                    dst_port: 0,
+                    payload: datagram[..len].to_vec(),
+                    protocol: Protocol::Datagram2,
+                    src_port: 0,
+                })
+                .is_err());
+        }
+
+        assert!(receiver_rx.try_recv().is_err());
     }
 
     #[test]
