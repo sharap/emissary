@@ -61,6 +61,12 @@ pub use message::MessageBlock;
 /// Logging target for the file.
 const LOG_TARGET: &str = "emissary::ntcp2";
 
+/// Maximum number of concurrently pending handshakes.
+///
+/// Inbound connections are dropped while the limit is reached so that a flood of idle connections
+/// cannot exhaust memory and file descriptors.
+const MAX_PENDING_HANDSHAKES: usize = 128;
+
 /// NTCP2 context.
 pub struct Ntcp2Context<R: Runtime> {
     /// NTCP2 configuration.
@@ -500,6 +506,20 @@ impl<R: Runtime> Stream for Ntcp2Transport<R> {
                             continue;
                         }
 
+                        if this.pending_handshakes.len() >= MAX_PENDING_HANDSHAKES {
+                            tracing::debug!(
+                                target: LOG_TARGET,
+                                ?address,
+                                "too many pending handshakes, dropping ipv4 connection",
+                            );
+                            this.router_ctx
+                                .metrics_handle()
+                                .counter(CONNECTIONS_DROPPED)
+                                .increment_with_label(1, "protocol", "ipv4");
+
+                            continue;
+                        }
+
                         let future = this.session_manager.accept_session(stream, address);
                         this.pending_handshakes.push(future);
                         this.router_ctx.metrics_handle().counter(NUM_INBOUND_NTCP2).increment(1);
@@ -526,6 +546,20 @@ impl<R: Runtime> Stream for Ntcp2Transport<R> {
                                 max_connections = ?this.max_connections,
                                 ?address,
                                 "connection limit at max, dropping ipv6 connection",
+                            );
+                            this.router_ctx
+                                .metrics_handle()
+                                .counter(CONNECTIONS_DROPPED)
+                                .increment_with_label(1, "protocol", "ipv6");
+
+                            continue;
+                        }
+
+                        if this.pending_handshakes.len() >= MAX_PENDING_HANDSHAKES {
+                            tracing::debug!(
+                                target: LOG_TARGET,
+                                ?address,
+                                "too many pending handshakes, dropping ipv6 connection",
                             );
                             this.router_ctx
                                 .metrics_handle()
@@ -1061,6 +1095,78 @@ mod tests {
         assert!(context.is_none());
         assert!(ipv4_address.is_none());
         assert!(ipv6_address.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_handshake_limit() {
+        use tokio::{io::AsyncReadExt, net::TcpStream};
+
+        let config = Ntcp2Config {
+            port: 0u16,
+            ipv4_host: Some("127.0.0.1".parse().unwrap()),
+            ipv6_host: None,
+            publish_ipv4: true,
+            publish_ipv6: false,
+            key: [0xaa; 32],
+            iv: [0xbb; 16],
+            ipv4: true,
+            ipv6: false,
+            ml_kem: None,
+            disable_pq: false,
+            max_connections: None,
+        };
+        let (context, ipv4_address, _ipv6_address) =
+            Ntcp2Transport::<MockRuntime>::initialize(Some(config.clone())).await.unwrap();
+        let context = context.unwrap();
+
+        let (local_router_info, local_static_key, local_signing_key) = RouterInfoBuilder::default()
+            .with_static_key(config.key.to_vec())
+            .with_ntcp2(Ntcp2Config {
+                port: context.port(),
+                ..config.clone()
+            })
+            .build();
+        let router_ctx = RouterContextBuilder::default()
+            .with_net_id(local_router_info.net_id)
+            .with_router_info(local_router_info.clone(), local_static_key, local_signing_key)
+            .build();
+        let (tx, _transport_rx) = mpsc::channel(16);
+        let mut transport = Ntcp2Transport::new(context, true, router_ctx, tx);
+
+        let local_address = match ipv4_address.unwrap() {
+            RouterAddress::Ntcp2 {
+                socket_address: Some(address),
+                ..
+            } => address,
+            _ => unreachable!(),
+        };
+
+        // open the maximum number of connections which never start a handshake
+        let mut idle = Vec::new();
+        for _ in 0..MAX_PENDING_HANDSHAKES {
+            idle.push(TcpStream::connect(local_address).await.unwrap());
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(500), transport.next()).await.is_err());
+        assert_eq!(transport.pending_handshakes.len(), MAX_PENDING_HANDSHAKES);
+
+        // one more connection is dropped right away
+        let mut extra = TcpStream::connect(local_address).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(500), transport.next()).await.is_err());
+        assert_eq!(transport.pending_handshakes.len(), MAX_PENDING_HANDSHAKES);
+
+        let mut buffer = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), extra.read(&mut buffer))
+                .await
+                .expect("connection closed")
+                .unwrap(),
+            0
+        );
+
+        // the idle connections are still open and waiting for the handshake
+        assert!(tokio::time::timeout(Duration::from_millis(500), idle[0].read(&mut buffer))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

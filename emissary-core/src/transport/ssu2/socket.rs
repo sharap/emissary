@@ -68,6 +68,12 @@ use core::{
 /// Logging target for the file.
 const LOG_TARGET: &str = "emissary::ssu2::socket";
 
+/// Maximum number of concurrently pending sessions.
+///
+/// Inbound session requests are ignored while the limit is reached so that a flood of handshake
+/// packets cannot exhaust memory.
+const MAX_PENDING_SESSIONS: usize = 256;
+
 /// Protocol name.
 const PROTOCOL_NAME: &str = "Noise_XKchaobfse+hs1+hs2+hs3_25519_ChaChaPoly_SHA256";
 
@@ -580,6 +586,16 @@ impl<R: Runtime> Ssu2Socket<R> {
                     return Err(Ssu2Error::ConnectionLimits);
                 }
 
+                if self.pending_sessions.len() >= MAX_PENDING_SESSIONS {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        ?address,
+                        num_pending = ?self.pending_sessions.len(),
+                        "too many pending sessions, ignoring session request",
+                    );
+                    return Err(Ssu2Error::ConnectionLimits);
+                }
+
                 let (tx, rx) = channel(CHANNEL_SIZE);
                 let relay_tag = self.relay_manager.allocate_relay_tag();
                 let session = InboundSsu2Session::<R>::new(InboundSsu2Context {
@@ -809,6 +825,16 @@ impl<R: Runtime> Ssu2Socket<R> {
                         !connection_id,
                         address,
                         TerminationReason::ConnectionLimits,
+                    );
+                    return Err(Ssu2Error::ConnectionLimits);
+                }
+
+                if self.pending_sessions.len() >= MAX_PENDING_SESSIONS {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        ?address,
+                        num_pending = ?self.pending_sessions.len(),
+                        "too many pending sessions, ignoring session request",
                     );
                     return Err(Ssu2Error::ConnectionLimits);
                 }

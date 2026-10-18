@@ -67,6 +67,9 @@ mod participant;
 /// Logging target for the file.
 const LOG_TARGET: &str = "emissary::tunnel::transit::manager";
 
+/// Maximum number of records in a tunnel build request, same as i2pd.
+const MAX_NUM_RECORDS: usize = 8;
+
 /// Short tunnel build request record size.
 const SHORT_RECORD_LEN: usize = 218;
 
@@ -212,7 +215,12 @@ impl<R: Runtime> TransitTunnelManager<R> {
         &self,
         payload: &'a mut [u8],
     ) -> Option<(usize, &'a mut [u8])> {
-        (payload.len() > RECORD_SIZE && (payload.len() - 1).is_multiple_of(RECORD_SIZE))
+        let num_records = payload.len().saturating_sub(1) / RECORD_SIZE;
+
+        (payload.len() > RECORD_SIZE
+            && (payload.len() - 1).is_multiple_of(RECORD_SIZE)
+            && num_records <= MAX_NUM_RECORDS
+            && payload[0] as usize == num_records)
             .then(|| {
                 payload[1..].chunks_mut(RECORD_SIZE).enumerate().find(|(_, chunk)| {
                     chunk[..16] == self.router_ctx.noise().local_router_hash()[..16]
@@ -263,6 +271,17 @@ impl<R: Runtime> TransitTunnelManager<R> {
         let next_tunnel_id = build_record.next_tunnel_id();
         let next_message_id = build_record.next_message_id();
         let next_router = build_record.next_router();
+
+        // a tunnel must not route back to this router
+        if next_router == *self.router_ctx.router_id() {
+            tracing::warn!(
+                target: LOG_TARGET,
+                ?message_id,
+                %tunnel_id,
+                "next hop of the tunnel is this router, rejecting",
+            );
+            return Err(Error::Tunnel(TunnelError::InvalidHop));
+        }
 
         tracing::trace!(
             target: LOG_TARGET,
@@ -540,6 +559,17 @@ impl<R: Runtime> TransitTunnelManager<R> {
         let next_tunnel_id = build_record.next_tunnel_id();
         let next_message_id = build_record.next_message_id();
         let next_router = build_record.next_router();
+
+        // a tunnel must not route back to this router
+        if next_router == *self.router_ctx.router_id() {
+            tracing::warn!(
+                target: LOG_TARGET,
+                ?message_id,
+                %tunnel_id,
+                "next hop of the tunnel is this router, rejecting",
+            );
+            return Err(Error::Tunnel(TunnelError::InvalidHop));
+        }
 
         tracing::trace!(
             target: LOG_TARGET,
@@ -1318,6 +1348,118 @@ mod tests {
 
         match transit_manager.handle_short_tunnel_build(message).unwrap_err() {
             Error::Tunnel(TunnelError::RecordNotFound) => {}
+            error => panic!("invalid error: {error:?}"),
+        }
+    }
+
+    /// Create transit tunnel manager for a fresh router.
+    fn make_transit_manager() -> (TransitTunnelManager<MockRuntime>, Bytes, StaticPublicKey) {
+        let handle = MockRuntime::register_metrics(vec![], None);
+        let (router_hash, static_key, signing_key, _noise, router_info) = make_router(true);
+        let (_transit_tx, transit_rx) = channel(16);
+        let (subsys_handle, _event_rx) = SubsystemHandle::new();
+        let mut shutdown_ctx = ShutdownContext::<MockRuntime>::new();
+        let shutdown_handle = shutdown_ctx.handle();
+        let (_event_mgr, _event_subscriber, event_handle) =
+            EventManager::new(None, MockRuntime::register_metrics(vec![], None));
+        let public_key = static_key.public();
+
+        (
+            TransitTunnelManager::<MockRuntime>::new(
+                None,
+                RouterContext::new(
+                    handle,
+                    ProfileStorage::new(&[], &[], None),
+                    router_info.identity.id(),
+                    Bytes::from(router_info.serialize(&signing_key)),
+                    static_key,
+                    signing_key,
+                    2u8,
+                    event_handle,
+                ),
+                subsys_handle,
+                transit_rx,
+                shutdown_handle,
+            ),
+            router_hash,
+            public_key,
+        )
+    }
+
+    #[tokio::test]
+    async fn too_many_build_records_rejected() {
+        let (mut transit_manager, _, _) = make_transit_manager();
+        let local_hash = transit_manager.router_ctx.noise().local_router_hash().to_vec();
+
+        // build request with `num_records` garbage records, the last one addressed to us
+        let build = |num_records: usize| {
+            let mut payload = vec![num_records as u8];
+
+            for i in 0..num_records {
+                let mut record = vec![0xaa; SHORT_RECORD_LEN];
+                if i == num_records - 1 {
+                    record[..16].copy_from_slice(&local_hash[..16]);
+                }
+                payload.extend(record);
+            }
+
+            Message {
+                message_type: MessageType::ShortTunnelBuild,
+                message_id: 1337,
+                expiration: MockRuntime::time_since_epoch() + Duration::from_secs(10),
+                payload,
+            }
+        };
+
+        // more records than allowed, the request is rejected before our record is looked at
+        match transit_manager.handle_short_tunnel_build(build(MAX_NUM_RECORDS + 1)).unwrap_err() {
+            Error::Tunnel(TunnelError::RecordNotFound) => {}
+            error => panic!("invalid error: {error:?}"),
+        }
+
+        // maximum number of records is accepted and fails only because the record is garbage
+        match transit_manager.handle_short_tunnel_build(build(MAX_NUM_RECORDS)).unwrap_err() {
+            Error::Tunnel(TunnelError::RecordNotFound) => panic!("record not found"),
+            _ => {}
+        }
+
+        // record count in the header must match the number of records
+        let mut message = build(MAX_NUM_RECORDS);
+        message.payload[0] = 3u8;
+        match transit_manager.handle_short_tunnel_build(message).unwrap_err() {
+            Error::Tunnel(TunnelError::RecordNotFound) => {}
+            error => panic!("invalid error: {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn next_hop_is_self_rejected() {
+        let (mut transit_manager, router_hash, public_key) = make_transit_manager();
+        let (local_hash, _local_pk, _, local_noise, _) = make_router(true);
+
+        // tunnel whose first hop is followed by the same router again
+        let hops = vec![
+            (router_hash.clone(), public_key.clone()),
+            (router_hash, public_key),
+        ];
+        let (_pending_tunnel, _next_router, message) =
+            PendingTunnel::<_, OutboundTunnel<MockRuntime>>::create_tunnel(TunnelBuildParameters {
+                hops,
+                metrics_handle: MockRuntime::register_metrics(vec![], None),
+                name: Str::from("tunnel-pool"),
+                noise: local_noise,
+                message_id: MessageId::from(MockRuntime::rng().next_u32()),
+                tunnel_info: TunnelInfo::Outbound {
+                    gateway: TunnelId::from(MockRuntime::rng().next_u32()),
+                    tunnel_id: TunnelId::from(MockRuntime::rng().next_u32()),
+                    router_id: local_hash,
+                },
+                receiver: ReceiverKind::Outbound,
+            })
+            .unwrap();
+
+        match transit_manager.handle_short_tunnel_build(message).unwrap_err() {
+            Error::Tunnel(TunnelError::InvalidHop) => {}
             error => panic!("invalid error: {error:?}"),
         }
     }
