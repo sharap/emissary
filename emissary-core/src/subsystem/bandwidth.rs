@@ -40,6 +40,7 @@ use futures::FutureExt;
 
 use alloc::sync::Arc;
 use core::{
+    sync::atomic::AtomicIsize,
     sync::atomic::{AtomicU8, Ordering},
     task::Context,
     time::Duration,
@@ -49,7 +50,7 @@ use core::{
 const LOG_TARGET: &str = "emissary::bandwidth";
 
 /// How often token buckets are refilled.
-const REFILL_INTERVAL: Duration = Duration::from_millis(100);
+pub const REFILL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Number of refills per metering slot (one second).
 const REFILLS_PER_SLOT: usize = 10usize;
@@ -71,8 +72,6 @@ const HIGH_CONGESTION_THRESHOLD: f64 = 0.9f64;
 /// Usage above this fraction of the limit is medium congestion.
 const MEDIUM_CONGESTION_THRESHOLD: f64 = 0.7f64;
 
-/// How far over the inbound limit local traffic may go before it's dropped.
-const INBOUND_HEADROOM: f64 = 0.1f64;
 
 /// Congestion level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -223,10 +222,6 @@ impl TokenBucket {
         self.unlimited || self.tokens > 0
     }
 
-    /// Is the bucket in debt by more than `fraction` of its burst.
-    fn in_debt_over(&self, fraction: f64) -> bool {
-        !self.unlimited && (self.tokens as f64) < -(self.burst as f64 * fraction)
-    }
 
     /// Consume `size` tokens.
     fn consume(&mut self, size: usize) {
@@ -240,6 +235,102 @@ impl TokenBucket {
         if !self.unlimited {
             self.tokens = (self.tokens + self.refill).min(self.burst);
         }
+    }
+}
+
+/// Token bucket shared between threads.
+#[derive(Debug, Default)]
+struct SharedBucket {
+    /// Maximum number of tokens, one second of traffic. Zero means unlimited.
+    burst: AtomicIsize,
+
+    /// Tokens added per refill.
+    refill: AtomicIsize,
+
+    /// Available tokens, negative if the bucket is in debt.
+    tokens: AtomicIsize,
+}
+
+/// Inbound bandwidth limiter.
+///
+/// Shared between [`BandwidthTracker`], which refills it, and the transports, which consume it
+/// for every frame or packet they read and stop reading while it has no tokens. NTCP2 slows the
+/// remote router down through TCP flow control, SSU2 by letting packets be dropped.
+#[derive(Debug, Default, Clone)]
+pub struct InboundLimiter {
+    /// Shared bucket.
+    inner: Arc<SharedBucket>,
+}
+
+impl InboundLimiter {
+    /// Create new `InboundLimiter` without a limit.
+    pub fn unlimited() -> Self {
+        Self::default()
+    }
+
+    /// Create new `InboundLimiter` with `rate` bytes per second, zero meaning unlimited.
+    pub fn new(rate: usize) -> Self {
+        let limiter = Self::unlimited();
+        limiter.configure(rate);
+        limiter
+    }
+
+    /// Set the limit to `rate` bytes per second, zero meaning unlimited.
+    pub fn configure(&self, rate: usize) {
+        self.inner.burst.store(rate as isize, Ordering::Relaxed);
+        self.inner.refill.store(rate.div_ceil(REFILLS_PER_SLOT) as isize, Ordering::Relaxed);
+        self.inner.tokens.store(rate as isize, Ordering::Relaxed);
+    }
+
+    /// Is the limiter unlimited.
+    pub fn is_unlimited(&self) -> bool {
+        self.inner.burst.load(Ordering::Relaxed) == 0
+    }
+
+    /// Does the limiter currently allow reading.
+    ///
+    /// Reading is allowed as long as there are tokens left, even if what is read is larger
+    /// than the remaining tokens, in which case the bucket goes into debt.
+    pub fn allows(&self) -> bool {
+        self.is_unlimited() || self.inner.tokens.load(Ordering::Relaxed) > 0
+    }
+
+    /// Consume `size` tokens.
+    pub fn consume(&self, size: usize) {
+        if !self.is_unlimited() {
+            self.inner.tokens.fetch_sub(size as isize, Ordering::Relaxed);
+        }
+    }
+
+    /// Refill the bucket.
+    pub(crate) fn refill(&self) {
+        if self.is_unlimited() {
+            return;
+        }
+
+        let burst = self.inner.burst.load(Ordering::Relaxed);
+        let refill = self.inner.refill.load(Ordering::Relaxed);
+        let mut tokens = self.inner.tokens.load(Ordering::Relaxed);
+
+        loop {
+            let new = (tokens + refill).min(burst);
+
+            match self.inner.tokens.compare_exchange_weak(
+                tokens,
+                new,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => tokens = current,
+            }
+        }
+    }
+
+    /// Get available tokens.
+    #[cfg(test)]
+    pub fn tokens(&self) -> isize {
+        self.inner.tokens.load(Ordering::Relaxed)
     }
 }
 
@@ -346,8 +437,8 @@ pub struct BandwidthTracker<R: Runtime> {
     /// Current short-term congestion level.
     congestion_short: Congestion,
 
-    /// Token bucket for all inbound traffic.
-    inbound: TokenBucket,
+    /// Limiter for all inbound traffic, shared with the transports.
+    inbound: InboundLimiter,
 
     /// Inbound limit, bytes per second.
     inbound_limit: usize,
@@ -428,7 +519,7 @@ impl<R: Runtime> BandwidthTracker<R> {
             Self {
                 congestion_medium: congestion_medium.clone(),
                 congestion_short: congestion_short.clone(),
-                inbound: bucket(config.inbound),
+                inbound: InboundLimiter::new(config.inbound),
                 inbound_limit: config.inbound,
                 meter_medium: BandwidthMeter::new(),
                 meter_short: BandwidthMeter::new(),
@@ -444,6 +535,20 @@ impl<R: Runtime> BandwidthTracker<R> {
             congestion_short,
             congestion_medium,
         )
+    }
+
+    /// Get a copy of the inbound limiter.
+    #[cfg(test)]
+    pub fn inbound_limiter(&self) -> InboundLimiter {
+        self.inbound.clone()
+    }
+
+    /// Use `limiter`, shared with the transports, as the inbound limiter.
+    ///
+    /// The limiter is configured with the inbound limit of this tracker.
+    pub fn set_inbound_limiter(&mut self, limiter: InboundLimiter) {
+        limiter.configure(self.inbound_limit);
+        self.inbound = limiter;
     }
 
     /// Get verdict for an outbound message of `size` bytes from `source`.
@@ -476,23 +581,19 @@ impl<R: Runtime> BandwidthTracker<R> {
 
     /// Record an inbound message of `size` bytes from `source`.
     ///
-    /// Returns `true` if the message must be dropped because the limit has been exceeded:
-    /// transit traffic is dropped as soon as its budget is in debt, local traffic once the
-    /// inbound limit has been exceeded by more than 10%.
+    /// Returns `true` if the message must be dropped because the transit budget has been
+    /// exceeded. The inbound limit itself is enforced by the transports, which stop reading
+    /// while the shared [`InboundLimiter`] has no tokens, so local traffic is never dropped
+    /// here.
     pub fn inbound_exceeded(&mut self, size: usize, source: Source) -> bool {
-        let exceeded = if source.is_transit() {
-            self.transit_inbound.is_closed()
+        if source.is_transit()
+            && (self.transit_inbound.is_closed()
                 || !self.transit_inbound.allows()
-                || !self.inbound.allows()
-        } else {
-            self.inbound.in_debt_over(INBOUND_HEADROOM)
-        };
-
-        if exceeded {
+                || !self.inbound.allows())
+        {
             return true;
         }
 
-        self.inbound.consume(size);
         if source.is_transit() {
             self.transit_inbound.consume(size);
         }
@@ -550,7 +651,7 @@ impl<R: Runtime> BandwidthTracker<R> {
 
         tracing::trace!(
             target: LOG_TARGET,
-            inbound = ?self.inbound.tokens,
+            inbound = ?self.inbound.inner.tokens,
             outbound = ?self.outbound.tokens,
             "buckets refilled",
         );
@@ -692,23 +793,76 @@ mod tests {
     #[tokio::test]
     async fn inbound_transit_dropped_first() {
         let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(config(1000, 1000, 0.5));
+        let limiter = tracker.inbound_limiter();
 
         // transit budget is 500 bytes, the bucket may go into debt once
         assert!(!tracker.inbound_exceeded(400, Source::Transit));
         assert!(!tracker.inbound_exceeded(400, Source::Transit));
         assert!(tracker.inbound_exceeded(100, Source::Transit));
 
-        // local traffic may exceed the total limit by 10%
-        assert!(!tracker.inbound_exceeded(250, Source::Client));
-        assert!(!tracker.inbound_exceeded(100, Source::Client));
-        assert!(tracker.inbound_exceeded(1, Source::Client));
+        // local traffic is never dropped here, the transports throttle it
+        limiter.consume(2000);
+        assert!(!limiter.allows());
+        assert!(!tracker.inbound_exceeded(1000, Source::Client));
 
-        // and transit is dropped while the total budget is exhausted
+        // transit is dropped while the shared inbound bucket is exhausted, even if the transit
+        // bucket has recovered
         for _ in 0..REFILLS_PER_SLOT {
             tracker.refill();
         }
-        assert!(!tracker.inbound_exceeded(1000, Source::Client));
+        assert_eq!(limiter.tokens(), 0);
         assert!(tracker.inbound_exceeded(1, Source::Transit));
+
+        tracker.refill();
+        assert_eq!(limiter.tokens(), 100);
+        assert!(!tracker.inbound_exceeded(1, Source::Transit));
+    }
+
+    #[tokio::test]
+    async fn inbound_limiter_shared_with_transports() {
+        let (mut tracker, ..) = BandwidthTracker::<MockRuntime>::new(config(1000, 0, 0.5));
+        let limiter = tracker.inbound_limiter();
+        assert!(!limiter.is_unlimited());
+        assert_eq!(limiter.tokens(), 1000);
+
+        // consumption through a copy is visible to the tracker
+        limiter.clone().consume(1500);
+        assert_eq!(limiter.tokens(), -500);
+        assert!(!limiter.allows());
+        assert!(tracker.inbound_exceeded(1, Source::Transit));
+
+        // refills by the tracker are visible to the transports, tokens never exceed the burst
+        for _ in 0..6 {
+            tracker.refill();
+        }
+        assert_eq!(limiter.tokens(), 100);
+        assert!(limiter.allows());
+        for _ in 0..100 {
+            tracker.refill();
+        }
+        assert_eq!(limiter.tokens(), 1000);
+
+        // a limiter created elsewhere takes the tracker's limit when installed
+        let shared = InboundLimiter::unlimited();
+        assert!(shared.is_unlimited());
+        shared.consume(usize::MAX / 4);
+        assert!(shared.allows());
+
+        tracker.set_inbound_limiter(shared.clone());
+        assert!(!shared.is_unlimited());
+        assert_eq!(shared.tokens(), 1000);
+        shared.consume(1000);
+        assert!(!shared.allows());
+        assert!(tracker.inbound_exceeded(1, Source::Transit));
+        tracker.refill();
+        assert!(shared.allows());
+
+        // an unlimited configuration never throttles
+        let (tracker, ..) = BandwidthTracker::<MockRuntime>::new(config(0, 0, 0.5));
+        let limiter = tracker.inbound_limiter();
+        assert!(limiter.is_unlimited());
+        limiter.consume(usize::MAX / 4);
+        assert!(limiter.allows());
     }
 
     #[tokio::test]

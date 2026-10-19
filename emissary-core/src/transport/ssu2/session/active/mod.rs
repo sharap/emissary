@@ -24,7 +24,9 @@ use crate::{
     primitives::{RouterId, RouterInfo},
     router::context::RouterContext,
     runtime::{Counter, Instant, MetricsHandle, Runtime, UdpSocket},
-    subsystem::{OutboundMessage, OutboundMessageRecycle, SubsystemEvent},
+    subsystem::{
+        bandwidth::REFILL_INTERVAL, OutboundMessage, OutboundMessageRecycle, SubsystemEvent,
+    },
     transport::{
         ssu2::{
             duplicate::DuplicateFilter,
@@ -234,6 +236,9 @@ pub struct Ssu2Session<R: Runtime> {
     /// Key context for inbound packets.
     recv_key_ctx: KeyContext,
 
+    /// Timer for resuming packet processing after the inbound limit has been exceeded.
+    throttle_timer: Option<R::Timer>,
+
     /// Relay handle.
     relay_handle: RelayHandle<R>,
 
@@ -311,6 +316,7 @@ impl<R: Runtime> Ssu2Session<R> {
             pkt_rx: context.pkt_rx,
             recv_key_ctx: context.recv_key_ctx,
             relay_handle,
+            throttle_timer: None,
             remote_ack: RemoteAckManager::new(),
             resend_timer: None,
             router_ctx,
@@ -629,11 +635,26 @@ impl<R: Runtime> Future for Ssu2Session<R> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
+            // inbound limit exceeded: leave packets in the channel until the limiter has been
+            // refilled, the socket drops what doesn't fit and the remote router slows down
+            if !self.router_ctx.inbound_limiter().allows() {
+                let timer = self.throttle_timer.get_or_insert_with(|| R::timer(REFILL_INTERVAL));
+
+                match timer.poll_unpin(cx) {
+                    Poll::Pending => break,
+                    Poll::Ready(()) => {
+                        self.throttle_timer = None;
+                        continue;
+                    }
+                }
+            }
+
             match self.pkt_rx.poll_recv(cx) {
                 Poll::Pending => break,
                 Poll::Ready(None) => return Poll::Ready(TerminationReason::Unspecified),
                 Poll::Ready(Some(pkt)) => {
                     self.inbound_bandwidth += pkt.pkt.len();
+                    self.router_ctx.inbound_limiter().consume(pkt.pkt.len());
 
                     match self.handle_packet(pkt) {
                         Ok(()) => {}
@@ -848,12 +869,134 @@ mod tests {
         primitives::{MessageId, RouterInfoBuilder},
         profile::ProfileStorage,
         runtime::mock::MockRuntime,
+        timeout,
         transport::ssu2::{
-            message::data::DataMessageBuilder, peer_test::types::PeerTestEventRecycle,
+            message::data::{DataMessageBuilder, MessageKind},
+            peer_test::types::PeerTestEventRecycle,
         },
     };
     use bytes::Bytes;
     use thingbuf::mpsc::channel;
+
+    #[tokio::test]
+    async fn inbound_limit_throttles_packets() {
+        let (from_socket_tx, from_socket_rx) = channel(128);
+        let socket = <MockRuntime as Runtime>::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let recv_socket =
+            <MockRuntime as Runtime>::UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+        let remote_signing_key = SigningPrivateKey::random(rand::rng());
+        let (router_info, static_key, signing_key) = RouterInfoBuilder::default().build();
+        let (_event_mgr, _event_subscriber, event_handle) =
+            EventManager::new(None, MockRuntime::register_metrics(vec![], None));
+        let router_ctx = RouterContext::new(
+            MockRuntime::register_metrics(vec![], None),
+            ProfileStorage::<MockRuntime>::new(&Vec::new(), &Vec::new(), None),
+            router_info.identity.id(),
+            Bytes::from(router_info.serialize(&signing_key)),
+            static_key.clone(),
+            signing_key,
+            2u8,
+            event_handle.clone(),
+        );
+        let limiter = router_ctx.inbound_limiter().clone();
+
+        let recv_key_ctx = KeyContext {
+            k_data: [2u8; 32],
+            k_header_2: [3u8; 32],
+        };
+        let ctx = Ssu2SessionContext {
+            address: recv_socket.local_address().unwrap(),
+            dst_id: 1337u64,
+            intro_key: [1u8; 32],
+            max_payload_size: 1472,
+            pkt_rx: from_socket_rx,
+            recv_key_ctx: recv_key_ctx.clone(),
+            router_id: RouterId::random(),
+            send_key_ctx: KeyContext {
+                k_data: [3u8; 32],
+                k_header_2: [2u8; 32],
+            },
+            verifying_key: remote_signing_key.public(),
+        };
+        let (peer_test_event_tx, _peer_test_event_rx) =
+            with_recycle(16, PeerTestEventRecycle::default());
+        let peer_test_handle = PeerTestHandle::new(peer_test_event_tx);
+        let (relay_event_tx, _relay_event_rx) = channel(16);
+        let relay_handle = RelayHandle::new(relay_event_tx);
+        let (transport_tx, transport_rx) = channel(16);
+
+        tokio::spawn(
+            Ssu2Session::<MockRuntime>::new(
+                ctx,
+                socket,
+                transport_tx,
+                router_ctx,
+                peer_test_handle,
+                relay_handle,
+            )
+            .run(),
+        );
+        match timeout!(transport_rx.recv()).await.unwrap().unwrap() {
+            SubsystemEvent::ConnectionEstablished { .. } => {}
+            event => panic!("unexpected event: {event:?}"),
+        }
+
+        // build a packet carrying one unfragmented i2np message, decrypting the first part
+        // of the header like the socket does before handing the packet to the session
+        let make_packet = |pkt_num: u32| {
+            let message = Message {
+                message_type: MessageType::Data,
+                message_id: pkt_num,
+                expiration: MockRuntime::time_since_epoch() + I2NP_MESSAGE_EXPIRATION,
+                payload: vec![0xaa; 400],
+            }
+            .serialize_short();
+            let mut pkt = DataMessageBuilder::default()
+                .with_dst_id(1337u64)
+                .with_key_context([1u8; 32], &recv_key_ctx)
+                .with_message(pkt_num, MessageKind::UnFragmented { message: &message })
+                .build::<MockRuntime>()
+                .to_vec();
+            let mut reader = HeaderReader::new([1u8; 32], &mut pkt).unwrap();
+            let _dst_id = reader.dst_id();
+
+            pkt
+        };
+        async fn next_message(rx: &Receiver<SubsystemEvent>) -> u32 {
+            match timeout!(rx.recv()).await.expect("no timeout").expect("channel open") {
+                SubsystemEvent::Message { messages } => messages[0].1.message_id,
+                event => panic!("unexpected event: {event:?}"),
+            }
+        }
+
+        // two packets fit in the budget, the third one has to wait for a refill
+        let packets = (1..=3u32).map(make_packet).collect::<Vec<_>>();
+        limiter.configure(2 * packets[0].len() - 1);
+
+        for pkt in packets {
+            from_socket_tx
+                .try_send(Packet {
+                    pkt,
+                    address: "127.0.0.1:8888".parse().unwrap(),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(next_message(&transport_rx).await, 1);
+        assert_eq!(next_message(&transport_rx).await, 2);
+        assert!(!limiter.allows());
+
+        // the third packet stays in the channel while the limiter is in debt
+        assert!(timeout!(transport_rx.recv(), Duration::from_millis(300)).await.is_err());
+
+        // once the limiter has been refilled, processing resumes
+        limiter.refill();
+        assert_eq!(next_message(&transport_rx).await, 3);
+    }
 
     #[tokio::test]
     async fn backpressure_works() {

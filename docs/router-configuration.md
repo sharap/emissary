@@ -202,7 +202,7 @@ ml_kem = "3,4"
     <tr>
       <td><code>inbound</code></td>
       <td><code>--inbound-bandwidth</code></td>
-      <td>Inbound bandwidth limit in bytes per second. <code>0</code> disables the limit. (default: <code>bandwidth</code>)</td>
+      <td>Inbound bandwidth limit in bytes per second. Over the limit the router stops reading from its connections, which slows remote routers down (NTCP2 through TCP flow control, SSU2 by dropping packets); transit traffic over its share is dropped. <code>0</code> disables the limit. (default: <code>bandwidth</code>)</td>
     </tr>
     <tr>
       <td><code>outbound</code></td>

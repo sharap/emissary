@@ -38,7 +38,7 @@ use crate::{
     profile::ProfileStorage,
     router::context::RouterContext,
     runtime::{Runtime, TcpStream},
-    subsystem::SubsystemEvent,
+    subsystem::{bandwidth::InboundLimiter, SubsystemEvent},
     transport::{
         ntcp2::session::{initiator::Initiator, responder::Responder},
         Direction,
@@ -388,6 +388,7 @@ impl<R: Runtime> SessionManager<R> {
         transport_tx: Sender<SubsystemEvent>,
         started: R::Instant,
         metrics_handle: R::MetricsHandle,
+        inbound_limiter: InboundLimiter,
         ipv4: bool,
         ipv6: bool,
     ) -> Result<Ntcp2Session<R>, Ntcp2Error> {
@@ -548,6 +549,7 @@ impl<R: Runtime> SessionManager<R> {
             started,
             metrics_handle,
             encryption,
+            inbound_limiter,
         ))
     }
 
@@ -576,6 +578,7 @@ impl<R: Runtime> SessionManager<R> {
         let router_id = router.identity.id();
         let transport_tx = self.transport_tx.clone();
         let metrics_handle = self.router_ctx.metrics_handle().clone();
+        let inbound_limiter = self.router_ctx.inbound_limiter().clone();
         let outbound_state = Arc::clone(&self.outbound);
         let started = R::now();
 
@@ -592,6 +595,7 @@ impl<R: Runtime> SessionManager<R> {
                 transport_tx.clone(),
                 started,
                 metrics_handle,
+                inbound_limiter,
                 ipv4,
                 ipv6,
             )
@@ -640,6 +644,7 @@ impl<R: Runtime> SessionManager<R> {
         transport_tx: Sender<SubsystemEvent>,
         started: R::Instant,
         metrics_handle: R::MetricsHandle,
+        inbound_limiter: InboundLimiter,
     ) -> Result<Ntcp2Session<R>, Ntcp2Error> {
         tracing::trace!(
             target: LOG_TARGET,
@@ -708,6 +713,7 @@ impl<R: Runtime> SessionManager<R> {
                     started,
                     metrics_handle,
                     encryption,
+                    inbound_limiter,
                 ))
             }
             Err(error) => {
@@ -737,6 +743,7 @@ impl<R: Runtime> SessionManager<R> {
         let event_handle = self.router_ctx.event_handle().clone();
         let transport_tx = self.transport_tx.clone();
         let metrics_handle = self.router_ctx.metrics_handle().clone();
+        let inbound_limiter = self.router_ctx.inbound_limiter().clone();
         let inbound_state = self.inbound.clone();
         let started = R::now();
 
@@ -754,6 +761,7 @@ impl<R: Runtime> SessionManager<R> {
                 transport_tx,
                 started,
                 metrics_handle,
+                inbound_limiter,
             )
             .await
             .map_err(|error| (None, error))
@@ -775,7 +783,7 @@ mod tests {
             mock::{MockRuntime, MockTcpListener, MockTcpStream},
             Runtime, TcpListener as _,
         },
-        subsystem::OutboundMessage,
+        subsystem::{OutboundMessage, SubsystemEvent},
         timeout,
         transport::ntcp2::{listener::Ntcp2Listener, session::SessionManager, TerminationReason},
     };
@@ -786,7 +794,7 @@ mod tests {
         net::{Ipv4Addr, Ipv6Addr, SocketAddr},
         time::Duration,
     };
-    use thingbuf::mpsc::channel;
+    use thingbuf::mpsc::{channel, Receiver};
     use tokio::net::TcpListener;
 
     struct Ntcp2Builder<R: Runtime> {
@@ -912,6 +920,120 @@ mod tests {
         router_info: RouterInfo,
         signing_key: SigningPrivateKey,
         static_key: StaticPrivateKey,
+    }
+
+    /// Receive the next I2NP message dispatched by a session.
+    async fn next_message(rx: &Receiver<SubsystemEvent>) -> u32 {
+        match timeout!(rx.recv()).await.expect("no timeout").expect("channel open") {
+            SubsystemEvent::Message { messages } => {
+                assert_eq!(messages.len(), 1);
+                messages[0].1.message_id
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_limit_throttles_reads() {
+        let (_event_mgr, _event_subscriber, event_handle) =
+            EventManager::new(None, MockRuntime::register_metrics(vec![], None));
+        let (transport_tx1, transport_rx1) = channel(16);
+        let local = Ntcp2Builder::<MockRuntime>::new().build();
+        let local_manager = SessionManager::new(
+            StaticPrivateKey::from_bytes(local.ntcp2_key),
+            local.ntcp2_iv,
+            RouterContext::new(
+                MockRuntime::register_metrics(Vec::new(), None),
+                ProfileStorage::<MockRuntime>::new(&[], &[], None),
+                local.router_info.identity.id(),
+                Bytes::from(local.router_info.serialize(&local.signing_key)),
+                local.static_key,
+                local.signing_key,
+                2u8,
+                event_handle.clone(),
+            ),
+            true,
+            true,
+            transport_tx1,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = Ntcp2Builder::<MockRuntime>::new()
+            .with_router_address(listener.local_addr().unwrap().port())
+            .build();
+        let (transport_tx2, transport_rx2) = channel(16);
+        let remote_ctx = RouterContext::new(
+            MockRuntime::register_metrics(Vec::new(), None),
+            ProfileStorage::<MockRuntime>::new(&[], &[], None),
+            remote.router_info.identity.id(),
+            Bytes::from(remote.router_info.serialize(&remote.signing_key)),
+            remote.static_key,
+            remote.signing_key,
+            2u8,
+            event_handle.clone(),
+        );
+
+        // every frame below is roughly 430 bytes: two frames fit in the budget, the third one
+        // has to wait for the limiter to be refilled
+        let limiter = remote_ctx.inbound_limiter().clone();
+        limiter.configure(500);
+
+        let remote_manager = SessionManager::new(
+            StaticPrivateKey::from_bytes(remote.ntcp2_key),
+            remote.ntcp2_iv,
+            remote_ctx,
+            true,
+            true,
+            transport_tx2,
+        );
+
+        let handle = tokio::spawn(async move {
+            local_manager.create_session(remote.router_info.clone(), true, false).await
+        });
+        let (stream, address) = timeout!(listener.accept()).await.unwrap().unwrap();
+        let (remote_session, local_session) = tokio::join!(
+            remote_manager.accept_session(MockTcpStream::new(stream), address),
+            handle
+        );
+        let remote_session = remote_session.unwrap();
+        let local_session = local_session.unwrap().unwrap();
+
+        tokio::spawn(local_session.run());
+        tokio::spawn(remote_session.run());
+
+        let tx = match timeout!(transport_rx1.recv()).await.unwrap().unwrap() {
+            SubsystemEvent::ConnectionEstablished { tx, .. } => tx,
+            event => panic!("unexpected event: {event:?}"),
+        };
+        match timeout!(transport_rx2.recv()).await.unwrap().unwrap() {
+            SubsystemEvent::ConnectionEstablished { .. } => {}
+            event => panic!("unexpected event: {event:?}"),
+        }
+
+        for message_id in 1..=3u32 {
+            tx.send(OutboundMessage::Message(Message {
+                message_type: MessageType::Data,
+                message_id,
+                expiration: MockRuntime::time_since_epoch() + I2NP_MESSAGE_EXPIRATION,
+                payload: vec![0xaa; 400],
+            }))
+            .await
+            .unwrap();
+        }
+
+        // the first two frames are read, the second one leaves the limiter in debt
+        assert_eq!(next_message(&transport_rx2).await, 1);
+        assert_eq!(next_message(&transport_rx2).await, 2);
+        assert!(!limiter.allows());
+
+        // the third frame stays in the socket while the limiter is in debt
+        assert!(timeout!(transport_rx2.recv(), Duration::from_millis(300)).await.is_err());
+
+        // once the limiter has been refilled, reading resumes
+        for _ in 0..10 {
+            limiter.refill();
+        }
+        assert_eq!(next_message(&transport_rx2).await, 3);
     }
 
     #[tokio::test]

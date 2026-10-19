@@ -294,7 +294,7 @@ impl<R: Runtime> Router<R> {
             congestion,
             dial_rx,
             handle,
-            manager,
+            mut manager,
             netdb_rx,
             transit_rx,
             transport_tx,
@@ -304,6 +304,9 @@ impl<R: Runtime> Router<R> {
             config.bandwidth.unwrap_or_default(),
             metrics_handle.clone(),
         );
+
+        // the transports enforce the inbound limit through the limiter in the router context
+        manager.set_inbound_limiter(router_ctx.inbound_limiter().clone());
 
         // spawn subsystem manager in the background
         R::spawn(manager);

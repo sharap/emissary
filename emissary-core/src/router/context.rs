@@ -22,6 +22,7 @@ use crate::{
     primitives::RouterId,
     profile::ProfileStorage,
     runtime::Runtime,
+    subsystem::bandwidth::InboundLimiter,
     tunnel::NoiseContext,
 };
 
@@ -36,6 +37,9 @@ use alloc::sync::Arc;
 
 /// Inner router context.
 struct InnerRouterContext<R: Runtime> {
+    /// Inbound bandwidth limiter, shared with the transports.
+    inbound_limiter: InboundLimiter,
+
     /// Metrics handle.
     metrics_handle: R::MetricsHandle,
 
@@ -93,6 +97,7 @@ impl<R: Runtime> RouterContext<R> {
         Self {
             event_handle,
             inner: Arc::new(InnerRouterContext {
+                inbound_limiter: InboundLimiter::unlimited(),
                 metrics_handle,
                 net_id,
                 noise: NoiseContext::new(static_key.clone(), Bytes::from(router_id.to_vec())),
@@ -126,6 +131,11 @@ impl<R: Runtime> RouterContext<R> {
     pub fn set_router_info(&self, router_info: Bytes) {
         let mut inner = self.inner.router_info.write();
         *inner = router_info;
+    }
+
+    /// Get reference to the inbound bandwidth limiter.
+    pub fn inbound_limiter(&self) -> &InboundLimiter {
+        &self.inner.inbound_limiter
     }
 
     /// Get reference to metrics handle.

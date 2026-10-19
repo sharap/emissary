@@ -25,7 +25,10 @@ use crate::{
     events::EventHandle,
     primitives::{RouterId, RouterInfo},
     runtime::{AsyncRead, AsyncWrite, Counter, Histogram, Instant, MetricsHandle, Runtime},
-    subsystem::{OutboundMessage, OutboundMessageRecycle, SubsystemEvent},
+    subsystem::{
+        bandwidth::{InboundLimiter, REFILL_INTERVAL},
+        OutboundMessage, OutboundMessageRecycle, SubsystemEvent,
+    },
     transport::{
         ntcp2::{
             message::MessageBlock,
@@ -151,6 +154,9 @@ pub struct Ntcp2Session<R: Runtime> {
     /// Total inbound bandwidth.
     inbound_bandwidth: usize,
 
+    /// Inbound bandwidth limiter.
+    inbound_limiter: InboundLimiter,
+
     /// Metrics handle.
     metrics_handle: R::MetricsHandle,
 
@@ -196,6 +202,9 @@ pub struct Ntcp2Session<R: Runtime> {
     /// TCP stream.
     stream: R::TcpStream,
 
+    /// Timer for resuming reads after the inbound limit has been exceeded.
+    throttle_timer: Option<R::Timer>,
+
     /// TX channel for sending events to `SubsystemManager`.
     transport_tx: Sender<SubsystemEvent>,
 
@@ -217,6 +226,7 @@ impl<R: Runtime> Ntcp2Session<R> {
         started: R::Instant,
         metrics_handle: R::MetricsHandle,
         encryption: EncryptionKind,
+        inbound_limiter: InboundLimiter,
     ) -> Self {
         let KeyContext {
             send_key,
@@ -234,6 +244,7 @@ impl<R: Runtime> Ntcp2Session<R> {
             idle_timeout_timer: R::timer(IDLE_TIMEOUT_CHECK_INTERVAL),
             inbound_activity: R::now(),
             inbound_bandwidth: 0usize,
+            inbound_limiter,
             metrics_handle,
             msg_rx,
             msg_tx,
@@ -249,6 +260,7 @@ impl<R: Runtime> Ntcp2Session<R> {
             sip,
             started,
             stream,
+            throttle_timer: None,
             transport_tx,
             write_state: WriteState::GetMessage,
         }
@@ -346,6 +358,22 @@ impl<R: Runtime> Future for Ntcp2Session<R> {
         loop {
             match this.read_state {
                 ReadState::ReadSize { offset } => {
+                    // inbound limit exceeded: stop reading until the limiter has been refilled,
+                    // tcp flow control then slows the remote router down
+                    if offset == 0 && !this.inbound_limiter.allows() {
+                        let timer = this
+                            .throttle_timer
+                            .get_or_insert_with(|| R::timer(REFILL_INTERVAL));
+
+                        match timer.poll_unpin(cx) {
+                            Poll::Pending => break,
+                            Poll::Ready(()) => {
+                                this.throttle_timer = None;
+                                continue;
+                            }
+                        }
+                    }
+
                     match stream.as_mut().poll_read(cx, &mut this.read_buffer[offset..2]) {
                         Poll::Pending => break,
                         Poll::Ready(Err(error)) => {
@@ -399,6 +427,7 @@ impl<R: Runtime> Future for Ntcp2Session<R> {
                                 continue;
                             }
                             this.inbound_bandwidth += this.read_buffer[..size].len();
+                            this.inbound_limiter.consume(size + 2);
                             this.metrics_handle
                                 .histogram(MESSAGE_SIZES)
                                 .record(this.read_buffer[..size].len() as f64);

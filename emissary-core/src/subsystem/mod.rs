@@ -30,7 +30,7 @@ use crate::{
     primitives::{MessageId, RouterId, TunnelId},
     runtime::{Gauge, MetricType, MetricsHandle, Runtime},
     subsystem::{
-        bandwidth::{BandwidthTracker, Congestion, CongestionLevel, Verdict},
+        bandwidth::{BandwidthTracker, Congestion, CongestionLevel, InboundLimiter, Verdict},
         metrics::*,
     },
     tunnel::{DeliveryInstructions, NoiseContext},
@@ -599,6 +599,11 @@ impl<R: Runtime> SubsystemManager<R> {
     /// Collect `SubsystemManager`-related metric counters, gauges and histograms.
     pub fn metrics(metrics: Vec<MetricType>) -> Vec<MetricType> {
         register_metrics(metrics)
+    }
+
+    /// Use `limiter`, shared with the transports, as the inbound bandwidth limiter.
+    pub fn set_inbound_limiter(&mut self, limiter: InboundLimiter) {
+        self.bandwidth_tracker.set_inbound_limiter(limiter);
     }
 
     /// Handle outbound `message` to router identified by `router_id`.
