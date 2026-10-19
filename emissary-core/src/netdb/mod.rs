@@ -18,7 +18,7 @@
 
 use crate::{
     constants::limits::MAX_ROUTER_INFO_SIZE,
-    crypto::{base32_encode, base64_encode, StaticPublicKey},
+    crypto::{blinding::store_hash, base32_encode, base64_encode, StaticPublicKey},
     error::{
         parser::{DatabaseStoreParseError, RouterIdentityParseError, RouterInfoParseError},
         Error, QueryError,
@@ -37,7 +37,7 @@ use crate::{
         Message, MessageBuilder, MessageType, I2NP_MESSAGE_EXPIRATION,
     },
     netdb::{metrics::*, query::*},
-    primitives::{DestinationId, LeaseSet2, RouterId, RouterInfo},
+    primitives::{EncryptedLeaseSet2, DestinationId, LeaseSet2, RouterId, RouterInfo},
     profile::Bucket,
     router::context::RouterContext,
     runtime::{Counter, Gauge, Histogram, Instant, JoinSet, MetricType, MetricsHandle, Runtime},
@@ -52,7 +52,7 @@ use hashbrown::{HashMap, HashSet};
 use rand::Rng;
 use thingbuf::mpsc;
 
-use alloc::{format, vec::Vec};
+use alloc::{boxed::Box, format, vec::Vec};
 use core::{
     future::Future,
     mem,
@@ -62,7 +62,7 @@ use core::{
 };
 
 pub use dht::Dht;
-pub use handle::NetDbHandle;
+pub use handle::{NetDbHandle, QueriedLeaseSet};
 
 #[cfg(test)]
 pub use handle::{NetDbAction, NetDbActionRecycle};
@@ -98,6 +98,18 @@ const EXPLORATION_INTERVAL_LOW_ROUTER_COUNT: usize = 55usize;
 /// How often should router exploration be performed if the known peer count is high
 const EXPLORATION_INTERVAL_HIGH_ROUTER_COUNT: usize = 170usize;
 
+/// Lease set stored by a floodfill.
+struct StoredLeaseSet {
+    /// Is the lease set encrypted.
+    encrypted: bool,
+
+    /// When the lease set expires.
+    expires: Duration,
+
+    /// Serialized lease set, without the store type byte.
+    raw: Bytes,
+}
+
 /// Network database (NetDB).
 pub struct NetDb<R: Runtime> {
     /// Active queries.
@@ -123,7 +135,7 @@ pub struct NetDb<R: Runtime> {
     /// Serialized [`LeasSet2`]s received via `DatabaseStore` messages.
     ///
     /// This contains entries only if `floodfill` is true.
-    lease_sets: HashMap<Bytes, (Bytes, Duration)>,
+    lease_sets: HashMap<Bytes, StoredLeaseSet>,
 
     /// `NetDb` maintenance timer.
     maintenance_timer: R::Timer,
@@ -465,12 +477,73 @@ impl<R: Runtime> NetDb<R> {
             return;
         }
 
+        self.store_lease_set(key, reply, message, lease_set.expires(), false, destination_id);
+    }
+
+    /// Handle `DatabaseStore` message for an [`EncryptedLeaseSet2`].
+    ///
+    /// The lease set cannot be decrypted but its key must be the store hash of its blinded key
+    /// and the signature made with that key has already been verified.
+    fn on_encrypted_lease_set_store(
+        &mut self,
+        key: Bytes,
+        reply: StoreReplyType,
+        message: &[u8],
+        lease_set: EncryptedLeaseSet2,
+    ) {
+        tracing::trace!(
+            target: LOG_TARGET,
+            key = ?base32_encode(&key),
+            "encrypted lease set store",
+        );
+
+        if key.as_ref() != store_hash(&lease_set.blinded_public_key) {
+            tracing::warn!(
+                target: LOG_TARGET,
+                key = ?base32_encode(&key),
+                "encrypted lease set key doesn't match its blinded key, ignoring",
+            );
+            return;
+        }
+
+        if lease_set.is_expired::<R>() {
+            tracing::warn!(
+                target: LOG_TARGET,
+                key = ?base32_encode(&key),
+                expired = ?lease_set.expires,
+                "received an expired encrypted lease set, ignoring",
+            );
+            return;
+        }
+
+        let destination_id = DestinationId::from(&key);
+        self.store_lease_set(key, reply, message, lease_set.expires(), true, destination_id);
+    }
+
+    /// Store a validated lease set, send the store reply and flood the lease set.
+    ///
+    /// `destination_id` identifies the lease set in logs only.
+    fn store_lease_set(
+        &mut self,
+        key: Bytes,
+        reply: StoreReplyType,
+        message: &[u8],
+        expires: Duration,
+        encrypted: bool,
+        destination_id: DestinationId,
+    ) {
         // parse the raw lease set from the database store, store it in the set of leases we keep
         // track of and flood it to three floodfills closest to `key`
         let raw_lease_set = DatabaseStore::<R>::extract_raw_lease_set(message);
-        let expires = lease_set.expires();
 
-        self.lease_sets.insert(key.clone(), (raw_lease_set.clone(), expires));
+        self.lease_sets.insert(
+            key.clone(),
+            StoredLeaseSet {
+                encrypted,
+                expires,
+                raw: raw_lease_set.clone(),
+            },
+        );
 
         match reply {
             StoreReplyType::None => {
@@ -566,8 +639,14 @@ impl<R: Runtime> NetDb<R> {
             message_id: R::rng().next_u32(),
             payload: DatabaseStoreBuilder::new(
                 key,
-                DatabaseStoreKind::LeaseSet2 {
-                    lease_set: raw_lease_set,
+                if encrypted {
+                    DatabaseStoreKind::EncryptedLeaseSet2 {
+                        lease_set: raw_lease_set,
+                    }
+                } else {
+                    DatabaseStoreKind::LeaseSet2 {
+                        lease_set: raw_lease_set,
+                    }
                 },
             )
             .build()
@@ -618,11 +697,12 @@ impl<R: Runtime> NetDb<R> {
                     .serialize(),
                 )
             }
-            Some((lease_set, _)) => {
+            Some(stored) => {
                 tracing::trace!(
                     target: LOG_TARGET,
                     key = %b32_key,
                     %destination_id,
+                    encrypted = ?stored.encrypted,
                     "lease set found from local storage",
                 );
 
@@ -630,8 +710,14 @@ impl<R: Runtime> NetDb<R> {
                     MessageType::DatabaseStore,
                     DatabaseStoreBuilder::new(
                         key,
-                        DatabaseStoreKind::LeaseSet2 {
-                            lease_set: lease_set.clone(),
+                        if stored.encrypted {
+                            DatabaseStoreKind::EncryptedLeaseSet2 {
+                                lease_set: stored.raw.clone(),
+                            }
+                        } else {
+                            DatabaseStoreKind::LeaseSet2 {
+                                lease_set: stored.raw.clone(),
+                            }
                         },
                     )
                     .build(),
@@ -916,9 +1002,21 @@ impl<R: Runtime> NetDb<R> {
                     destination_id = %lease_set.header.destination.id(),
                     "ignoring lease set database store",
                 ),
+                DatabaseStorePayload::EncryptedLeaseSet2 { lease_set } if self.floodfill => {
+                    self.on_encrypted_lease_set_store(key, reply, &message.payload, lease_set);
+                }
+                DatabaseStorePayload::EncryptedLeaseSet2 { .. } => tracing::trace!(
+                    target: LOG_TARGET,
+                    key = ?base32_encode(&key),
+                    "ignoring encrypted lease set database store",
+                ),
             },
             Some(kind) => match (payload, kind) {
-                (DatabaseStorePayload::LeaseSet2 { lease_set }, QueryKind::LeaseSet { query }) => {
+                (
+                    payload @ (DatabaseStorePayload::LeaseSet2 { .. }
+                    | DatabaseStorePayload::EncryptedLeaseSet2 { .. }),
+                    QueryKind::LeaseSet { query },
+                ) => {
                     self.router_ctx.metrics_handle().counter(NUM_LS_QUERY_SUCCESSES).increment(1);
                     self.router_ctx
                         .metrics_handle()
@@ -934,11 +1032,25 @@ impl<R: Runtime> NetDb<R> {
                         .record(query.queried.len() as f64);
                     self.router_ctx.metrics_handle().gauge(ACTIVE_QUERIES).decrement(1);
 
-                    tracing::trace!(
-                        target: LOG_TARGET,
-                        destination_id = %lease_set.header.destination.id(),
-                        "lease set query reply received",
-                    );
+                    let lease_set = match payload {
+                        DatabaseStorePayload::LeaseSet2 { lease_set } => {
+                            tracing::trace!(
+                                target: LOG_TARGET,
+                                destination_id = %lease_set.header.destination.id(),
+                                "lease set query reply received",
+                            );
+                            QueriedLeaseSet::Standard(Box::new(lease_set))
+                        }
+                        DatabaseStorePayload::EncryptedLeaseSet2 { lease_set } => {
+                            tracing::trace!(
+                                target: LOG_TARGET,
+                                key = ?base32_encode(&key),
+                                "encrypted lease set query reply received",
+                            );
+                            QueriedLeaseSet::Encrypted(Box::new(lease_set))
+                        }
+                        DatabaseStorePayload::RouterInfo { .. } => unreachable!(),
+                    };
 
                     query.complete(Ok(lease_set));
                 }
@@ -1314,7 +1426,11 @@ impl<R: Runtime> NetDb<R> {
     /// Starts at most 3 queries in parallel and the first one that succeeds is sent to the
     /// destination. The query is considered failed if `DatabaseSearchReply` is received from all
     /// three floodfill routers or if the query timer expires.
-    fn query_lease_set(&mut self, key: Bytes, tx: oneshot::Sender<Result<LeaseSet2, QueryError>>) {
+    fn query_lease_set(
+        &mut self,
+        key: Bytes,
+        tx: oneshot::Sender<Result<QueriedLeaseSet, QueryError>>,
+    ) {
         match self.active.get_mut(&key) {
             Some(QueryKind::LeaseSet { query }) => {
                 tracing::debug!(
@@ -1591,7 +1707,7 @@ impl<R: Runtime> NetDb<R> {
             let num_pruned = self
                 .lease_sets
                 .iter()
-                .filter_map(|(key, (_, expires))| (expires < &now).then_some(key.clone()))
+                .filter_map(|(key, stored)| (stored.expires < now).then_some(key.clone()))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .fold(0usize, |count, key| {
@@ -2138,6 +2254,273 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(floodfills.remove(&router_id));
+        }
+    }
+
+    /// Encrypted lease set of a random destination as a database store payload, with its key,
+    /// the blinded key of the destination and the expiration of the lease set.
+    fn encrypted_lease_set_store() -> (Bytes, Bytes, crate::crypto::blinding::BlindedPublicKey, Duration) {
+        use crate::{crypto::blinding::BlindedPublicKey, primitives::EncryptedLeaseSet2};
+
+        let (lease_set, signing_key) = LeaseSet2::random();
+        let serialized = lease_set.serialize(&signing_key);
+        let expires = LeaseSet2::parse::<MockRuntime>(&serialized).unwrap().header.expires;
+        let bundle =
+            EncryptedLeaseSet2::encrypt::<MockRuntime>(&serialized, expires, &signing_key).unwrap();
+
+        (
+            Bytes::from(bundle.store_hash.to_vec()),
+            Bytes::from(bundle.payload),
+            BlindedPublicKey::new(&signing_key.public()).unwrap(),
+            bundle.expires,
+        )
+    }
+
+    #[tokio::test]
+    async fn encrypted_lease_set_store_to_floodfill() {
+        let storage = ProfileStorage::new(&Vec::new(), &Vec::new(), None);
+        let (tp_handle, _tm_rx, _tp_tx, _srx) = TunnelPoolHandle::create();
+
+        // add few floodfills to router storage
+        let mut floodfills = (0..3)
+            .map(|_| {
+                let info = RouterInfoBuilder::default().as_floodfill().build().0;
+                let id = info.identity.id();
+                storage.add_router(info);
+                id
+            })
+            .collect::<HashSet<_>>();
+
+        let (router_info, static_key, signing_key) = RouterInfoBuilder::default().build();
+        let SubsystemManagerContext {
+            dial_rx,
+            handle,
+            manager,
+            netdb_rx: _netdb_rx,
+            transit_rx: _transit_rx,
+            transport_tx: _transport_tx,
+            ..
+        } = SubsystemManager::<MockRuntime>::new(
+            router_info.identity.id().clone(),
+            NoiseContext::new(
+                static_key.clone(),
+                Bytes::from(router_info.identity.id().to_vec()),
+            ),
+            Default::default(),
+            MockRuntime::register_metrics(vec![], None),
+        );
+        let (_event_mgr, _event_subscriber, event_handle) =
+            EventManager::new(None, MockRuntime::register_metrics(vec![], None));
+        let (_netdb_tx, netdb_rx) = channel(64);
+        let (mut netdb, _handle) = NetDb::<MockRuntime>::new(
+            RouterContext::new(
+                MockRuntime::register_metrics(vec![], None),
+                storage,
+                router_info.identity.id(),
+                Bytes::from(router_info.serialize(&signing_key)),
+                static_key,
+                signing_key,
+                2u8,
+                event_handle.clone(),
+            ),
+            true,
+            tp_handle,
+            netdb_rx,
+            handle,
+        );
+        tokio::spawn(manager);
+
+        let (key, lease_set, _, expires) = encrypted_lease_set_store();
+
+        // a store under a key that isn't the hash of the blinded key is ignored
+        let wrong_key = Bytes::from(RouterId::random().to_vec());
+        let message = DatabaseStoreBuilder::new(
+            wrong_key,
+            DatabaseStoreKind::EncryptedLeaseSet2 {
+                lease_set: lease_set.clone(),
+            },
+        )
+        .build();
+        assert!(netdb
+            .on_message(
+                Message {
+                    payload: message.to_vec(),
+                    message_type: MessageType::DatabaseStore,
+                    ..Default::default()
+                },
+                None
+            )
+            .is_ok());
+        assert!(netdb.lease_sets.is_empty());
+
+        // a store under the correct key is accepted, acknowledged and flooded
+        let reply_router = RouterId::random();
+        let message = DatabaseStoreBuilder::new(
+            key.clone(),
+            DatabaseStoreKind::EncryptedLeaseSet2 { lease_set },
+        )
+        .with_reply_type(StoreReplyType::Tunnel {
+            reply_token: MockRuntime::rng().next_u32(),
+            tunnel_id: TunnelId::random(),
+            router_id: reply_router.clone(),
+        })
+        .build();
+        assert!(netdb
+            .on_message(
+                Message {
+                    payload: message.to_vec(),
+                    message_type: MessageType::DatabaseStore,
+                    ..Default::default()
+                },
+                None
+            )
+            .is_ok());
+
+        let stored = netdb.lease_sets.get(&key).unwrap();
+        assert!(stored.encrypted);
+        assert_eq!(stored.expires, expires);
+
+        let router = tokio::time::timeout(Duration::from_secs(5), dial_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(router, reply_router);
+
+        for _ in 0..3 {
+            let router_id = tokio::time::timeout(Duration::from_secs(5), dial_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(floodfills.remove(&router_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypted_lease_set_lookup_and_query() {
+        let storage = ProfileStorage::new(&Vec::new(), &Vec::new(), None);
+        let (tp_handle, tm_rx, _tp_tx, _srx) = TunnelPoolHandle::create();
+
+        // add few floodfills to router storage
+        let floodfills = (0..3)
+            .map(|_| {
+                let info = RouterInfoBuilder::default().as_floodfill().build().0;
+                let id = info.identity.id();
+                storage.add_router(info);
+                id
+            })
+            .collect::<Vec<_>>();
+
+        let (router_info, static_key, signing_key) = RouterInfoBuilder::default().build();
+        let (_event_mgr, _event_subscriber, event_handle) =
+            EventManager::new(None, MockRuntime::register_metrics(vec![], None));
+        let (_netdb_tx, netdb_rx) = channel(64);
+        let (handle, _event_rx) = SubsystemHandle::new();
+        let (mut netdb, _handle) = NetDb::<MockRuntime>::new(
+            RouterContext::new(
+                MockRuntime::register_metrics(vec![], None),
+                storage,
+                router_info.identity.id(),
+                Bytes::from(router_info.serialize(&signing_key)),
+                static_key,
+                signing_key,
+                2u8,
+                event_handle.clone(),
+            ),
+            true,
+            tp_handle,
+            netdb_rx,
+            handle,
+        );
+        netdb
+            .message_builder
+            .inbound_tunnels
+            .add_tunnel(LeaseSet2::random().0.leases[0].clone());
+        netdb.message_builder.outbound_tunnels.add_tunnel(TunnelId::random());
+
+        let (key, lease_set, blinded, expires) = encrypted_lease_set_store();
+        netdb.lease_sets.insert(
+            key.clone(),
+            StoredLeaseSet {
+                encrypted: true,
+                expires,
+                raw: lease_set.clone(),
+            },
+        );
+
+        // a lookup for the key is answered with an encrypted lease set
+        let tunnel_id = TunnelId::random();
+        let router_id = RouterId::random();
+        let message = DatabaseLookupBuilder::new(key.clone(), LookupType::LeaseSet)
+            .with_reply_type(ReplyType::Tunnel {
+                tunnel_id,
+                router_id: router_id.clone(),
+            })
+            .build();
+        assert!(netdb
+            .on_message(
+                Message {
+                    payload: message.to_vec(),
+                    message_type: MessageType::DatabaseLookup,
+                    ..Default::default()
+                },
+                None
+            )
+            .is_ok());
+
+        match tm_rx.try_recv().unwrap() {
+            TunnelMessage::TunnelDeliveryViaRoute {
+                router_id: gateway,
+                tunnel_id: dst_tunnel_id,
+                message,
+                ..
+            } => {
+                assert_eq!(gateway, router_id);
+                assert_eq!(dst_tunnel_id, tunnel_id);
+
+                let message = Message::parse_standard(&message).unwrap();
+                assert_eq!(message.message_type, MessageType::DatabaseStore);
+
+                let store = DatabaseStore::<MockRuntime>::parse(&message.payload).unwrap();
+                assert_eq!(store.key, key);
+                match store.payload {
+                    DatabaseStorePayload::EncryptedLeaseSet2 { lease_set } => {
+                        assert!(lease_set.decrypt::<MockRuntime>(&blinded).is_ok());
+                    }
+                    _ => panic!("invalid payload type"),
+                }
+            }
+            _ => panic!("invalid message"),
+        }
+
+        // a query for the key is completed with the encrypted lease set from the reply
+        netdb.lease_sets.clear();
+        let (res_tx, mut res_rx) = oneshot::channel();
+        netdb.query_lease_set(key.clone(), res_tx);
+        assert!(std::matches!(
+            netdb.active.get(&key),
+            Some(QueryKind::LeaseSet { .. })
+        ));
+
+        let message =
+            DatabaseStoreBuilder::new(key.clone(), DatabaseStoreKind::EncryptedLeaseSet2 { lease_set })
+                .build();
+        assert!(netdb
+            .on_message(
+                Message {
+                    payload: message.to_vec(),
+                    message_type: MessageType::DatabaseStore,
+                    ..Default::default()
+                },
+                Some(floodfills[0].clone())
+            )
+            .is_ok());
+        assert!(netdb.active.get(&key).is_none());
+
+        match res_rx.try_recv().unwrap().unwrap() {
+            Ok(QueriedLeaseSet::Encrypted(lease_set)) => {
+                assert!(lease_set.decrypt::<MockRuntime>(&blinded).is_ok());
+            }
+            _ => panic!("invalid query result"),
         }
     }
 
@@ -2925,7 +3308,14 @@ mod tests {
             (Bytes::from(id.to_vec()), lease_set, expires)
         };
 
-        netdb.lease_sets.insert(key.clone(), (lease_set, expires));
+        netdb.lease_sets.insert(
+            key.clone(),
+            StoredLeaseSet {
+                encrypted: false,
+                expires,
+                raw: lease_set,
+            },
+        );
 
         let tunnel_id = TunnelId::random();
         let router_id = RouterId::random();
@@ -3948,7 +4338,8 @@ mod tests {
 
                             true
                         }
-                        DatabaseStorePayload::LeaseSet2 { .. } => false,
+                        DatabaseStorePayload::LeaseSet2 { .. }
+                        | DatabaseStorePayload::EncryptedLeaseSet2 { .. } => false,
                     }
                 }
                 _ => false,

@@ -17,7 +17,8 @@
 // DEALINGS IN THE SOFTWARE.
 
 use emissary_core::{
-    crypto::base32_encode,
+    crypto::{base32_encode, base64_decode, blinding::BlindedPublicKey},
+    primitives::Destination,
     events::EventSubscriber,
     router::Router,
     runtime::{AddressBook, Runtime},
@@ -274,6 +275,148 @@ async fn streaming_works(kind: TransportKind) {
 
     assert_eq!(std::str::from_utf8(&buffer[..nread]), Ok("hello, world!\n"));
 
+    stream.write_all(b"goodbye, world!\n").await.unwrap();
+
+    assert!(handle.await.is_ok());
+}
+
+/// Read one line from a raw SAMv3 socket.
+async fn read_sam_line(stream: &mut tokio::net::TcpStream) -> String {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+
+    loop {
+        stream.read_exact(&mut byte).await.expect("to succeed");
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+    }
+
+    String::from_utf8(line).expect("valid utf-8")
+}
+
+#[tokio::test(start_paused = true)]
+async fn encrypted_lease_set_works_ntcp2() {
+    encrypted_lease_set_works(TransportKind::Ntcp2).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn encrypted_lease_set_works_ssu2() {
+    encrypted_lease_set_works(TransportKind::Ssu2).await;
+}
+
+/// Server publishes an encrypted lease set (`i2cp.leaseSetType=5`), the client reaches it
+/// through its b33 address.
+///
+/// The server session is driven over a raw SAMv3 socket since the client library doesn't
+/// support the lease set type option.
+async fn encrypted_lease_set_works(kind: TransportKind) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let mut router_infos = Vec::<Vec<u8>>::new();
+    let net_id = (TokioRuntime::rng().next_u32() % 255) as u8;
+
+    for i in 0..4 {
+        let (router, _events, router_info) =
+            make_router(i < 2, net_id, router_infos.clone(), kind).await;
+
+        router_infos.push(router_info);
+        tokio::spawn(router);
+    }
+
+    // create two more routers, fetch their sam tcp ports and spawn them in the background
+    let mut ports = Vec::<u16>::new();
+
+    for _ in 0..2 {
+        let router = make_router(false, net_id, router_infos.clone(), kind).await.0;
+        ports.push(router.protocol_address_info().sam_tcp.unwrap().port());
+        tokio::spawn(router);
+    }
+
+    // let the network boot up
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    // create server session with an encrypted lease set
+    let mut control = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ports[0]))
+        .await
+        .expect("to succeed");
+    control.write_all(b"HELLO VERSION\n").await.unwrap();
+    assert!(read_sam_line(&mut control).await.starts_with("HELLO REPLY RESULT=OK"));
+    control
+        .write_all(
+            b"SESSION CREATE STYLE=STREAM ID=encrypted DESTINATION=TRANSIENT i2cp.leaseSetType=5\n",
+        )
+        .await
+        .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), read_sam_line(&mut control))
+        .await
+        .expect("no timeout");
+    let private_key = status
+        .strip_prefix("SESSION STATUS RESULT=OK DESTINATION=")
+        .unwrap_or_else(|| panic!("unexpected session status: {status}"));
+
+    // the b33 address is derived from the destination's signing key
+    let destination =
+        Destination::parse(base64_decode(private_key.trim()).expect("valid base64")).unwrap();
+    let address = format!(
+        "{}.b32.i2p",
+        BlindedPublicKey::new(destination.verifying_key()).unwrap().to_b33()
+    );
+    assert_eq!(address.len(), 56 + ".b32.i2p".len());
+
+    // accept one stream on the server session
+    let server_port = ports[0];
+    let handle = tokio::spawn(async move {
+        let mut socket = tokio::net::TcpStream::connect(format!("127.0.0.1:{server_port}"))
+            .await
+            .expect("to succeed");
+        socket.write_all(b"HELLO VERSION\n").await.unwrap();
+        assert!(read_sam_line(&mut socket).await.starts_with("HELLO REPLY RESULT=OK"));
+        socket.write_all(b"STREAM ACCEPT ID=encrypted SILENT=false\n").await.unwrap();
+        assert!(read_sam_line(&mut socket).await.starts_with("STREAM STATUS RESULT=OK"));
+
+        // the destination of the client precedes the stream data
+        let peer = tokio::time::timeout(Duration::from_secs(60), read_sam_line(&mut socket))
+            .await
+            .expect("no timeout");
+        assert!(!peer.is_empty());
+
+        socket.write_all(b"hello, world!\n").await.unwrap();
+        let mut buffer = vec![0u8; 64];
+        let nread = socket.read(&mut buffer).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&buffer[..nread]),
+            Ok("goodbye, world!\n")
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // keep the control socket alive until the end of the test
+        drop(control);
+    });
+
+    // connect to the b33 address from another router
+    let mut session = tokio::time::timeout(
+        Duration::from_secs(30),
+        Session::<Stream>::new(SessionOptions {
+            samv3_tcp_port: ports[1],
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("no timeout")
+    .expect("to succeed");
+
+    let mut stream = tokio::time::timeout(Duration::from_secs(60), session.connect(&address))
+        .await
+        .expect("no timeout")
+        .expect("to succeed");
+
+    let mut buffer = vec![0u8; 64];
+    let nread = stream.read(&mut buffer).await.unwrap();
+    assert_eq!(std::str::from_utf8(&buffer[..nread]), Ok("hello, world!\n"));
     stream.write_all(b"goodbye, world!\n").await.unwrap();
 
     assert!(handle.await.is_ok());

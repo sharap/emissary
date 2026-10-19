@@ -24,8 +24,8 @@ use crate::{
         garlic::{DeliveryInstructions, GarlicMessageBuilder, GARLIC_MESSAGE_OVERHEAD},
         MessageBuilder, MessageType, I2NP_MESSAGE_EXPIRATION,
     },
-    netdb::Dht,
-    primitives::{Lease, LeaseSet2, MessageId, RouterId, TunnelId},
+    netdb::{Dht, QueriedLeaseSet},
+    primitives::{Lease, MessageId, RouterId, TunnelId},
     profile::ProfileStorage,
     router::context::RouterContext,
     runtime::{Instant, Runtime},
@@ -231,7 +231,7 @@ pub enum QueryKind<R: Runtime> {
     /// Lease set query.
     LeaseSet {
         /// Active query.
-        query: Query<R, LeaseSet2>,
+        query: Query<R, QueriedLeaseSet>,
     },
 
     /// Router info.

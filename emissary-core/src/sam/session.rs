@@ -17,12 +17,17 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    crypto::{base32_decode, base32_encode, base64_encode, sha256::Sha256, SigningPrivateKey},
+    crypto::{
+        base32_decode, base32_encode, base64_encode, blinding::BlindedPublicKey, sha256::Sha256,
+        SigningPrivateKey,
+    },
     destination::{DeliveryStyle, Destination, DestinationEvent, LeaseSetStatus},
     error::QueryError,
     events::EventHandle,
     i2cp::{I2cpPayload, I2cpPayloadBuilder},
-    primitives::{Destination as Dest, DestinationId, LeaseSet2, LeaseSet2Header, Mapping},
+    primitives::{
+        Destination as Dest, DestinationId, EncryptedLeaseSet2, LeaseSet2, LeaseSet2Header, Mapping,
+    },
     protocol::Protocol,
     runtime::{AddressBook, JoinSet, Runtime},
     sam::{
@@ -63,6 +68,38 @@ use core::{
 
 /// Logging target for the file.
 const LOG_TARGET: &str = "emissary::sam::session";
+
+/// How long a published lease set is valid.
+const LEASE_SET_LIFETIME: Duration = Duration::from_secs(10 * 60);
+
+/// Does the session publish its lease set encrypted (`i2cp.leaseSetType=5`).
+fn is_encrypted_lease_set(options: &HashMap<String, String>) -> bool {
+    options.get("i2cp.leaseSetType").map(|value| value.trim() == "5").unwrap_or(false)
+}
+
+/// Publish `lease_set`, expiring at `expires` (seconds since epoch), to `NetDb`.
+///
+/// If `encrypted` is true, the lease set is published as an encrypted lease set under the
+/// blinded key of `signing_key`. Keys that cannot be blinded fall back to a plain lease set.
+fn publish_local_lease_set<R: Runtime>(
+    destination: &mut Destination<R>,
+    lease_set: Bytes,
+    expires: u32,
+    signing_key: &SigningPrivateKey,
+    encrypted: bool,
+) {
+    if encrypted {
+        match EncryptedLeaseSet2::encrypt::<R>(&lease_set, expires, signing_key) {
+            Some(bundle) => return destination.publish_encrypted_lease_set(lease_set, bundle),
+            None => tracing::warn!(
+                target: LOG_TARGET,
+                "signing key cannot be blinded, publishing a plain lease set",
+            ),
+        }
+    }
+
+    destination.publish_lease_set(lease_set);
+}
 
 /// Active SAMv3 session.
 pub struct SamSession<R: Runtime> {
@@ -196,15 +233,17 @@ impl<R: Runtime> SamSession<R> {
                 .get("i2cp.dontPublishLeaseSet")
                 .map(|value| value.parse::<bool>().unwrap_or(false))
                 .unwrap_or(false);
+            let is_encrypted = is_encrypted_lease_set(&options);
+            let published = R::time_since_epoch().as_secs() as u32;
 
             let local_leaseset = Bytes::from(
                 LeaseSet2 {
                     header: LeaseSet2Header {
                         destination: destination.clone(),
-                        expires: Duration::from_secs(10 * 60).as_secs() as u32,
+                        expires: LEASE_SET_LIFETIME.as_secs() as u32,
                         is_unpublished,
                         offline_signature: None,
-                        published: R::time_since_epoch().as_secs() as u32,
+                        published,
                     },
                     public_keys: public_key_context.public_keys(),
                     leases: inbound.values().cloned().collect(),
@@ -213,12 +252,18 @@ impl<R: Runtime> SamSession<R> {
             );
 
             // publish the new destination to the event system
+            //
+            // destinations with encrypted lease sets are reachable through their b33 address
+            let address = match is_encrypted {
+                true => BlindedPublicKey::new(&signing_key.public()).map(|key| key.to_b33()),
+                false => None,
+            };
             if is_unpublished {
                 event_handle.client_destination_started(session_id.to_string());
             } else {
                 event_handle.server_destination_started(
                     session_id.to_string(),
-                    base32_encode(destination_id.to_vec()),
+                    address.clone().unwrap_or_else(|| base32_encode(destination_id.to_vec())),
                 );
             }
 
@@ -235,12 +280,19 @@ impl<R: Runtime> SamSession<R> {
                 profile_storage,
             );
             // TODO: not needed anymore?
-            session_destination.publish_lease_set(local_leaseset.clone());
+            publish_local_lease_set::<R>(
+                &mut session_destination,
+                local_leaseset.clone(),
+                published.saturating_add(LEASE_SET_LIFETIME.as_secs() as u32),
+                &signing_key,
+                is_encrypted,
+            );
 
             tracing::info!(
                 target: LOG_TARGET,
                 %session_id,
                 %destination_id,
+                b33 = ?address,
                 "start active session",
             );
 
@@ -363,6 +415,7 @@ impl<R: Runtime> SamSession<R> {
         &mut self,
         mut socket: Box<SamSocket<R>>,
         destination_id: DestinationId,
+        blinded: Option<BlindedPublicKey>,
         options: HashMap<String, String>,
         session_id: Arc<str>,
     ) {
@@ -395,8 +448,15 @@ impl<R: Runtime> SamSession<R> {
             target: LOG_TARGET,
             session_id = %self.session_id,
             destination_id = %destination_id,
+            encrypted = ?blinded.is_some(),
             "connect to destination",
         );
+
+        // the lease set of a blinded destination is looked up and decrypted with its blinded key
+        if let Some(key) = blinded {
+            let registered = self.destination.register_blinded_destination(key);
+            debug_assert_eq!(registered, destination_id);
+        }
 
         match self.destination.query_lease_set(&destination_id) {
             LeaseSetStatus::Found => {
@@ -1210,10 +1270,11 @@ impl<R: Runtime> Future for SamSession<R> {
                 Poll::Ready(None) => return Poll::Ready(Arc::clone(&self.session_id)),
                 Poll::Ready(Some(SamSessionCommand::Connect {
                     socket,
+                    blinded,
                     destination_id,
                     options,
                     session_id,
-                })) => self.on_stream_connect(socket, destination_id, options, session_id),
+                })) => self.on_stream_connect(socket, destination_id, blinded, options, session_id),
                 Poll::Ready(Some(SamSessionCommand::Accept {
                     socket,
                     options,
@@ -1308,6 +1369,17 @@ impl<R: Runtime> Future for SamSession<R> {
                     self.on_inbound_message(messages),
                 Poll::Ready(Some(DestinationEvent::LeaseSetFound { destination_id })) =>
                     self.on_lease_set_found(destination_id),
+                Poll::Ready(Some(DestinationEvent::BlindedLeaseSetFound {
+                    blinded_id,
+                    destination_id,
+                })) => {
+                    // streams and datagrams were queued under the blinded id, the remote is
+                    // known by its real id from now on
+                    if let Some(pending) = self.pending_outbound.remove(&blinded_id) {
+                        self.pending_outbound.insert(destination_id.clone(), pending);
+                    }
+                    self.on_lease_set_found(destination_id);
+                }
                 Poll::Ready(Some(DestinationEvent::LeaseSetNotFound {
                     destination_id,
                     error,
@@ -1329,6 +1401,7 @@ impl<R: Runtime> Future for SamSession<R> {
                         "create new lease set",
                     );
 
+                    let published = R::time_since_epoch().as_secs() as u32;
                     let lease_set = Bytes::from(
                         LeaseSet2 {
                             header: LeaseSet2Header {
@@ -1338,16 +1411,24 @@ impl<R: Runtime> Future for SamSession<R> {
                                     .get("i2cp.dontPublishLeaseSet")
                                     .map(|value| value.parse::<bool>().unwrap_or(false))
                                     .unwrap_or(false),
-                                expires: Duration::from_secs(10 * 60).as_secs() as u32,
+                                expires: LEASE_SET_LIFETIME.as_secs() as u32,
                                 offline_signature: None,
-                                published: R::time_since_epoch().as_secs() as u32,
+                                published,
                             },
                             public_keys: self.public_key_context.public_keys(),
                             leases,
                         }
                         .serialize(&self.signing_key),
                     );
-                    self.destination.publish_lease_set(lease_set);
+
+                    let this = self.as_mut().get_mut();
+                    publish_local_lease_set::<R>(
+                        &mut this.destination,
+                        lease_set,
+                        published.saturating_add(LEASE_SET_LIFETIME.as_secs() as u32),
+                        &this.signing_key,
+                        is_encrypted_lease_set(&this.options),
+                    );
                 }
                 Poll::Ready(Some(DestinationEvent::SessionTerminated { destination_id })) => {
                     tracing::info!(
@@ -1443,6 +1524,94 @@ mod tests {
         tm_recv: mpsc::Receiver<TunnelMessage, TunnelMessageRecycle>,
         tp_event: mpsc::Sender<TunnelPoolEvent>,
         tx: Sender<SamSessionCommand<MockRuntime>, SamSessionCommandRecycle>,
+    }
+
+    #[test]
+    fn encrypted_lease_set_option() {
+        assert!(!is_encrypted_lease_set(&HashMap::new()));
+        assert!(!is_encrypted_lease_set(&HashMap::from_iter([(
+            "i2cp.leaseSetType".to_string(),
+            "3".to_string()
+        )])));
+        assert!(is_encrypted_lease_set(&HashMap::from_iter([(
+            "i2cp.leaseSetType".to_string(),
+            "5".to_string()
+        )])));
+    }
+
+    #[tokio::test]
+    async fn encrypted_lease_set_published_under_store_hash() {
+        use crate::crypto::blinding::{date_string, BlindedPublicKey};
+
+        let (mut session, ctx) = create_session().await;
+        let signing_key = session.signing_key.clone();
+        let published = MockRuntime::time_since_epoch().as_secs() as u32;
+        let lease_set = Bytes::from(
+            LeaseSet2 {
+                header: LeaseSet2Header {
+                    destination: session.dest.clone(),
+                    expires: LEASE_SET_LIFETIME.as_secs() as u32,
+                    is_unpublished: false,
+                    offline_signature: None,
+                    published,
+                },
+                public_keys: session.public_key_context.public_keys(),
+                leases: vec![LeaseSet2::random().0.leases[0].clone()],
+            }
+            .serialize(&signing_key),
+        );
+
+        // drain the actions caused by session creation
+        while ctx.netdb_rx.try_recv().is_ok() {}
+
+        publish_local_lease_set::<MockRuntime>(
+            &mut session.destination,
+            lease_set,
+            published + LEASE_SET_LIFETIME.as_secs() as u32,
+            &signing_key,
+            true,
+        );
+
+        // the lease set manager looks for the floodfills closest to the store hash of the day
+        let blinded = BlindedPublicKey::new(&signing_key.public()).unwrap();
+        let store_hash = blinded.store_hash(&date_string(MockRuntime::time_since_epoch())).unwrap();
+
+        match ctx.netdb_rx.try_recv().unwrap() {
+            NetDbAction::GetClosestFloodfills { key, .. } => {
+                assert_eq!(key, Bytes::from(store_hash.to_vec()));
+            }
+            _ => panic!("unexpected action"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_to_blinded_destination() {
+        let (mut session, _ctx) = create_session().await;
+        let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (stream, _) = tokio::join!(
+            MockTcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream.unwrap()));
+
+        let signing_key = SigningPrivateKey::random(MockRuntime::rng());
+        let blinded = BlindedPublicKey::new(&signing_key.public()).unwrap();
+        let destination_id = DestinationId::from(blinded.public_key());
+
+        session.on_stream_connect(
+            socket,
+            destination_id.clone(),
+            Some(blinded.clone()),
+            HashMap::new(),
+            Arc::from("hello"),
+        );
+
+        // the destination is registered as blinded and its lease set is being queried
+        assert_eq!(
+            session.destination.blinded_key(&destination_id),
+            Some(&blinded)
+        );
+        assert!(session.pending_outbound.contains_key(&destination_id));
     }
 
     async fn create_session() -> (SamSession<MockRuntime>, TestSessionContext) {
@@ -1822,6 +1991,7 @@ mod tests {
         session.on_stream_connect(
             socket,
             DestinationId::random(),
+            None,
             HashMap::new(),
             Arc::from("hello"),
         );
@@ -1849,6 +2019,7 @@ mod tests {
         session.on_stream_connect(
             socket,
             DestinationId::random(),
+            None,
             HashMap::new(),
             Arc::from("hello"),
         );
@@ -1873,6 +2044,7 @@ mod tests {
         session.on_stream_connect(
             socket,
             session.dest.id(),
+            None,
             HashMap::new(),
             Arc::from("hello"),
         );

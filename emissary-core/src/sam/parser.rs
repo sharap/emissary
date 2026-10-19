@@ -17,7 +17,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    crypto::{base32_decode, base64_decode, SigningPrivateKey},
+    crypto::{base32_decode, base64_decode, blinding::BlindedPublicKey, SigningPrivateKey},
     primitives::{Destination, DestinationId, Str},
     runtime::Runtime,
 };
@@ -180,6 +180,12 @@ pub enum HostKind {
         destination_id: DestinationId,
     },
 
+    /// Base32-encoded blinded host (b33), the lease set of the destination is encrypted.
+    B33Host {
+        /// Blinded public key of the destination.
+        key: BlindedPublicKey,
+    },
+
     /// Regular host, such as host.i2p.
     Host {
         /// Host.
@@ -199,6 +205,7 @@ impl PartialEq for HostKind {
                     destination_id: destination_id2,
                 },
             ) => destination_id1 == destination_id2,
+            (Self::B33Host { key: key1 }, Self::B33Host { key: key2 }) => key1 == key2,
             (
                 Self::Destination {
                     destination: destination1,
@@ -682,16 +689,23 @@ impl<'a, R: Runtime> TryFrom<ParsedCommand<'a, R>> for SamCommand {
                         0usize
                     };
 
-                    let decoded = base32_decode(&destination[start..end]).ok_or_else(|| {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            ?destination,
-                            "invalid .b32.i2p address",
-                        );
-                    })?;
-
-                    HostKind::B32Host {
-                        destination_id: DestinationId::from(&decoded),
+                    // regular addresses encode the 32-byte hash of the destination, blinded
+                    // addresses are longer and carry the signing key of the destination
+                    match base32_decode(&destination[start..end]) {
+                        Some(decoded) if decoded.len() == 32 => HostKind::B32Host {
+                            destination_id: DestinationId::from(&decoded),
+                        },
+                        _ => HostKind::B33Host {
+                            key: BlindedPublicKey::from_b33(&destination[start..end]).ok_or_else(
+                                || {
+                                    tracing::warn!(
+                                        target: LOG_TARGET,
+                                        ?destination,
+                                        "invalid .b32.i2p address",
+                                    );
+                                },
+                            )?,
+                        },
                     }
                 } else if destination.ends_with(".i2p") {
                     tracing::trace!(
@@ -1172,6 +1186,40 @@ mod tests {
                 assert_eq!(options.get("SILENT"), Some(&"false".to_string()));
             }
             response => panic!("invalid response: {response:?}"),
+        }
+
+        // base32-encoded blinded hostname (b33)
+        {
+            let signing_key = SigningPrivateKey::random(MockRuntime::rng());
+            let blinded = BlindedPublicKey::new(&signing_key.public()).unwrap();
+            let address = blinded.to_b33();
+            assert_eq!(address.len(), 56);
+
+            for prefix in ["", "http://", "https://"] {
+                match SamCommand::parse::<MockRuntime>(&format!(
+                    "STREAM CONNECT ID=MM9z52ZwnTTPwfeD DESTINATION={prefix}{address}.b32.i2p \
+                    SILENT=false",
+                )) {
+                    Some(SamCommand::Connect {
+                        session_id,
+                        host: HostKind::B33Host { key },
+                        ..
+                    }) => {
+                        assert_eq!(session_id.as_str(), "MM9z52ZwnTTPwfeD");
+                        assert_eq!(key, blinded);
+                    }
+                    response => panic!("invalid response: {response:?}"),
+                }
+            }
+
+            // corrupted b33 address is rejected
+            let mut corrupted = address.clone().into_bytes();
+            corrupted[30] = if corrupted[30] == b'a' { b'b' } else { b'a' };
+            let corrupted = String::from_utf8(corrupted).unwrap();
+            assert!(SamCommand::parse::<MockRuntime>(&format!(
+                "STREAM CONNECT ID=MM9z52ZwnTTPwfeD DESTINATION={corrupted}.b32.i2p SILENT=false",
+            ))
+            .is_none());
         }
 
         // base32-encoded hostname

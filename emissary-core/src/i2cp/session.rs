@@ -477,6 +477,48 @@ impl<R: Runtime> Future for I2cpSession<R> {
                             }
                         },
                     },
+                Poll::Ready(Some(DestinationEvent::BlindedLeaseSetFound { destination_id, .. })) =>
+                    match self.pending_connections.remove(&destination_id) {
+                        Some(messages) => messages.into_iter().for_each(|message| {
+                            if let Err(error) = self.destination.send_message(
+                                DeliveryStyle::Unspecified {
+                                    destination_id: destination_id.clone(),
+                                },
+                                message.payload,
+                            ) {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    session_id = ?self.session_id,
+                                    ?error,
+                                    "failed to encrypt message",
+                                );
+                            }
+                        }),
+                        None => match self.pending_lookups.remove(&destination_id) {
+                            Some((session_id, request_id)) => {
+                                let destination = self
+                                    .destination
+                                    .lease_set(&destination_id)
+                                    .header
+                                    .destination
+                                    .serialized()
+                                    .clone();
+
+                                self.socket.send_message(HostReply::new(
+                                    session_id.as_u16(),
+                                    request_id,
+                                    HostReplyKind::Success { destination },
+                                ));
+                            }
+                            None => {
+                                tracing::warn!(
+                                    target: LOG_TARGET,
+                                    %destination_id,
+                                    "lease set query completed for a connection that doesn't exist",
+                                );
+                            }
+                        },
+                    },
                 Poll::Ready(Some(DestinationEvent::LeaseSetNotFound {
                     destination_id,
                     error,

@@ -17,7 +17,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    crypto::{chachapoly::ChaChaPoly, EphemeralPrivateKey, StaticPublicKey},
+    crypto::{base32_encode, chachapoly::ChaChaPoly, EphemeralPrivateKey, StaticPublicKey},
     error::QueryError,
     i2np::{
         database::{
@@ -28,7 +28,7 @@ use crate::{
         MessageBuilder, MessageType, I2NP_MESSAGE_EXPIRATION,
     },
     netdb::{Dht, NetDbHandle},
-    primitives::{DestinationId, Lease, MessageId, RouterId, TunnelId},
+    primitives::{DestinationId, EncryptedLeaseSet2Bundle, Lease, MessageId, RouterId, TunnelId},
     profile::ProfileStorage,
     runtime::{Instant, JoinSet, Runtime},
     tunnel::{NoiseContext, TunnelMessageSender},
@@ -173,6 +173,9 @@ pub struct LeaseSetManager<R: Runtime> {
     /// ID of the local destination.
     destination_id: DestinationId,
 
+    /// Is the lease set published encrypted.
+    encrypted: bool,
+
     /// Expiring inbound tunnels.
     expiring_tunnels: HashSet<TunnelId>,
 
@@ -263,6 +266,7 @@ impl<R: Runtime> LeaseSetManager<R> {
 
         Self {
             destination_id: destination_id.clone(),
+            encrypted: false,
             expiring_tunnels: HashSet::new(),
             floodfills: HashMap::new(),
             key,
@@ -297,9 +301,55 @@ impl<R: Runtime> LeaseSetManager<R> {
         }
     }
 
+    /// Register new encrypted lease set for the [`Destination`].
+    ///
+    /// Encrypted lease sets are stored under the hash of the blinded key of the day: when the
+    /// key changes, the floodfills closest to the new key are fetched and the lease set is
+    /// published to them.
+    pub fn register_encrypted_lease_set(&mut self, encrypted: EncryptedLeaseSet2Bundle) {
+        let key = Bytes::from(encrypted.store_hash.to_vec());
+        self.lease_set = Bytes::from(encrypted.payload);
+        self.encrypted = true;
+
+        if self.unpublished {
+            return;
+        }
+
+        if self.key != key {
+            tracing::debug!(
+                target: LOG_TARGET,
+                local = %self.destination_id,
+                key = ?base32_encode(&key),
+                "store key of the encrypted lease set changed",
+            );
+
+            self.key = key;
+            self.floodfills.clear();
+            self.pending_floodfills.clear();
+            self.queried_floodfills.clear();
+            self.storage_floodfills.clear();
+            self.get_closest_floodfills();
+
+            if let Some(waker) = self.waker.take() {
+                waker.wake_by_ref();
+            }
+            return;
+        }
+
+        if let PublishState::AwaitingLeaseSet = &self.state {
+            self.get_closest_floodfills();
+
+            if let Some(waker) = self.waker.take() {
+                waker.wake_by_ref();
+            }
+        }
+    }
+
     /// Register new lease set for the [`Destination`].
     pub fn register_lease_set(&mut self, lease_set: Bytes) {
         self.lease_set = lease_set;
+        self.encrypted = false;
+        self.encrypted = false;
 
         if self.unpublished {
             return;
@@ -548,8 +598,14 @@ impl<R: Runtime> LeaseSetManager<R> {
 
         let message = DatabaseStoreBuilder::new(
             self.key.clone(),
-            DatabaseStoreKind::LeaseSet2 {
-                lease_set: self.lease_set.clone(),
+            if self.encrypted {
+                DatabaseStoreKind::EncryptedLeaseSet2 {
+                    lease_set: self.lease_set.clone(),
+                }
+            } else {
+                DatabaseStoreKind::LeaseSet2 {
+                    lease_set: self.lease_set.clone(),
+                }
             },
         )
         .with_reply_type(ReplyType::Tunnel {
@@ -1001,6 +1057,139 @@ mod tests {
         },
     };
     use std::collections::VecDeque;
+
+    #[tokio::test(start_paused = true)]
+    async fn encrypted_lease_set_published_under_store_hash() {
+        use crate::{
+            crypto::blinding::BlindedPublicKey, i2np::database::store::DatabaseStorePayload,
+            primitives::EncryptedLeaseSet2,
+        };
+
+        let (tp_handle, tm_rx, _tp_tx, _srx) = TunnelPoolHandle::create();
+        let sender = tp_handle.sender();
+        let (netdb_handle, netdb_rx) = NetDbHandle::create();
+        let noise_ctx = NoiseContext::new(
+            StaticPrivateKey::random(MockRuntime::rng()),
+            Bytes::from(RouterId::random().to_vec()),
+        );
+        let (lease_set, signing_key) = LeaseSet2::random();
+        let tunnels = lease_set.leases.clone();
+        let destination_id = lease_set.header.destination.id();
+        let serialized = lease_set.serialize(&signing_key);
+        let expires = LeaseSet2::parse::<MockRuntime>(&serialized).unwrap().header.expires;
+
+        let mut manager = LeaseSetManager::<MockRuntime>::new(
+            tunnels,
+            destination_id.clone(),
+            sender,
+            3usize,
+            netdb_handle,
+            noise_ctx,
+            ProfileStorage::new(&[], &[], None),
+            false,
+            Bytes::from(serialized.clone()),
+        );
+        assert!(!manager.encrypted);
+        assert_eq!(manager.key, Bytes::from(destination_id.to_vec()));
+
+        // the encrypted lease set is stored under the hash of the blinded key, so the floodfills
+        // closest to that key are fetched
+        let bundle =
+            EncryptedLeaseSet2::encrypt::<MockRuntime>(&serialized, expires, &signing_key).unwrap();
+        let store_hash = Bytes::from(bundle.store_hash.to_vec());
+        manager.register_encrypted_lease_set(bundle);
+
+        assert!(manager.encrypted);
+        assert_eq!(manager.key, store_hash);
+        assert!(std::matches!(
+            manager.state,
+            PublishState::GetClosestFloodfills { .. }
+        ));
+
+        let mut floodfills = (0..3)
+            .map(|_| {
+                (
+                    RouterId::random(),
+                    StaticPrivateKey::random(MockRuntime::rng()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        // the request made for the destination id is stale and ignored, the one for the store
+        // hash is answered
+        loop {
+            tokio::select! {
+                _ = &mut manager => {}
+                event = netdb_rx.recv() => match event.unwrap() {
+                    NetDbAction::GetClosestFloodfills { key, tx } => {
+                        if key == store_hash {
+                            tx.send(
+                                floodfills
+                                    .iter()
+                                    .map(|(router_id, key)| (router_id.clone(), key.public()))
+                                    .collect(),
+                            )
+                            .unwrap();
+                            break;
+                        }
+                    }
+                    _ => panic!("invalid action received"),
+                },
+                _ = tokio::time::sleep(Duration::from_secs(40)) => panic!("timeout"),
+            }
+        }
+
+        // the published database store carries the encrypted lease set under the store hash
+        loop {
+            tokio::select! {
+                _ = &mut manager => {}
+                event = tm_rx.recv() => match event.unwrap() {
+                    TunnelMessage::RouterDeliveryViaRoute {
+                        outbound_tunnel: None,
+                        router_id,
+                        message,
+                    } => {
+                        let message = Message::parse_standard(&message).unwrap();
+                        assert_eq!(message.message_type, MessageType::Garlic);
+
+                        let key = floodfills.remove(&router_id).unwrap();
+                        let mut garlic = GarlicHandler::<MockRuntime>::new(
+                            NoiseContext::new(key, Bytes::from(router_id.to_vec())),
+                            MockRuntime::register_metrics(vec![], None),
+                        );
+                        let GarlicDeliveryInstructions::Local { message } = garlic
+                            .handle_message(message)
+                            .unwrap()
+                            .filter(|message| {
+                                std::matches!(message, GarlicDeliveryInstructions::Local { .. })
+                            })
+                            .collect::<VecDeque<_>>()
+                            .pop_front()
+                            .expect("to exist")
+                        else {
+                            panic!("invalid type");
+                        };
+                        assert_eq!(message.message_type, MessageType::DatabaseStore);
+
+                        let store = DatabaseStore::<MockRuntime>::parse(&message.payload).unwrap();
+                        assert_eq!(store.key, store_hash);
+
+                        match store.payload {
+                            DatabaseStorePayload::EncryptedLeaseSet2 { lease_set } => {
+                                let blinded = BlindedPublicKey::new(&signing_key.public()).unwrap();
+                                let decrypted = lease_set.decrypt::<MockRuntime>(&blinded).unwrap();
+                                assert_eq!(decrypted.header.destination.id(), destination_id);
+                            }
+                            _ => panic!("invalid payload"),
+                        }
+                        break
+                    }
+                    _ => panic!("unexpected tunnel message"),
+                },
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("timeout"),
+            }
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn lease_set_published_and_storage_verified() {

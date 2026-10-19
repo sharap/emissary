@@ -20,7 +20,7 @@ use crate::{
     constants::limits::MAX_ROUTER_INFO_SIZE,
     error::parser::DatabaseStoreParseError,
     i2np::{database::DATABASE_KEY_SIZE, ROUTER_HASH_LEN},
-    primitives::{LeaseSet2, RouterId, RouterInfo, TunnelId},
+    primitives::{EncryptedLeaseSet2, LeaseSet2, RouterId, RouterInfo, TunnelId},
     runtime::Runtime,
 };
 
@@ -159,6 +159,12 @@ pub enum DatabaseStorePayload {
         /// Lease set.
         lease_set: LeaseSet2,
     },
+
+    /// Encrypted lease set.
+    EncryptedLeaseSet2 {
+        /// Encrypted lease set, verified but not decrypted.
+        lease_set: EncryptedLeaseSet2,
+    },
 }
 
 impl fmt::Display for DatabaseStorePayload {
@@ -174,6 +180,11 @@ impl fmt::Display for DatabaseStorePayload {
                 "DatabaseStorePayload::LeaseSet2 ({})",
                 lease_set.header.destination.id()
             ),
+            Self::EncryptedLeaseSet2 { lease_set } => write!(
+                f,
+                "DatabaseStorePayload::EncryptedLeaseSet2 (expires {})",
+                lease_set.expires
+            ),
         }
     }
 }
@@ -185,6 +196,7 @@ impl DatabaseStorePayload {
             // TODO: calculate actual size
             Self::RouterInfo { .. } => 2048usize,
             Self::LeaseSet2 { lease_set } => lease_set.serialized_len(),
+            Self::EncryptedLeaseSet2 { .. } => 0usize,
         }
     }
 }
@@ -285,6 +297,20 @@ impl<R: Runtime> DatabaseStore<R> {
                     },
                 ))
             }
+            StoreType::EncryptedLeaseSet => {
+                let (rest, lease_set) =
+                    EncryptedLeaseSet2::parse_frame::<R>(rest).map_err(Err::convert)?;
+
+                Ok((
+                    rest,
+                    Self {
+                        key: Bytes::from(key.to_vec()),
+                        payload: DatabaseStorePayload::EncryptedLeaseSet2 { lease_set },
+                        reply,
+                        _runtime: Default::default(),
+                    },
+                ))
+            }
             _ => Err(Err::Error(DatabaseStoreParseError::UnsupportedStoreType(
                 store_type,
             ))),
@@ -352,6 +378,12 @@ pub enum DatabaseStoreKind {
         /// Serialized [`LeaseSet2`].
         lease_set: Bytes,
     },
+
+    /// [`EncryptedLeaseSet2`].
+    EncryptedLeaseSet2 {
+        /// Serialized [`EncryptedLeaseSet2`].
+        lease_set: Bytes,
+    },
 }
 
 impl DatabaseStoreKind {
@@ -359,7 +391,8 @@ impl DatabaseStoreKind {
     fn serialized_len(&self) -> usize {
         match self {
             Self::RouterInfo { router_info } => router_info.len(),
-            Self::LeaseSet2 { lease_set } => lease_set.len(),
+            Self::LeaseSet2 { lease_set } | Self::EncryptedLeaseSet2 { lease_set } =>
+                lease_set.len(),
         }
     }
 }
@@ -407,6 +440,8 @@ impl DatabaseStoreBuilder {
         match &self.kind {
             DatabaseStoreKind::RouterInfo { .. } => out.put_u8(StoreType::RouterInfo.as_u8()),
             DatabaseStoreKind::LeaseSet2 { .. } => out.put_u8(StoreType::LeaseSet2.as_u8()),
+            DatabaseStoreKind::EncryptedLeaseSet2 { .. } =>
+                out.put_u8(StoreType::EncryptedLeaseSet.as_u8()),
         }
 
         match reply {
@@ -437,7 +472,8 @@ impl DatabaseStoreBuilder {
                 out.put_u16(router_info.len() as u16);
                 out.put_slice(&router_info);
             }
-            DatabaseStoreKind::LeaseSet2 { lease_set } => out.put_slice(&lease_set),
+            DatabaseStoreKind::LeaseSet2 { lease_set }
+            | DatabaseStoreKind::EncryptedLeaseSet2 { lease_set } => out.put_slice(&lease_set),
         }
 
         out
@@ -449,6 +485,52 @@ mod tests {
     use super::*;
     use crate::runtime::mock::MockRuntime;
     use rand::Rng;
+
+    #[test]
+    fn encrypted_lease_set_round_trip() {
+        use crate::{crypto::blinding::BlindedPublicKey, primitives::EncryptedLeaseSet2};
+
+        let (lease_set, signing_key) = LeaseSet2::random();
+        let destination_id = lease_set.header.destination.id();
+        let serialized = lease_set.serialize(&signing_key);
+        let expires = LeaseSet2::parse::<MockRuntime>(&serialized).unwrap().header.expires;
+        let bundle =
+            EncryptedLeaseSet2::encrypt::<MockRuntime>(&serialized, expires, &signing_key).unwrap();
+        let key = Bytes::from(bundle.store_hash.to_vec());
+
+        let message = DatabaseStoreBuilder::new(
+            key.clone(),
+            DatabaseStoreKind::EncryptedLeaseSet2 {
+                lease_set: Bytes::from(bundle.payload.clone()),
+            },
+        )
+        .build();
+
+        // the store type byte is 5
+        assert_eq!(message[DATABASE_KEY_SIZE], 5u8);
+        assert_eq!(
+            DatabaseStore::<MockRuntime>::extract_raw_lease_set(&message),
+            Bytes::from(bundle.payload.clone())
+        );
+
+        let store = DatabaseStore::<MockRuntime>::parse(&message).unwrap();
+        assert_eq!(store.key, key);
+
+        match store.payload {
+            DatabaseStorePayload::EncryptedLeaseSet2 { lease_set } => {
+                let blinded = BlindedPublicKey::new(&signing_key.public()).unwrap();
+                let decrypted = lease_set.decrypt::<MockRuntime>(&blinded).unwrap();
+                assert_eq!(decrypted.header.destination.id(), destination_id);
+            }
+            _ => panic!("invalid payload"),
+        }
+
+        // a corrupted encrypted lease set is rejected by the parser
+        let mut corrupted = message.to_vec();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 1;
+        assert!(DatabaseStore::<MockRuntime>::parse(&corrupted).is_err());
+    }
 
     #[test]
     fn oversized_router_info_is_rejected() {

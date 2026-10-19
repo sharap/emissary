@@ -599,6 +599,7 @@ impl<R: Runtime> Future for SamServer<R> {
                                 &Arc::clone(&session_id),
                                 SamSessionCommand::Connect {
                                     socket,
+                                    blinded: None,
                                     destination_id: destination.id(),
                                     options,
                                     session_id: Arc::clone(&session_id),
@@ -617,7 +618,27 @@ impl<R: Runtime> Future for SamServer<R> {
                                 &Arc::clone(&session_id),
                                 SamSessionCommand::Connect {
                                     socket,
+                                    blinded: None,
                                     destination_id,
+                                    options,
+                                    session_id: Arc::clone(&session_id),
+                                },
+                            ) {
+                                tracing::warn!(
+                                    target: LOG_TARGET,
+                                    %session_id,
+                                    ?error,
+                                    "failed to send `STREAM CONNECT` to active session",
+                                )
+                            }
+                        }
+                        HostKind::B33Host { key } => {
+                            if let Err(error) = this.active_sessions.send_command(
+                                &Arc::clone(&session_id),
+                                SamSessionCommand::Connect {
+                                    socket,
+                                    destination_id: DestinationId::from(key.public_key()),
+                                    blinded: Some(key),
                                     options,
                                     session_id: Arc::clone(&session_id),
                                 },
@@ -670,6 +691,7 @@ impl<R: Runtime> Future for SamServer<R> {
                                                 &Arc::clone(&session_id),
                                                 SamSessionCommand::Connect {
                                                     socket,
+                                                    blinded: None,
                                                     destination_id,
                                                     options,
                                                     session_id: Arc::clone(&session_id),

@@ -294,18 +294,19 @@ impl BlindedPublicKey {
     }
 
     /// Get the hash under which the encrypted lease set is stored on `date`.
-    ///
-    /// `SHA256(stA' || A')`
     pub fn store_hash(&self, date: &[u8; 8]) -> Option<[u8; 32]> {
-        let blinded = self.blinded_key(date)?;
-
-        Some(
-            Sha256::new()
-                .update(SIG_TYPE_REDDSA_SHA512_ED25519.to_be_bytes())
-                .update(blinded)
-                .finalize_new(),
-        )
+        self.blinded_key(date).map(|blinded| store_hash(&blinded))
     }
+}
+
+/// Get the hash under which an encrypted lease set signed with `blinded_public_key` is stored.
+///
+/// `SHA256(stA' || A')`
+pub fn store_hash(blinded_public_key: &[u8; 32]) -> [u8; 32] {
+    Sha256::new()
+        .update(SIG_TYPE_REDDSA_SHA512_ED25519.to_be_bytes())
+        .update(blinded_public_key)
+        .finalize_new()
 }
 
 /// Blinded signing key.

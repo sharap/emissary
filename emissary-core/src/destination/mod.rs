@@ -17,7 +17,10 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    crypto::{StaticPrivateKey, StaticPublicKey},
+    crypto::{
+        blinding::{date_string, BlindedPublicKey},
+        StaticPrivateKey, StaticPublicKey,
+    },
     destination::{
         lease_set::LeaseSetManager,
         routing_path::{
@@ -34,8 +37,8 @@ use crate::{
         delivery_status::DeliveryStatus,
         Message, MessageBuilder, MessageType, I2NP_MESSAGE_EXPIRATION,
     },
-    netdb::NetDbHandle,
-    primitives::{DestinationId, Lease, LeaseSet2, TunnelId},
+    netdb::{NetDbHandle, QueriedLeaseSet},
+    primitives::{DestinationId, EncryptedLeaseSet2Bundle, Lease, LeaseSet2, TunnelId},
     profile::ProfileStorage,
     runtime::{JoinSet, Runtime},
     tunnel::{NoiseContext, TunnelPoolEvent, TunnelPoolHandle},
@@ -120,6 +123,18 @@ pub enum DestinationEvent {
         destination_id: DestinationId,
     },
 
+    /// Encrypted lease set of a blinded remote found in NetDb and decrypted.
+    ///
+    /// The remote is known by `destination_id` from now on, `blinded_id` is the ID the query was
+    /// made with.
+    BlindedLeaseSetFound {
+        /// ID the lease set was queried with.
+        blinded_id: DestinationId,
+
+        /// ID of the remote destination.
+        destination_id: DestinationId,
+    },
+
     /// Lease set of the remote not found in NetDb.
     LeaseSetNotFound {
         /// ID of the remote destination.
@@ -188,6 +203,12 @@ pub struct DestinationContext {
 
 /// Client destination.
 pub struct Destination<R: Runtime> {
+    /// Remote destinations whose lease sets are encrypted, by the ID under which they're known.
+    blinded_destinations: HashMap<DestinationId, BlindedPublicKey>,
+
+    /// Real IDs of blinded remote destinations whose lease sets have been decrypted.
+    resolved_blinded: HashMap<DestinationId, DestinationId>,
+
     /// Destination ID of the client.
     destination_id: DestinationId,
 
@@ -247,6 +268,8 @@ impl<R: Runtime> Destination<R> {
         profile_storage: ProfileStorage<R>,
     ) -> Self {
         Self {
+            blinded_destinations: HashMap::new(),
+            resolved_blinded: HashMap::new(),
             destination_id: destination_id.clone(),
             lease_set: lease_set.clone(),
             lease_set_manager: LeaseSetManager::new(
@@ -296,6 +319,9 @@ impl<R: Runtime> Destination<R> {
             return LeaseSetStatus::Pending;
         }
 
+        let blinded = self.blinded_destinations.get(destination_id).cloned();
+
+
         if let Some(context) = self.remote_destinations.get(destination_id) {
             if !context.lease_set.is_expired::<R>() {
                 return LeaseSetStatus::Found;
@@ -320,7 +346,17 @@ impl<R: Runtime> Destination<R> {
         self.pending_queries.insert(destination_id.clone());
         self.query_futures.push(async move {
             for _ in 0..NUM_QUERY_RETRIES {
-                let Ok(rx) = handle.query_lease_set(Bytes::from(destination_id.to_vec())) else {
+                // encrypted lease sets are stored under the hash of the blinded key of the day
+                let key = match &blinded {
+                    None => Bytes::from(destination_id.to_vec()),
+                    Some(blinded) => match blinded.store_hash(&date_string(R::time_since_epoch()))
+                    {
+                        Some(hash) => Bytes::from(hash.to_vec()),
+                        None => return (destination_id, Err(QueryError::ValueNotFound)),
+                    },
+                };
+
+                let Ok(rx) = handle.query_lease_set(key) else {
                     R::delay(NETDB_BACKOFF_TIMEOUT).await;
                     continue;
                 };
@@ -328,14 +364,49 @@ impl<R: Runtime> Destination<R> {
                 tracing::trace!(
                     target: LOG_TARGET,
                     %destination_id,
+                    encrypted = ?blinded.is_some(),
                     "lease set query started",
                 );
 
-                match rx.await {
-                    Err(_) => return (destination_id, Err(QueryError::Timeout)),
-                    Ok(Err(error)) => return (destination_id, Err(error)),
-                    Ok(Ok(lease_set)) => return (destination_id, Ok(lease_set)),
-                }
+                let result = match rx.await {
+                    Err(_) => Err(QueryError::Timeout),
+                    Ok(Err(error)) => Err(error),
+                    Ok(Ok(QueriedLeaseSet::Standard(lease_set))) => match &blinded {
+                        None => Ok(*lease_set),
+                        Some(_) => {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                %destination_id,
+                                "standard lease set received for a blinded destination",
+                            );
+                            Err(QueryError::Malformed)
+                        }
+                    },
+                    Ok(Ok(QueriedLeaseSet::Encrypted(lease_set))) => match &blinded {
+                        None => {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                %destination_id,
+                                "encrypted lease set received for a regular destination",
+                            );
+                            Err(QueryError::Malformed)
+                        }
+                        Some(blinded) => match lease_set.decrypt::<R>(blinded) {
+                            Ok(lease_set) => Ok(lease_set),
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: LOG_TARGET,
+                                    %destination_id,
+                                    ?error,
+                                    "failed to decrypt lease set",
+                                );
+                                Err(QueryError::Malformed)
+                            }
+                        },
+                    },
+                };
+
+                return (destination_id, result);
             }
 
             tracing::warn!(
@@ -564,7 +635,8 @@ impl<R: Runtime> Destination<R> {
                 };
 
                 match payload {
-                    DatabaseStorePayload::LeaseSet2 { .. } => {
+                    DatabaseStorePayload::LeaseSet2 { .. }
+                    | DatabaseStorePayload::EncryptedLeaseSet2 { .. } => {
                         self.lease_set_manager.register_database_store(key.clone());
                         return Ok(Vec::new());
                     }
@@ -740,6 +812,42 @@ impl<R: Runtime> Destination<R> {
         self.lease_set_manager.register_lease_set(lease_set.clone());
     }
 
+    /// Publish `encrypted`, the encrypted form of `lease_set`, to `NetDb`.
+    ///
+    /// Active sessions keep receiving the plain lease set, it's bundled in garlic messages.
+    pub fn publish_encrypted_lease_set(
+        &mut self,
+        lease_set: Bytes,
+        encrypted: EncryptedLeaseSet2Bundle,
+    ) {
+        self.session_manager.register_lease_set(lease_set);
+        self.lease_set_manager.register_encrypted_lease_set(encrypted);
+    }
+
+    /// Register a remote destination whose lease set is published encrypted.
+    ///
+    /// Returns the [`DestinationId`] under which the destination is known locally. Until the
+    /// lease set has been decrypted, that is an ID derived from the destination's signing key
+    /// and a query for it looks up the encrypted lease set of the day and decrypts it with
+    /// `key`, after which [`DestinationEvent::BlindedLeaseSetFound`] gives the real ID. Once
+    /// resolved, the real ID is returned and used for everything.
+    pub fn register_blinded_destination(&mut self, key: BlindedPublicKey) -> DestinationId {
+        let blinded_id = DestinationId::from(key.public_key());
+
+        if let Some(destination_id) = self.resolved_blinded.get(&blinded_id) {
+            return destination_id.clone();
+        }
+
+        self.blinded_destinations.insert(blinded_id.clone(), key);
+        blinded_id
+    }
+
+    /// Get the blinded key of a remote destination, if its lease set is encrypted.
+    #[cfg(test)]
+    pub fn blinded_key(&self, destination_id: &DestinationId) -> Option<&BlindedPublicKey> {
+        self.blinded_destinations.get(destination_id)
+    }
+
     /// Shutdown session by shutting down the tunnel pool.
     pub fn shutdown(&mut self) {
         self.tunnel_pool_handle.shutdown();
@@ -846,7 +954,35 @@ impl<R: Runtime> Stream for Destination<R> {
         match self.query_futures.poll_next_unpin(cx) {
             Poll::Pending => {}
             Poll::Ready(None) => return Poll::Ready(None),
-            Poll::Ready(Some((destination_id, result))) => {
+            Poll::Ready(Some((queried_id, result))) => {
+                self.pending_queries.remove(&queried_id);
+
+                // a blinded destination is known by the ID derived from its signing key until its
+                // lease set has been decrypted, after that by its real ID which the streaming
+                // protocol needs for replay protection
+                let destination_id = match (&result, self.blinded_destinations.get(&queried_id)) {
+                    (Ok(lease_set), Some(key)) => {
+                        let destination_id = lease_set.header.destination.id();
+
+                        if destination_id != queried_id {
+                            tracing::debug!(
+                                target: LOG_TARGET,
+                                local = %self.destination_id,
+                                blinded = %queried_id,
+                                remote = %destination_id,
+                                "blinded destination resolved",
+                            );
+
+                            let key = key.clone();
+                            self.resolved_blinded.insert(queried_id.clone(), destination_id.clone());
+                            self.blinded_destinations.insert(destination_id.clone(), key);
+                        }
+
+                        destination_id
+                    }
+                    _ => queried_id.clone(),
+                };
+
                 // always register lease set query result, regardless of its status as one or more
                 // routing paths might've initiated the query and need to know whether it succeeded
                 // or not
@@ -860,15 +996,12 @@ impl<R: Runtime> Stream for Destination<R> {
 
                 match result {
                     Err(error) => {
-                        self.pending_queries.remove(&destination_id);
-
                         return Poll::Ready(Some(DestinationEvent::LeaseSetNotFound {
-                            destination_id,
+                            destination_id: queried_id,
                             error,
                         }));
                     }
                     Ok(lease_set) => {
-                        self.pending_queries.remove(&destination_id);
 
                         match lease_set.public_keys.iter().find(|&remote_key| {
                             self.public_keys
@@ -887,7 +1020,7 @@ impl<R: Runtime> Stream for Destination<R> {
                                 );
 
                                 return Poll::Ready(Some(DestinationEvent::LeaseSetNotFound {
-                                    destination_id,
+                                    destination_id: queried_id,
                                     error: QueryError::ValueNotFound,
                                 }));
                             }
@@ -933,8 +1066,13 @@ impl<R: Runtime> Stream for Destination<R> {
                             }
                         }
 
-                        return Poll::Ready(Some(DestinationEvent::LeaseSetFound {
-                            destination_id,
+                        return Poll::Ready(Some(if destination_id != queried_id {
+                            DestinationEvent::BlindedLeaseSetFound {
+                                blinded_id: queried_id,
+                                destination_id,
+                            }
+                        } else {
+                            DestinationEvent::LeaseSetFound { destination_id }
                         }));
                     }
                 }
@@ -1353,7 +1491,7 @@ mod tests {
 
         match rx.try_recv().unwrap() {
             NetDbAction::QueryLeaseSet2 { tx, .. } => {
-                let _ = tx.send(Ok(lease_set));
+                let _ = tx.send(Ok(QueriedLeaseSet::Standard(Box::new(lease_set))));
             }
             _ => panic!("unexpected event"),
         }
@@ -1379,6 +1517,211 @@ mod tests {
             {
                 TunnelMessage::TunnelDeliveryViaRoute { .. } => {}
                 _ => panic!("invalid tunnel message type"),
+            }
+        }
+    }
+
+    use crate::{netdb::NetDbActionRecycle, primitives::EncryptedLeaseSet2};
+
+    /// Create a client destination and the receiver of its netdb actions.
+    ///
+    /// The returned tunnel pool handles must be kept alive for the destination to stay alive.
+    fn blinded_test_destination() -> (
+        Destination<MockRuntime>,
+        thingbuf::mpsc::Receiver<NetDbAction, NetDbActionRecycle>,
+        impl Sized,
+    ) {
+        let (netdb_handle, rx) = NetDbHandle::create();
+        let (tp_handle, tm_rx, tp_tx, srx) = TunnelPoolHandle::create();
+        let private_key = StaticPrivateKey::random(MockRuntime::rng());
+
+        (
+            Destination::<MockRuntime>::new(
+                DestinationId::random(),
+                private_key.clone(),
+                vec![private_key.public()],
+                Bytes::new(),
+                netdb_handle,
+                tp_handle,
+                Vec::new(),
+                Vec::new(),
+                true,
+                ProfileStorage::new(&[], &[], None),
+            ),
+            rx,
+            (tm_rx, tp_tx, srx),
+        )
+    }
+
+    /// Encrypted lease set of a random destination, its blinded key and the ID of the destination.
+    fn encrypted_remote() -> (EncryptedLeaseSet2, BlindedPublicKey, DestinationId, [u8; 32]) {
+        let (lease_set, signing_key) = LeaseSet2::random();
+        let remote_id = lease_set.header.destination.id();
+        let serialized = lease_set.serialize(&signing_key);
+        let expires = LeaseSet2::parse::<MockRuntime>(&serialized).unwrap().header.expires;
+        let bundle =
+            EncryptedLeaseSet2::encrypt::<MockRuntime>(&serialized, expires, &signing_key).unwrap();
+
+        (
+            EncryptedLeaseSet2::parse::<MockRuntime>(&bundle.payload).unwrap(),
+            BlindedPublicKey::new(&signing_key.public()).unwrap(),
+            remote_id,
+            bundle.store_hash,
+        )
+    }
+
+    #[tokio::test]
+    async fn query_blinded_lease_set() {
+        let (mut destination, rx, _pool) = blinded_test_destination();
+        let (encrypted, blinded, remote_id, store_hash) = encrypted_remote();
+
+        // the blinded destination is known by an id derived from its signing key
+        let blinded_id = destination.register_blinded_destination(blinded.clone());
+        assert_ne!(blinded_id, remote_id);
+        assert_eq!(
+            destination.query_lease_set(&blinded_id),
+            LeaseSetStatus::NotFound
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(2), destination.next()).await.is_err());
+
+        // the query is for the store hash of the day and the reply is an encrypted lease set
+        match rx.try_recv().unwrap() {
+            NetDbAction::QueryLeaseSet2 { key, tx } => {
+                assert_eq!(key, Bytes::from(store_hash.to_vec()));
+                let _ = tx.send(Ok(QueriedLeaseSet::Encrypted(Box::new(encrypted))));
+            }
+            _ => panic!("unexpected event"),
+        }
+
+        match tokio::time::timeout(Duration::from_secs(5), destination.next())
+            .await
+            .expect("no timeout")
+            .expect("to succeed")
+        {
+            DestinationEvent::BlindedLeaseSetFound {
+                blinded_id: queried_id,
+                destination_id,
+            } => {
+                assert_eq!(queried_id, blinded_id);
+                assert_eq!(destination_id, remote_id);
+            }
+            _ => panic!("invalid event"),
+        }
+
+        // the decrypted lease set is stored under the real id of the destination which is used
+        // for everything from now on
+        let context = destination.remote_destinations.get(&remote_id).unwrap();
+        assert_eq!(context.lease_set.header.destination.id(), remote_id);
+        assert!(!destination.remote_destinations.contains_key(&blinded_id));
+        assert_eq!(destination.query_lease_set(&remote_id), LeaseSetStatus::Found);
+        assert!(!destination.pending_queries.contains(&blinded_id));
+        assert_eq!(destination.register_blinded_destination(blinded.clone()), remote_id);
+        assert_eq!(destination.blinded_key(&remote_id), Some(&blinded));
+    }
+
+    #[tokio::test]
+    async fn blinded_lease_set_of_another_destination_rejected() {
+        let (mut destination, rx, _pool) = blinded_test_destination();
+        let (encrypted, _, _, _) = encrypted_remote();
+        let (_, other_blinded, _, _) = encrypted_remote();
+
+        let blinded_id = destination.register_blinded_destination(other_blinded);
+        assert_eq!(
+            destination.query_lease_set(&blinded_id),
+            LeaseSetStatus::NotFound
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(2), destination.next()).await.is_err());
+
+        match rx.try_recv().unwrap() {
+            NetDbAction::QueryLeaseSet2 { tx, .. } => {
+                let _ = tx.send(Ok(QueriedLeaseSet::Encrypted(Box::new(encrypted))));
+            }
+            _ => panic!("unexpected event"),
+        }
+
+        match tokio::time::timeout(Duration::from_secs(5), destination.next())
+            .await
+            .expect("no timeout")
+            .expect("to succeed")
+        {
+            DestinationEvent::LeaseSetNotFound {
+                destination_id,
+                error,
+            } => {
+                assert_eq!(destination_id, blinded_id);
+                assert_eq!(error, QueryError::Malformed);
+            }
+            _ => panic!("invalid event"),
+        }
+        assert!(!destination.remote_destinations.contains_key(&blinded_id));
+        assert!(!destination.pending_queries.contains(&blinded_id));
+    }
+
+    #[tokio::test]
+    async fn lease_set_kind_must_match_destination_kind() {
+        // standard lease set for a blinded destination
+        {
+            let (mut destination, rx, _pool) = blinded_test_destination();
+            let (_, blinded, _, _) = encrypted_remote();
+            let blinded_id = destination.register_blinded_destination(blinded);
+            assert_eq!(
+                destination.query_lease_set(&blinded_id),
+                LeaseSetStatus::NotFound
+            );
+            assert!(tokio::time::timeout(Duration::from_secs(2), destination.next())
+                .await
+                .is_err());
+
+            match rx.try_recv().unwrap() {
+                NetDbAction::QueryLeaseSet2 { tx, .. } => {
+                    let _ = tx.send(Ok(QueriedLeaseSet::Standard(Box::new(
+                        LeaseSet2::random().0,
+                    ))));
+                }
+                _ => panic!("unexpected event"),
+            }
+
+            match tokio::time::timeout(Duration::from_secs(5), destination.next())
+                .await
+                .expect("no timeout")
+                .expect("to succeed")
+            {
+                DestinationEvent::LeaseSetNotFound { error, .. } => {
+                    assert_eq!(error, QueryError::Malformed);
+                }
+                _ => panic!("invalid event"),
+            }
+        }
+
+        // encrypted lease set for a regular destination
+        {
+            let (mut destination, rx, _pool) = blinded_test_destination();
+            let (encrypted, _, remote_id, _) = encrypted_remote();
+            assert_eq!(
+                destination.query_lease_set(&remote_id),
+                LeaseSetStatus::NotFound
+            );
+            assert!(tokio::time::timeout(Duration::from_secs(2), destination.next())
+                .await
+                .is_err());
+
+            match rx.try_recv().unwrap() {
+                NetDbAction::QueryLeaseSet2 { key, tx } => {
+                    assert_eq!(key, Bytes::from(remote_id.to_vec()));
+                    let _ = tx.send(Ok(QueriedLeaseSet::Encrypted(Box::new(encrypted))));
+                }
+                _ => panic!("unexpected event"),
+            }
+
+            match tokio::time::timeout(Duration::from_secs(5), destination.next())
+                .await
+                .expect("no timeout")
+                .expect("to succeed")
+            {
+                DestinationEvent::LeaseSetNotFound { error, .. } => {
+                    assert_eq!(error, QueryError::Malformed);
+                }
+                _ => panic!("invalid event"),
             }
         }
     }

@@ -1986,6 +1986,7 @@ dependencies = [
  "cbc",
  "chacha20 0.9.1",
  "chacha20poly1305",
+ "crc32fast",
  "curve25519-elligator2",
  "data-encoding",
  "ecb",

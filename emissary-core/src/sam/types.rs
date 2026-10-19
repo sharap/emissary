@@ -17,7 +17,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    crypto::{StaticPrivateKey, StaticPublicKey},
+    crypto::{blinding::BlindedPublicKey, StaticPrivateKey, StaticPublicKey},
     primitives::{Destination as Dest, DestinationId, Mapping},
     protocol::Protocol,
     runtime::Runtime,
@@ -56,6 +56,9 @@ pub enum SamSessionCommand<R: Runtime> {
     Connect {
         /// SAMv3 socket associated with the outbound stream.
         socket: Box<SamSocket<R>>,
+
+        /// Blinded key of the remote destination, if its lease set is encrypted.
+        blinded: Option<BlindedPublicKey>,
 
         /// Destination ID.
         destination_id: DestinationId,

@@ -20,14 +20,24 @@ use crate::{
     crypto::StaticPublicKey,
     error::{ChannelError, QueryError},
     netdb::LOG_TARGET,
-    primitives::{LeaseSet2, RouterId},
+    primitives::{EncryptedLeaseSet2, LeaseSet2, RouterId},
 };
 
 use bytes::Bytes;
 use futures_channel::oneshot;
 use thingbuf::mpsc;
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
+
+/// Lease set returned by a lease set query.
+#[derive(Debug, Clone)]
+pub enum QueriedLeaseSet {
+    /// Standard lease set.
+    Standard(Box<LeaseSet2>),
+
+    /// Encrypted lease set which the caller must decrypt with the blinded key of the destination.
+    Encrypted(Box<EncryptedLeaseSet2>),
+}
 
 /// Recycling strategy for [`NetDbAction`].
 #[derive(Default, Clone)]
@@ -52,7 +62,7 @@ pub enum NetDbAction {
         key: Bytes,
 
         /// Oneshot sender used to send the result to caller.
-        tx: oneshot::Sender<Result<LeaseSet2, QueryError>>,
+        tx: oneshot::Sender<Result<QueriedLeaseSet, QueryError>>,
     },
 
     /// [`RouterInfo`] query.
@@ -126,7 +136,7 @@ impl NetDbHandle {
     pub fn query_lease_set(
         &self,
         key: Bytes,
-    ) -> Result<oneshot::Receiver<Result<LeaseSet2, QueryError>>, ChannelError> {
+    ) -> Result<oneshot::Receiver<Result<QueriedLeaseSet, QueryError>>, ChannelError> {
         let (tx, rx) = oneshot::channel();
 
         self.tx
