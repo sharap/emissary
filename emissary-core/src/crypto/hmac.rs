@@ -53,3 +53,63 @@ impl Hmac {
         self.hmac.finalize().into_bytes().into()
     }
 }
+
+/// HKDF-SHA256 as specified in RFC 5869.
+///
+/// Extracts a pseudorandom key from `ikm` using `salt` and expands it with `info` into
+/// `out_len` bytes.
+pub fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
+    let prk = Hmac::new(salt).update(ikm).finalize_new();
+    let mut out = Vec::with_capacity(out_len.next_multiple_of(32));
+    let mut previous: &[u8] = &[];
+    let mut counter = 1u8;
+
+    while out.len() < out_len {
+        let block = Hmac::new(&prk).update(previous).update(info).update([counter]).finalize_new();
+        out.extend_from_slice(&block);
+        previous = &out[out.len() - 32..];
+        counter += 1;
+    }
+
+    out.truncate(out_len);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hkdf_rfc5869_test_case_1() {
+        let ikm = [0x0bu8; 22];
+        let salt = (0u8..=0x0c).collect::<Vec<_>>();
+        let info = (0xf0u8..=0xf9).collect::<Vec<_>>();
+        let okm = hkdf(&salt, &ikm, &info, 42);
+
+        assert_eq!(
+            okm,
+            [
+                0x3c, 0xb2, 0x5f, 0x25, 0xfa, 0xac, 0xd5, 0x7a, 0x90, 0x43, 0x4f, 0x64, 0xd0, 0x36,
+                0x2f, 0x2a, 0x2d, 0x2d, 0x0a, 0x90, 0xcf, 0x1a, 0x5a, 0x4c, 0x5d, 0xb0, 0x2d, 0x56,
+                0xec, 0xc4, 0xc5, 0xbf, 0x34, 0x00, 0x72, 0x08, 0xd5, 0xb8, 0x87, 0x18, 0x58, 0x65,
+            ]
+        );
+    }
+
+    #[test]
+    fn hkdf_rfc5869_test_case_2() {
+        let ikm = (0u8..=0x4f).collect::<Vec<_>>();
+        let salt = (0x60u8..=0xaf).collect::<Vec<_>>();
+        let info = (0xb0u8..=0xff).collect::<Vec<_>>();
+        let okm = hkdf(&salt, &ikm, &info, 82);
+
+        assert_eq!(
+            &okm[..16],
+            [0xb1, 0x1e, 0x39, 0x8d, 0xc8, 0x03, 0x27, 0xa1, 0xc8, 0xe7, 0xf7, 0x8c, 0x59, 0x6a, 0x49, 0x34]
+        );
+        assert_eq!(okm.len(), 82);
+
+        // the output is a prefix of a longer output
+        assert_eq!(hkdf(&salt, &ikm, &info, 100)[..82], okm[..]);
+    }
+}

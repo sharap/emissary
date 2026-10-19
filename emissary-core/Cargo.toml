@@ -15,6 +15,7 @@ aes = { version = "0.8.4", default-features = false }
 bytes = { version = "1.11.1", default-features = false }
 cbc = { version = "0.1.2", default-features = false, features = ["alloc"] }
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+crc32fast = { version = "1.4.2", default-features = false }
 chacha20 = { version = "0.9.1", default-features = false, features = ["zeroize"] }
 curve25519-elligator2 = { version = "0.1.0-alpha.2", default-features = false, features = ["elligator2", "alloc"] }
 data-encoding = { version = "2.9.0", default-features = false, features = ["alloc"] }

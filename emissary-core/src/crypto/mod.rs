@@ -32,6 +32,7 @@ use alloc::{string::String, vec::Vec};
 use core::convert::TryInto;
 
 pub mod aes;
+pub mod blinding;
 pub mod chachapoly;
 pub mod dsa;
 pub mod hmac;

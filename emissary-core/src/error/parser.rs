@@ -131,6 +131,24 @@ pub enum LeaseSetParseError {
 
     /// Invalid lease list.
     InvalidLeaseList,
+
+    /// Encrypted lease set has an unsupported blinded key type.
+    UnsupportedBlindedKeyType(u16),
+
+    /// Blinded public key of the encrypted lease set is not a valid key.
+    InvalidBlindedKey,
+
+    /// Blinded public key of the encrypted lease set doesn't match the expected key.
+    BlindedKeyMismatch,
+
+    /// Encrypted lease set requires per-client authorization.
+    ClientAuthorizationRequired,
+
+    /// Ciphertext of the encrypted lease set is malformed.
+    InvalidCiphertext,
+
+    /// Encrypted lease set contains an unsupported inner lease set type.
+    UnsupportedInnerType(u8),
 }
 
 impl From<OfflineSignatureParseError> for LeaseSetParseError {
