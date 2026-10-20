@@ -68,8 +68,14 @@ pub struct PendingStream<R: Runtime> {
     /// Destination ID of the remote peer.
     pub destination_id: DestinationId,
 
+    /// Local I2CP port the stream was opened to, used to pick a listener for the stream.
+    pub dst_port: u16,
+
     /// Destination of remote peer.
     pub remote_destination: Destination,
+
+    /// I2CP port of the remote peer.
+    pub src_port: u16,
 
     /// When was the stream established.
     pub established: R::Instant,
@@ -100,6 +106,8 @@ impl<R: Runtime> PendingStream<R> {
         syn_payload: Vec<u8>,
         signing_key: &SigningPrivateKey,
         offline_signature: Option<&[u8]>,
+        src_port: u16,
+        dst_port: u16,
     ) -> (Self, Vec<u8>) {
         let send_stream_id = R::rng().next_u32();
         let packet = PacketBuilder::new(send_stream_id)
@@ -115,7 +123,9 @@ impl<R: Runtime> PendingStream<R> {
         (
             Self {
                 destination_id: remote_destination.id(),
+                dst_port,
                 remote_destination,
+                src_port,
                 established: R::now(),
                 packets: match syn_payload.is_empty() {
                     true => VecDeque::new(),
@@ -223,6 +233,8 @@ mod tests {
             vec![],
             &SigningPrivateKey::random(NoopRuntime::rng()),
             None,
+            0u16,
+            0u16,
         );
 
         let packet = PacketBuilder::new(stream.send_stream_id)
@@ -247,6 +259,8 @@ mod tests {
             vec![],
             &SigningPrivateKey::random(NoopRuntime::rng()),
             None,
+            0u16,
+            0u16,
         );
 
         let packet = PacketBuilder::new(stream.send_stream_id)
@@ -272,6 +286,8 @@ mod tests {
             vec![],
             &SigningPrivateKey::random(NoopRuntime::rng()),
             None,
+            0u16,
+            0u16,
         );
 
         let packet = PacketBuilder::new(stream.send_stream_id)
@@ -297,6 +313,8 @@ mod tests {
             vec![],
             &SigningPrivateKey::random(NoopRuntime::rng()),
             None,
+            0u16,
+            0u16,
         );
 
         for i in 1..=3 {
@@ -344,6 +362,8 @@ mod tests {
             vec![],
             &SigningPrivateKey::random(NoopRuntime::rng()),
             None,
+            0u16,
+            0u16,
         );
 
         match stream.on_packet(vec![1, 2, 3, 4]) {
@@ -362,6 +382,8 @@ mod tests {
             vec![],
             &SigningPrivateKey::random(NoopRuntime::rng()),
             None,
+            0u16,
+            0u16,
         );
 
         for i in 1..=INITIAL_WINDOW_SIZE {
@@ -411,6 +433,8 @@ mod tests {
             vec![1, 2, 3, 4],
             &SigningPrivateKey::random(NoopRuntime::rng()),
             None,
+            0u16,
+            0u16,
         );
 
         match stream.packets.pop_front() {

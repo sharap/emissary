@@ -30,7 +30,7 @@ use futures::{future::BoxFuture, StreamExt};
 use alloc::{boxed::Box, collections::VecDeque};
 use core::{
     fmt, mem,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll, Waker},
 };
@@ -70,8 +70,8 @@ pub enum ListenerKind<R: Runtime> {
         /// Bound to a `DestinationId` once an inbound connection has been estasblished.
         pending_routing_path_handle: PendingRoutingPathHandle,
 
-        /// Port which the persistent TCP listener is listening on.
-        port: u16,
+        /// Address of the TCP listener the streams are forwarded to.
+        address: SocketAddr,
 
         /// Has the stream configured to be silent.
         silent: bool,
@@ -86,9 +86,9 @@ impl<R: Runtime> fmt::Debug for ListenerKind<R> {
         match self {
             Self::Ephemeral { .. } =>
                 f.debug_struct("ListenerKind::Ephemeral").finish_non_exhaustive(),
-            Self::Persistent { port, .. } => f
+            Self::Persistent { address, .. } => f
                 .debug_struct("ListenerKind::Persistent")
-                .field("port", &port)
+                .field("address", &address)
                 .finish_non_exhaustive(),
         }
     }
@@ -142,8 +142,8 @@ enum PendingListenerKind {
 
     /// Persistent listener (`STREAM FORWARD`).
     Persistent {
-        /// Port where the TCP listener is listening on.
-        port: u16,
+        /// Address of the TCP listener the streams are forwarded to.
+        address: SocketAddr,
 
         /// Have the streams been configured to be silent.
         silent: bool,
@@ -154,9 +154,11 @@ impl fmt::Debug for PendingListenerKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ephemeral { .. } => f.debug_struct("PendingListenerKind::Ephemeral").finish(),
-            Self::Persistent { port, silent, .. } => f
+            Self::Persistent {
+                address, silent, ..
+            } => f
                 .debug_struct("PendingListenerKind::Persistent")
-                .field("port", &port)
+                .field("address", &address)
                 .field("silent", &silent)
                 .finish(),
         }
@@ -202,8 +204,8 @@ enum ListenerState<R: Runtime> {
         /// Pending routing path handle.
         pending_routing_path_handle: PendingRoutingPathHandle,
 
-        /// Port of the active TCP listener.
-        port: u16,
+        /// Address of the TCP listener the streams are forwarded to.
+        address: SocketAddr,
 
         /// Have the inbound streams been configured to be silent.
         silent: bool,
@@ -227,9 +229,9 @@ impl<R: Runtime> fmt::Debug for ListenerState<R> {
                 .debug_struct("ListenerState::Ephemeral")
                 .field("num_listeners", &sockets.len())
                 .finish(),
-            Self::Persistent { port, .. } => f
+            Self::Persistent { address, .. } => f
                 .debug_struct("ListenerState::Persistent")
-                .field("port", &port)
+                .field("address", &address)
                 .finish_non_exhaustive(),
             Self::Poisoned => f.debug_struct("ListenerState::Poisoned").finish(),
         }
@@ -293,24 +295,18 @@ impl<R: Runtime> StreamListener<R> {
                 })
             }
             ListenerState::Persistent {
-                port,
+                address,
                 silent,
                 pending_routing_path_handle,
                 ..
             } => {
-                let port = *port;
+                let address = *address;
                 let silent = *silent;
 
                 Some(SocketKind::Forwarded {
                     pending_routing_path_handle: pending_routing_path_handle.clone(),
                     silent,
-                    future: Box::pin(async move {
-                        R::TcpStream::connect(SocketAddr::new(
-                            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                            port,
-                        ))
-                        .await
-                    }),
+                    future: Box::pin(async move { R::TcpStream::connect(address).await }),
                 })
             }
             state => {
@@ -527,13 +523,13 @@ impl<R: Runtime> StreamListener<R> {
                 ListenerState::Uninitialized,
                 ListenerKind::Persistent {
                     mut socket,
-                    port,
+                    address,
                     silent,
                     pending_routing_path_handle,
                 },
             ) => {
                 self.state = ListenerState::Initializing {
-                    kind: PendingListenerKind::Persistent { port, silent },
+                    kind: PendingListenerKind::Persistent { address, silent },
                 };
 
                 // from specification:
@@ -602,10 +598,10 @@ impl<R: Runtime> futures::Stream for StreamListener<R> {
                                     )]),
                                 };
                             }
-                            PendingListenerKind::Persistent { port, silent } => {
+                            PendingListenerKind::Persistent { address, silent } => {
                                 self.state = ListenerState::Persistent {
                                     socket,
-                                    port,
+                                    address,
                                     silent,
                                     pending_routing_path_handle,
                                 };
@@ -662,7 +658,7 @@ mod tests {
         assert_eq!(
             listener.register_listener(ListenerKind::Persistent {
                 socket: Box::new(SamSocket::new(NoopTcpStream::new())),
-                port: 1337,
+                address: "127.0.0.1:1337".parse().unwrap(),
                 silent: false,
                 pending_routing_path_handle: PendingRoutingPathHandle::create(),
             }),
@@ -681,7 +677,7 @@ mod tests {
         assert_eq!(
             listener.register_listener(ListenerKind::Persistent {
                 socket: Box::new(SamSocket::new(NoopTcpStream::new())),
-                port: 1337,
+                address: "127.0.0.1:1337".parse().unwrap(),
                 silent: false,
                 pending_routing_path_handle: PendingRoutingPathHandle::create(),
             }),
@@ -787,7 +783,7 @@ mod tests {
         assert_eq!(
             listener.register_listener(ListenerKind::Persistent {
                 socket: Box::new(SamSocket::new(NoopTcpStream::new())),
-                port: 1337,
+                address: "127.0.0.1:1337".parse().unwrap(),
                 silent: false,
                 pending_routing_path_handle: PendingRoutingPathHandle::create(),
             }),
@@ -797,7 +793,7 @@ mod tests {
         assert_eq!(
             listener.register_listener(ListenerKind::Persistent {
                 socket: Box::new(SamSocket::new(NoopTcpStream::new())),
-                port: 1338,
+                address: "127.0.0.1:1338".parse().unwrap(),
                 silent: false,
                 pending_routing_path_handle: PendingRoutingPathHandle::create(),
             }),
@@ -820,7 +816,7 @@ mod tests {
         assert_eq!(
             listener.register_listener(ListenerKind::Persistent {
                 socket: Box::new(SamSocket::new(stream2.unwrap())),
-                port: 1337,
+                address: "127.0.0.1:1337".parse().unwrap(),
                 silent: false,
                 pending_routing_path_handle: PendingRoutingPathHandle::create(),
             }),
@@ -831,10 +827,10 @@ mod tests {
             ListenerState::Initializing {
                 kind:
                     PendingListenerKind::Persistent {
-                        port: 1337,
+                        address,
                         silent: false,
                     },
-            } => {}
+            } => assert_eq!(*address, "127.0.0.1:1337".parse::<SocketAddr>().unwrap()),
             _ => panic!("invalid state"),
         }
 
@@ -844,10 +840,10 @@ mod tests {
 
         match &listener.state {
             ListenerState::Persistent {
-                port: 1337,
+                address,
                 silent: false,
                 ..
-            } => {}
+            } => assert_eq!(*address, "127.0.0.1:1337".parse::<SocketAddr>().unwrap()),
             _ => panic!("invalid state"),
         }
     }
@@ -1039,7 +1035,7 @@ mod tests {
         assert_eq!(
             listener.register_listener(ListenerKind::Persistent {
                 socket: Box::new(SamSocket::new(stream2.unwrap())),
-                port: 1337,
+                address: "127.0.0.1:1337".parse().unwrap(),
                 silent: false,
                 pending_routing_path_handle: PendingRoutingPathHandle::create(),
             }),
@@ -1050,10 +1046,10 @@ mod tests {
             ListenerState::Initializing {
                 kind:
                     PendingListenerKind::Persistent {
-                        port: 1337,
+                        address,
                         silent: false,
                     },
-            } => {}
+            } => assert_eq!(*address, "127.0.0.1:1337".parse::<SocketAddr>().unwrap()),
             _ => panic!("invalid state"),
         }
 
@@ -1063,10 +1059,10 @@ mod tests {
 
         match &listener.state {
             ListenerState::Persistent {
-                port: 1337,
+                address,
                 silent: false,
                 ..
-            } => {}
+            } => assert_eq!(*address, "127.0.0.1:1337".parse::<SocketAddr>().unwrap()),
             _ => panic!("invalid state"),
         }
 
@@ -1076,10 +1072,10 @@ mod tests {
 
             match &listener.state {
                 ListenerState::Persistent {
-                    port: 1337,
+                    address,
                     silent: false,
                     ..
-                } => {}
+                } => assert_eq!(*address, "127.0.0.1:1337".parse::<SocketAddr>().unwrap()),
                 _ => panic!("invalid state"),
             }
         }

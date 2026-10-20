@@ -126,6 +126,9 @@ pub enum PendingSessionState<R: Runtime> {
 
         /// Stream options.
         options: HashMap<String, String>,
+
+        /// Listen port of the (sub-)session which opened the stream.
+        listen_port: u16,
     },
 
     /// Awaiting session to be created
@@ -177,12 +180,24 @@ impl<R: Runtime> PendingSession<R> {
     }
 }
 
+/// Sub-session of a primary session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubSession {
+    /// Session kind.
+    pub kind: SessionKind,
+
+    /// Local I2CP port on which the sub-session accepts inbound streams or datagrams.
+    ///
+    /// `LISTEN_PORT` of `SESSION ADD`, defaulting to `FROM_PORT` and `0` which is a wildcard.
+    pub listen_port: u16,
+}
+
 /// Session kind for [`SamSession`].
 pub enum SamSessionKind {
     /// [`SamSession`] is configured to be a primary sessions, supporting multiple sub-sessions.
     Primary {
         /// Registered sub-sessions.
-        sub_sessions: HashMap<Arc<str>, SessionKind>,
+        sub_sessions: HashMap<Arc<str>, SubSession>,
     },
 
     /// [`SamSession`] is configured to be a stream session.
@@ -206,7 +221,18 @@ impl SamSessionKind {
             Self::Datagram { .. } => false,
             Self::Primary { sub_sessions } => sub_sessions
                 .get(session_id)
-                .is_some_and(|kind| core::matches!(kind, SessionKind::Stream)),
+                .is_some_and(|sub_session| core::matches!(sub_session.kind, SessionKind::Stream)),
+        }
+    }
+
+    /// Get the listen port of the (sub-)session identified by `session_id`.
+    ///
+    /// Sessions without sub-sessions, and unknown sub-sessions, use the wildcard port `0`.
+    pub fn listen_port(&self, session_id: &Arc<str>) -> u16 {
+        match self {
+            Self::Primary { sub_sessions } =>
+                sub_sessions.get(session_id).map_or(0u16, |sub_session| sub_session.listen_port),
+            Self::Stream | Self::Datagram { .. } => 0u16,
         }
     }
 
@@ -218,12 +244,13 @@ impl SamSessionKind {
         match self {
             Self::Stream => false,
             Self::Datagram { .. } => true,
-            Self::Primary { sub_sessions } => sub_sessions.get(session_id).is_some_and(|kind| {
-                core::matches!(
-                    kind,
-                    SessionKind::Datagram | SessionKind::Anonymous | SessionKind::Datagram2,
-                )
-            }),
+            Self::Primary { sub_sessions } =>
+                sub_sessions.get(session_id).is_some_and(|sub_session| {
+                    core::matches!(
+                        sub_session.kind,
+                        SessionKind::Datagram | SessionKind::Anonymous | SessionKind::Datagram2,
+                    )
+                }),
         }
     }
 
@@ -239,14 +266,14 @@ impl SamSessionKind {
                 SessionKind::Datagram2 => Protocol::Datagram2,
                 _ => unreachable!(),
             },
-            Self::Primary { sub_sessions } => match sub_sessions.get(session_id).expect("to exist")
-            {
-                SessionKind::Stream => Protocol::Streaming,
-                SessionKind::Datagram => Protocol::Datagram,
-                SessionKind::Anonymous => Protocol::Anonymous,
-                SessionKind::Datagram2 => Protocol::Datagram2,
-                _ => unreachable!(),
-            },
+            Self::Primary { sub_sessions } =>
+                match sub_sessions.get(session_id).expect("to exist").kind {
+                    SessionKind::Stream => Protocol::Streaming,
+                    SessionKind::Datagram => Protocol::Datagram,
+                    SessionKind::Anonymous => Protocol::Anonymous,
+                    SessionKind::Datagram2 => Protocol::Datagram2,
+                    _ => unreachable!(),
+                },
         }
     }
 }

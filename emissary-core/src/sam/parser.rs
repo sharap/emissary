@@ -268,6 +268,12 @@ pub enum SamCommand {
         options: HashMap<String, String>,
     },
 
+    /// `SESSION REMOVE` message.
+    RemoveSubSession {
+        /// Sub-session ID.
+        session_id: String,
+    },
+
     /// `STREAM CONNECT` message.
     Connect {
         /// Session ID.
@@ -329,6 +335,8 @@ impl fmt::Display for SamCommand {
                 write!(f, "SamCommand::CreateSession({session_id})"),
             Self::CreateSubSession { session_id, .. } =>
                 write!(f, "SamCommand::CreateSubSession({session_id})"),
+            Self::RemoveSubSession { session_id } =>
+                write!(f, "SamCommand::RemoveSubSession({session_id})"),
             Self::Connect { session_id, .. } =>
                 write!(f, "SamCommand::StreamConnect({session_id})"),
             Self::Accept { session_id, .. } => write!(f, "SamCommand::StreamAccept({session_id})"),
@@ -715,6 +723,20 @@ impl<'a, R: Runtime> TryFrom<ParsedCommand<'a, R>> for SamCommand {
                         .collect(),
                 })
             }
+            ("SESSION", Some("REMOVE")) => {
+                let session_id = parsed_cmd
+                    .key_value_pairs
+                    .remove("ID")
+                    .ok_or_else(|| {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            "session id missing from `SESSION REMOVE`",
+                        );
+                    })?
+                    .to_string();
+
+                Ok(SamCommand::RemoveSubSession { session_id })
+            }
             ("STREAM", Some("CONNECT")) => {
                 let session_id = parsed_cmd.key_value_pairs.get("ID").ok_or_else(|| {
                     tracing::warn!(
@@ -913,6 +935,7 @@ impl SamCommand {
                 tag("VERSION"),
                 tag("CREATE"),
                 tag("ADD"),
+                tag("REMOVE"),
                 tag("CONNECT"),
                 tag("ACCEPT"),
                 tag("FORWARD"),
@@ -2233,5 +2256,17 @@ mod tests {
             privkey(&keys, keys.serialize().len())
         ))
         .is_none());
+    }
+
+    #[test]
+    fn parse_session_remove() {
+        match SamCommand::parse::<MockRuntime>("SESSION REMOVE ID=sub-session") {
+            Some(SamCommand::RemoveSubSession { session_id }) => {
+                assert_eq!(session_id, "sub-session");
+            }
+            response => panic!("invalid response: {response:?}"),
+        }
+
+        assert!(SamCommand::parse::<MockRuntime>("SESSION REMOVE").is_none());
     }
 }

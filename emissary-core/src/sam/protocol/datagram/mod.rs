@@ -23,6 +23,7 @@ use crate::{
     primitives::{DatagramFlags, Destination, Mapping, OfflineSignature},
     protocol::Protocol,
     runtime::Runtime,
+    sam::parser::SessionKind,
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -30,16 +31,205 @@ use hashbrown::HashMap;
 use nom::bytes::complete::take;
 use thingbuf::mpsc::Sender;
 
-use alloc::{borrow::Cow, format, string::String, vec::Vec};
-use core::marker::PhantomData;
+use alloc::{borrow::Cow, format, string::String, sync::Arc, vec::Vec};
+use core::{
+    marker::PhantomData,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 /// Logging target for the file.
 const LOG_TARGET: &str = "emissary::datagram";
 
+/// I2CP protocol number of raw datagrams, the only one supported for `RAW` sessions.
+const RAW_PROTOCOL: u8 = 18u8;
+
+/// Datagram forwarded to a client over UDP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardedDatagram {
+    /// Datagram, prefixed with a header line where the session kind requires one.
+    pub datagram: Vec<u8>,
+
+    /// Address of the client's UDP socket.
+    pub target: SocketAddr,
+}
+
+impl Default for ForwardedDatagram {
+    fn default() -> Self {
+        Self {
+            datagram: Vec::new(),
+            target: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0u16),
+        }
+    }
+}
+
+/// Datagram listener.
+///
+/// Created from the `PORT`/`HOST`/`LISTEN_PORT`/`LISTEN_PROTOCOL`/`HEADER` options of a
+/// `SESSION CREATE` or `SESSION ADD` command. Inbound datagrams are routed to a listener based on
+/// their I2CP protocol and destination port and forwarded to `target` over UDP.
+///
+/// https://geti2p.net/en/docs/api/samv3#primary-sessions
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatagramListener {
+    /// Should forwarded raw datagrams be prefixed with a header line (`HEADER=true`).
+    header: bool,
+
+    /// Session kind: `Datagram`, `Anonymous` or `Datagram2`.
+    kind: SessionKind,
+
+    /// Local I2CP port the listener accepts datagrams on, `0` is a wildcard.
+    listen_port: u16,
+
+    /// I2CP protocol the listener accepts, `0` is a wildcard. Only meaningful for raw sessions.
+    listen_protocol: u8,
+
+    /// ID of the (sub-)session which owns the listener.
+    session_id: Arc<str>,
+
+    /// Where the datagrams are forwarded to.
+    target: SocketAddr,
+}
+
+impl DatagramListener {
+    /// Create [`DatagramListener`] for `session_id` of kind `kind` from `options`.
+    ///
+    /// `PORT` is required, `HOST` defaults to `127.0.0.1` and must be an IP address, `LISTEN_PORT`
+    /// defaults to `FROM_PORT` which defaults to `0` and `LISTEN_PROTOCOL` defaults to `PROTOCOL`
+    /// which defaults to `18` for raw sessions. Only protocol `18` (and the wildcard `0`) is
+    /// supported for raw sessions.
+    fn new(
+        session_id: Arc<str>,
+        kind: SessionKind,
+        options: &HashMap<String, String>,
+    ) -> Result<Self, ()> {
+        let port = options
+            .get("PORT")
+            .ok_or_else(|| {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    %session_id,
+                    "tried to register datagram listener without specifying `PORT`",
+                );
+            })?
+            .parse::<u16>()
+            .map_err(|error| {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    %session_id,
+                    ?error,
+                    "invalid `PORT` for datagram listener",
+                );
+            })?;
+        let host = match options.get("HOST") {
+            None => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Some(host) => host.parse::<IpAddr>().map_err(|error| {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    %session_id,
+                    %host,
+                    ?error,
+                    "invalid `HOST` for datagram listener, must be an ip address",
+                );
+            })?,
+        };
+        let parse_port = |key: &str, default: u16| -> Result<u16, ()> {
+            options.get(key).map_or(Ok(default), |value| {
+                value.parse::<u16>().map_err(|error| {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        %session_id,
+                        %key,
+                        %value,
+                        ?error,
+                        "invalid port for datagram listener",
+                    );
+                })
+            })
+        };
+        let from_port = parse_port("FROM_PORT", 0u16)?;
+        let listen_port = parse_port("LISTEN_PORT", from_port)?;
+
+        let listen_protocol = match kind {
+            SessionKind::Anonymous => {
+                let protocol = options
+                    .get("LISTEN_PROTOCOL")
+                    .or_else(|| options.get("PROTOCOL"))
+                    .map_or(Ok(RAW_PROTOCOL), |value| {
+                        value.parse::<u8>().map_err(|_| ())
+                    })
+                    .map_err(|()| {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            %session_id,
+                            "invalid protocol for raw datagram listener",
+                        );
+                    })?;
+
+                if protocol != 0 && protocol != RAW_PROTOCOL {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        %session_id,
+                        %protocol,
+                        "only protocol 18 is supported for raw datagram listeners",
+                    );
+                    return Err(());
+                }
+
+                protocol
+            }
+            _ => 0u8,
+        };
+        let header = core::matches!(kind, SessionKind::Anonymous)
+            && options
+                .get("HEADER")
+                .is_some_and(|value| value.parse::<bool>().unwrap_or(false));
+
+        Ok(Self {
+            header,
+            kind,
+            listen_port,
+            listen_protocol,
+            session_id,
+            target: SocketAddr::new(host, port),
+        })
+    }
+
+    /// Does the listener accept datagrams of `protocol`.
+    ///
+    /// Repliable datagram listeners only accept the datagram kind they were created for. Raw
+    /// listeners accept raw datagrams, or any non-streaming protocol if their listen protocol is
+    /// the wildcard `0`.
+    fn accepts(&self, protocol: Protocol) -> bool {
+        match self.kind {
+            SessionKind::Datagram => protocol == Protocol::Datagram,
+            SessionKind::Datagram2 => protocol == Protocol::Datagram2,
+            SessionKind::Anonymous =>
+                protocol == Protocol::Anonymous
+                    || (self.listen_protocol == 0 && protocol != Protocol::Streaming),
+            SessionKind::Stream | SessionKind::Primary => false,
+        }
+    }
+
+    /// Is the listener an exact match for `protocol`, as opposed to a raw wildcard listener.
+    fn is_exact(&self, protocol: Protocol) -> bool {
+        match self.kind {
+            SessionKind::Anonymous => protocol == Protocol::Anonymous,
+            _ => true,
+        }
+    }
+
+    /// Would the listener conflict with `other`, i.e., accept the same traffic.
+    fn conflicts_with(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.listen_port == other.listen_port
+            && self.listen_protocol == other.listen_protocol
+    }
+}
+
 /// Datagram manager.
 pub struct DatagramManager<R: Runtime> {
     /// TX channel which can be used to send datagrams to clients.
-    datagram_tx: Sender<(u16, Vec<u8>)>,
+    datagram_tx: Sender<ForwardedDatagram>,
 
     /// Local destination.
     destination: Destination,
@@ -48,7 +238,7 @@ pub struct DatagramManager<R: Runtime> {
     destination_hash: [u8; 32],
 
     /// Listeners.
-    listeners: HashMap<u16, u16>,
+    listeners: Vec<DatagramListener>,
 
     /// Serialized offline signature section, if the local destination uses offline keys.
     offline_signature: Option<Bytes>,
@@ -64,23 +254,14 @@ impl<R: Runtime> DatagramManager<R> {
     /// Create new [`DatagramManager`].
     pub fn new(
         destination: Destination,
-        datagram_tx: Sender<(u16, Vec<u8>)>,
-        options: HashMap<String, String>,
+        datagram_tx: Sender<ForwardedDatagram>,
         signing_key: SigningPrivateKey,
     ) -> Self {
         Self {
             destination_hash: Sha256::new().update(&*destination).finalize_new(),
             datagram_tx,
             destination,
-            listeners: {
-                let port = options.get("PORT").and_then(|port| port.parse::<u16>().ok());
-                let dst_port = options.get("FROM_PORT").and_then(|port| port.parse::<u16>().ok());
-
-                // `port` may not exist if `DatagramManager` is owned by a primary session
-                port.map_or_else(HashMap::new, |port| {
-                    HashMap::from_iter([(dst_port.unwrap_or(0), port)])
-                })
-            },
+            listeners: Vec::new(),
             offline_signature: None,
             signing_key,
             _runtime: Default::default(),
@@ -158,6 +339,26 @@ impl<R: Runtime> DatagramManager<R> {
         out.freeze()
     }
 
+    /// Find listener for a datagram of `protocol` sent to `dst_port`.
+    ///
+    /// A listener of the matching kind with the exact port is preferred, then one with the
+    /// wildcard port, then a raw wildcard listener with the exact port and finally a raw wildcard
+    /// listener with the wildcard port (the default sub-session).
+    fn find_listener(&self, protocol: Protocol, dst_port: u16) -> Option<&DatagramListener> {
+        let candidates = self.listeners.iter().filter(|listener| listener.accepts(protocol));
+
+        candidates
+            .clone()
+            .find(|listener| listener.is_exact(protocol) && listener.listen_port == dst_port)
+            .or_else(|| {
+                candidates
+                    .clone()
+                    .find(|listener| listener.is_exact(protocol) && listener.listen_port == 0)
+            })
+            .or_else(|| candidates.clone().find(|listener| listener.listen_port == dst_port))
+            .or_else(|| candidates.clone().find(|listener| listener.listen_port == 0))
+    }
+
     /// Handle inbound datagram.
     pub fn on_datagram(&self, payload: I2cpPayload) -> crate::Result<()> {
         let I2cpPayload {
@@ -167,14 +368,39 @@ impl<R: Runtime> DatagramManager<R> {
             src_port,
         } = payload;
 
-        let Some(port) = self.listeners.get(&dst_port) else {
+        let Some(listener) = self.find_listener(protocol, dst_port) else {
             tracing::warn!(
                 target: LOG_TARGET,
+                ?protocol,
                 ?dst_port,
                 "no datagram listener for destination port",
             );
             return Err(Error::InvalidState);
         };
+        let target = listener.target;
+
+        // a raw listener with a wildcard protocol receives other datagram kinds as-is
+        if core::matches!(listener.kind, SessionKind::Anonymous) {
+            let mut out = BytesMut::with_capacity(payload.len() + 64);
+
+            if listener.header {
+                out.put_slice(
+                    format!(
+                        "FROM_PORT={src_port} TO_PORT={dst_port} PROTOCOL={}\n",
+                        protocol.as_u8()
+                    )
+                    .as_bytes(),
+                );
+            }
+            out.put_slice(&payload);
+
+            let _ = self.datagram_tx.try_send(ForwardedDatagram {
+                datagram: out.to_vec(),
+                target,
+            });
+
+            return Ok(());
+        }
 
         match protocol {
             Protocol::Datagram => {
@@ -200,7 +426,10 @@ impl<R: Runtime> DatagramManager<R> {
                 out.put_slice(info);
                 out.put_slice(rest);
 
-                let _ = self.datagram_tx.try_send((*port, out.to_vec()));
+                let _ = self.datagram_tx.try_send(ForwardedDatagram {
+                    datagram: out.to_vec(),
+                    target,
+                });
 
                 Ok(())
             }
@@ -276,65 +505,57 @@ impl<R: Runtime> DatagramManager<R> {
                 out.put_slice(info);
                 out.put_slice(payload);
 
-                let _ = self.datagram_tx.try_send((*port, out.to_vec()));
+                let _ = self.datagram_tx.try_send(ForwardedDatagram {
+                    datagram: out.to_vec(),
+                    target,
+                });
 
                 Ok(())
             }
-            Protocol::Anonymous => {
-                let _ = self.datagram_tx.try_send((*port, payload));
-
-                Ok(())
-            }
+            // handled above, raw datagrams are only accepted by raw listeners
+            Protocol::Anonymous => Err(Error::InvalidState),
             Protocol::Streaming => unreachable!(),
         }
     }
 
-    /// Attempt add datagram listener.
+    /// Attempt to add datagram listener for `session_id` of kind `kind`.
     ///
-    /// The SAMv3 `PORT` and `FROM_PORT` are parsed from `options` and if a listener for the same
-    /// port already exists in [`DatagramManager`], the listener is not added to the set of
-    /// listeners and `Err(())` is returned.
-    ///
-    /// If `PORT` doesn't exist in `options`, `Err(())` is return and if `FROM_PORT` is not
-    /// specified in `options`, it defaults to `0`.
-    pub fn add_listener(&mut self, options: HashMap<String, String>) -> Result<(), ()> {
-        let dst_port = options
-            .get("FROM_PORT")
-            .and_then(|port| port.parse::<u16>().ok())
-            .unwrap_or(0u16);
-        let port = options.get("PORT").ok_or_else(|| {
-            tracing::warn!(
-                target: LOG_TARGET,
-                ?options,
-                "tried to register datagram listener without specifying `PORT`",
-            );
-        })?;
+    /// The forwarding target and the accepted traffic are parsed from `options`, see
+    /// [`DatagramListener::new()`]. If a listener accepting the same traffic (kind, listen port and
+    /// listen protocol) already exists, the listener is not added and `Err(())` is returned.
+    pub fn add_listener(
+        &mut self,
+        session_id: Arc<str>,
+        kind: SessionKind,
+        options: &HashMap<String, String>,
+    ) -> Result<(), ()> {
+        let listener = DatagramListener::new(session_id, kind, options)?;
 
-        if let Some(port) = self.listeners.get(&dst_port) {
+        if let Some(existing) =
+            self.listeners.iter().find(|existing| existing.conflicts_with(&listener))
+        {
             tracing::warn!(
                 target: LOG_TARGET,
-                ?port,
-                ?dst_port,
-                "listener for the specified destination port already exists",
+                ?existing,
+                ?listener,
+                "listener for the specified kind, listen port and protocol already exists",
             );
             return Err(());
         }
 
-        match port.parse::<u16>() {
-            Err(error) => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    ?port,
-                    ?error,
-                    "invalid `PORT` for datagram listener",
-                );
-                Err(())
-            }
-            Ok(port) => {
-                self.listeners.insert(dst_port, port);
-                Ok(())
-            }
-        }
+        tracing::debug!(
+            target: LOG_TARGET,
+            ?listener,
+            "datagram listener added",
+        );
+        self.listeners.push(listener);
+
+        Ok(())
+    }
+
+    /// Remove all datagram listeners of `session_id`.
+    pub fn remove_listener(&mut self, session_id: &Arc<str>) {
+        self.listeners.retain(|listener| &listener.session_id != session_id);
     }
 }
 
@@ -344,19 +565,33 @@ mod tests {
     use crate::{primitives::OfflineKeys, runtime::mock::MockRuntime};
     use thingbuf::mpsc::channel;
 
+    fn options(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect()
+    }
+
+    fn localhost(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
     #[test]
     fn create_datagram_session() {
         let (destination, signing_key) = Destination::random();
         let (tx, _rx) = channel(16);
 
-        let manager = DatagramManager::<MockRuntime>::new(
-            destination,
-            tx,
-            HashMap::from_iter([("PORT".to_string(), "8888".to_string())]),
-            signing_key,
-        );
+        let mut manager = DatagramManager::<MockRuntime>::new(destination, tx, signing_key);
+        manager
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram,
+                &options(&[("PORT", "8888")]),
+            )
+            .unwrap();
 
-        assert_eq!(manager.listeners.get(&0), Some(&8888));
+        let listener = manager.find_listener(Protocol::Datagram, 0).unwrap();
+        assert_eq!(listener.target, localhost(8888));
+        assert_eq!(listener.listen_port, 0);
+        assert!(manager.find_listener(Protocol::Anonymous, 0).is_none());
+        assert!(manager.find_listener(Protocol::Datagram2, 0).is_none());
     }
 
     #[test]
@@ -364,17 +599,25 @@ mod tests {
         let (destination, signing_key) = Destination::random();
         let (tx, _rx) = channel(16);
 
-        let manager = DatagramManager::<MockRuntime>::new(
-            destination,
-            tx,
-            HashMap::from_iter([
-                ("PORT".to_string(), "1337".to_string()),
-                ("FROM_PORT".to_string(), "8889".to_string()),
-            ]),
-            signing_key,
-        );
+        let mut manager = DatagramManager::<MockRuntime>::new(destination, tx, signing_key);
+        manager
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram,
+                &options(&[
+                    ("PORT", "1337"),
+                    ("FROM_PORT", "8889"),
+                    ("HOST", "127.0.0.2"),
+                ]),
+            )
+            .unwrap();
 
-        assert_eq!(manager.listeners.get(&8889), Some(&1337));
+        // `LISTEN_PORT` defaults to `FROM_PORT`
+        let listener = manager.find_listener(Protocol::Datagram, 8889).unwrap();
+        assert_eq!(listener.target, "127.0.0.2:1337".parse().unwrap());
+        assert_eq!(listener.listen_port, 8889);
+        assert!(manager.find_listener(Protocol::Datagram, 0).is_none());
+        assert!(manager.find_listener(Protocol::Datagram, 8890).is_none());
     }
 
     #[test]
@@ -382,8 +625,7 @@ mod tests {
         let (destination, signing_key) = Destination::random();
         let (tx, _rx) = channel(16);
 
-        let manager =
-            DatagramManager::<MockRuntime>::new(destination, tx, HashMap::new(), signing_key);
+        let manager = DatagramManager::<MockRuntime>::new(destination, tx, signing_key);
 
         assert!(manager.listeners.is_empty());
     }
@@ -398,15 +640,20 @@ mod tests {
         let mut sender = DatagramManager::<MockRuntime>::new(
             sender_destination.clone(),
             sender_tx,
-            HashMap::new(),
             sender_signing_key,
         );
-        let receiver = DatagramManager::<MockRuntime>::new(
+        let mut receiver = DatagramManager::<MockRuntime>::new(
             receiver_destination,
             receiver_tx,
-            HashMap::from_iter([("PORT".to_string(), "8888".to_string())]),
             receiver_signing_key,
         );
+        receiver
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram2,
+                &options(&[("PORT", "8888")]),
+            )
+            .unwrap();
 
         let datagram =
             sender.make_datagram2(b"hello, world".to_vec(), &receiver.destination_hash, None);
@@ -420,13 +667,16 @@ mod tests {
             })
             .unwrap();
 
-        let (port, data) = receiver_rx.try_recv().unwrap();
+        let ForwardedDatagram {
+            target,
+            datagram: data,
+        } = receiver_rx.try_recv().unwrap();
         let info = format!(
             "{} FROM_PORT=0 TO_PORT=0\n",
             base64_encode(&*sender_destination)
         );
 
-        assert_eq!(port, 8888);
+        assert_eq!(target, localhost(8888));
         assert!(data.starts_with(info.as_bytes()));
         assert_eq!(&data[info.len()..], b"hello, world");
     }
@@ -438,18 +688,20 @@ mod tests {
         let (sender_tx, _sender_rx) = channel(16);
         let (receiver_tx, receiver_rx) = channel(16);
 
-        let mut sender = DatagramManager::<MockRuntime>::new(
-            sender_destination,
-            sender_tx,
-            HashMap::new(),
-            sender_signing_key,
-        );
-        let receiver = DatagramManager::<MockRuntime>::new(
+        let mut sender =
+            DatagramManager::<MockRuntime>::new(sender_destination, sender_tx, sender_signing_key);
+        let mut receiver = DatagramManager::<MockRuntime>::new(
             receiver_destination,
             receiver_tx,
-            HashMap::from_iter([("PORT".to_string(), "8888".to_string())]),
             receiver_signing_key,
         );
+        receiver
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram2,
+                &options(&[("PORT", "8888")]),
+            )
+            .unwrap();
 
         let datagram =
             sender.make_datagram2(b"hello, world".to_vec(), &receiver.destination_hash, None);
@@ -485,8 +737,7 @@ mod tests {
         let (destination, signing_key) = Destination::random();
         let (tx, _rx) = channel(16);
 
-        let manager =
-            DatagramManager::<MockRuntime>::new(destination, tx, HashMap::new(), signing_key);
+        let manager = DatagramManager::<MockRuntime>::new(destination, tx, signing_key);
 
         match manager.on_datagram(I2cpPayload {
             dst_port: 0,
@@ -504,16 +755,36 @@ mod tests {
         let (destination, signing_key) = Destination::random();
         let (tx, _rx) = channel(16);
 
-        let mut manager =
-            DatagramManager::<MockRuntime>::new(destination, tx, HashMap::new(), signing_key);
+        let mut manager = DatagramManager::<MockRuntime>::new(destination, tx, signing_key);
 
         assert!(manager
-            .add_listener(HashMap::from_iter([
-                ("PORT".to_string(), "2048".to_string()),
-                ("FROM_PORT".to_string(), "7777".to_string()),
-            ]))
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram,
+                &options(&[("PORT", "2048"), ("FROM_PORT", "7777")])
+            )
             .is_ok());
-        assert_eq!(manager.listeners.get(&7777), Some(&2048));
+        assert_eq!(
+            manager.find_listener(Protocol::Datagram, 7777).map(|listener| listener.target),
+            Some(localhost(2048))
+        );
+
+        // explicit listen port takes precedence over `FROM_PORT`
+        assert!(manager
+            .add_listener(
+                "test2".into(),
+                SessionKind::Datagram,
+                &options(&[
+                    ("PORT", "2049"),
+                    ("FROM_PORT", "7777"),
+                    ("LISTEN_PORT", "7778")
+                ])
+            )
+            .is_ok());
+        assert_eq!(
+            manager.find_listener(Protocol::Datagram, 7778).map(|listener| listener.target),
+            Some(localhost(2049))
+        );
     }
 
     #[test]
@@ -521,64 +792,93 @@ mod tests {
         let (destination, signing_key) = Destination::random();
         let (tx, _rx) = channel(16);
 
-        let mut manager =
-            DatagramManager::<MockRuntime>::new(destination, tx, HashMap::new(), signing_key);
+        let mut manager = DatagramManager::<MockRuntime>::new(destination, tx, signing_key);
 
         assert!(manager
-            .add_listener(HashMap::from_iter([(
-                "PORT".to_string(),
-                "2048".to_string()
-            ),]))
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram,
+                &options(&[("PORT", "2048")])
+            )
             .is_ok());
-        assert_eq!(manager.listeners.get(&0), Some(&2048));
+        assert_eq!(
+            manager.find_listener(Protocol::Datagram, 0).map(|listener| listener.target),
+            Some(localhost(2048))
+        );
+        // wildcard port receives datagrams sent to any port
+        assert_eq!(
+            manager.find_listener(Protocol::Datagram, 1337).map(|listener| listener.target),
+            Some(localhost(2048))
+        );
     }
 
     #[test]
-    fn add_listener_invalid_port() {
+    fn add_listener_invalid_options() {
         let (destination, signing_key) = Destination::random();
         let (tx, _rx) = channel(16);
 
-        let mut manager =
-            DatagramManager::<MockRuntime>::new(destination, tx, HashMap::new(), signing_key);
+        let mut manager = DatagramManager::<MockRuntime>::new(destination, tx, signing_key);
 
+        // invalid port
         assert!(manager
-            .add_listener(HashMap::from_iter([(
-                "PORT".to_string(),
-                "hello, world".to_string()
-            ),]))
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram,
+                &options(&[("PORT", "hello")])
+            )
             .is_err());
-    }
 
-    #[test]
-    fn add_listener_port_missing() {
-        let (destination, signing_key) = Destination::random();
-        let (tx, _rx) = channel(16);
-
-        let mut manager =
-            DatagramManager::<MockRuntime>::new(destination, tx, HashMap::new(), signing_key);
-
+        // port missing
         assert!(manager
-            .add_listener(HashMap::from_iter([(
-                "FROM_PORT".to_string(),
-                "1337".to_string()
-            ),]))
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram,
+                &options(&[("FROM_PORT", "1")])
+            )
             .is_err());
-    }
 
-    #[test]
-    fn add_listener_invalid_src_port() {
-        let (destination, signing_key) = Destination::random();
-        let (tx, _rx) = channel(16);
-
-        let mut manager =
-            DatagramManager::<MockRuntime>::new(destination, tx, HashMap::new(), signing_key);
-
+        // invalid listen port
         assert!(manager
-            .add_listener(HashMap::from_iter([
-                ("PORT".to_string(), "2048".to_string()),
-                ("FROM_PORT".to_string(), "hello, world".to_string()),
-            ]))
-            .is_ok());
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram,
+                &options(&[("PORT", "1"), ("FROM_PORT", "hello, world")])
+            )
+            .is_err());
+        assert!(manager
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram,
+                &options(&[("PORT", "1"), ("LISTEN_PORT", "70000")])
+            )
+            .is_err());
+
+        // host is not an ip address
+        assert!(manager
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram,
+                &options(&[("PORT", "1"), ("HOST", "localhost")])
+            )
+            .is_err());
+
+        // unsupported raw protocol
+        assert!(manager
+            .add_listener(
+                "test".into(),
+                SessionKind::Anonymous,
+                &options(&[("PORT", "1"), ("PROTOCOL", "200")])
+            )
+            .is_err());
+        assert!(manager
+            .add_listener(
+                "test".into(),
+                SessionKind::Anonymous,
+                &options(&[("PORT", "1"), ("LISTEN_PROTOCOL", "6")])
+            )
+            .is_err());
+
+        assert!(manager.listeners.is_empty());
     }
 
     #[test]
@@ -586,21 +886,156 @@ mod tests {
         let (destination, signing_key) = Destination::random();
         let (tx, _rx) = channel(16);
 
-        let mut manager = DatagramManager::<MockRuntime>::new(
-            destination,
-            tx,
-            HashMap::from_iter([("PORT".to_string(), "1337".to_string())]),
-            signing_key,
-        );
-        assert_eq!(manager.listeners.get(&0), Some(&1337));
+        let mut manager = DatagramManager::<MockRuntime>::new(destination, tx, signing_key);
+        manager
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram,
+                &options(&[("PORT", "1337")]),
+            )
+            .unwrap();
 
+        // same kind and listen port
         assert!(manager
-            .add_listener(HashMap::from_iter([(
-                "PORT".to_string(),
-                "2048".to_string()
-            ),]))
+            .add_listener(
+                "test2".into(),
+                SessionKind::Datagram,
+                &options(&[("PORT", "1338")])
+            )
             .is_err());
-        assert_eq!(manager.listeners.get(&0), Some(&1337));
+        assert_eq!(
+            manager.find_listener(Protocol::Datagram, 0).map(|listener| listener.target),
+            Some(localhost(1337))
+        );
+
+        // another kind with the same listen port is fine
+        assert!(manager
+            .add_listener(
+                "test3".into(),
+                SessionKind::Anonymous,
+                &options(&[("PORT", "1339")])
+            )
+            .is_ok());
+        assert_eq!(
+            manager.find_listener(Protocol::Anonymous, 0).map(|listener| listener.target),
+            Some(localhost(1339))
+        );
+
+        // removing the owner frees the port
+        manager.remove_listener(&Arc::from("test"));
+        assert!(manager
+            .add_listener(
+                "test2".into(),
+                SessionKind::Datagram,
+                &options(&[("PORT", "1338")])
+            )
+            .is_ok());
+        assert_eq!(
+            manager.find_listener(Protocol::Datagram, 0).map(|listener| listener.target),
+            Some(localhost(1338))
+        );
+    }
+
+    #[test]
+    fn datagrams_routed_by_port_and_protocol() {
+        let (destination, signing_key) = Destination::random();
+        let (tx, rx) = channel(16);
+
+        let mut manager = DatagramManager::<MockRuntime>::new(destination, tx, signing_key);
+        // default raw sub-session, catches everything that isn't routed elsewhere
+        manager
+            .add_listener(
+                "raw-any".into(),
+                SessionKind::Anonymous,
+                &options(&[("PORT", "1"), ("LISTEN_PROTOCOL", "0")]),
+            )
+            .unwrap();
+        // raw sub-session for port 10
+        manager
+            .add_listener(
+                "raw-10".into(),
+                SessionKind::Anonymous,
+                &options(&[("PORT", "2"), ("LISTEN_PORT", "10"), ("HEADER", "true")]),
+            )
+            .unwrap();
+        // repliable sub-sessions for port 10 and any port
+        manager
+            .add_listener(
+                "dgram-10".into(),
+                SessionKind::Datagram,
+                &options(&[("PORT", "3"), ("LISTEN_PORT", "10")]),
+            )
+            .unwrap();
+        manager
+            .add_listener(
+                "dgram-any".into(),
+                SessionKind::Datagram,
+                &options(&[("PORT", "4")]),
+            )
+            .unwrap();
+
+        let (sender, sender_key) = Destination::random();
+        let (sender_tx, _sender_rx) = channel(16);
+        let mut sender = DatagramManager::<MockRuntime>::new(sender, sender_tx, sender_key);
+
+        let deliver =
+            |manager: &DatagramManager<MockRuntime>, protocol, dst_port, payload: Bytes| {
+                manager
+                    .on_datagram(I2cpPayload {
+                        dst_port,
+                        payload: payload.to_vec(),
+                        protocol,
+                        src_port: 7,
+                    })
+                    .unwrap();
+                let ForwardedDatagram { target, datagram } = rx.try_recv().unwrap();
+                (target, datagram)
+            };
+
+        // raw to port 10 -> raw-10, with header
+        let (target, data) = deliver(
+            &manager,
+            Protocol::Anonymous,
+            10,
+            Bytes::from_static(b"raw"),
+        );
+        assert_eq!(target, localhost(2));
+        assert_eq!(data, b"FROM_PORT=7 TO_PORT=10 PROTOCOL=18\nraw");
+
+        // raw to port 11 -> raw-any, no header
+        let (target, data) = deliver(
+            &manager,
+            Protocol::Anonymous,
+            11,
+            Bytes::from_static(b"raw"),
+        );
+        assert_eq!(target, localhost(1));
+        assert_eq!(data, b"raw");
+
+        // repliable to port 10 -> dgram-10, to port 11 -> dgram-any
+        let datagram = sender.make_datagram(b"hello".to_vec());
+        let (target, _) = deliver(&manager, Protocol::Datagram, 10, datagram.clone());
+        assert_eq!(target, localhost(3));
+        let (target, _) = deliver(&manager, Protocol::Datagram, 11, datagram);
+        assert_eq!(target, localhost(4));
+
+        // datagram2 has no listener of its own kind -> raw wildcard listener, as-is
+        let datagram = sender.make_datagram2(b"hello".to_vec(), &manager.destination_hash, None);
+        let (target, data) = deliver(&manager, Protocol::Datagram2, 10, datagram.clone());
+        assert_eq!(target, localhost(1));
+        assert_eq!(data, datagram.to_vec());
+
+        // once the default sub-session is removed, unrouted datagrams are dropped
+        manager.remove_listener(&Arc::from("raw-any"));
+        assert!(manager
+            .on_datagram(I2cpPayload {
+                dst_port: 11,
+                payload: b"raw".to_vec(),
+                protocol: Protocol::Anonymous,
+                src_port: 7,
+            })
+            .is_err());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -615,16 +1050,21 @@ mod tests {
         let mut sender = DatagramManager::<MockRuntime>::new(
             sender_destination.clone(),
             sender_tx,
-            HashMap::new(),
             keys.transient_key().clone(),
         )
         .with_offline_signature(Some(Bytes::copy_from_slice(keys.signature().serialized())));
-        let receiver = DatagramManager::<MockRuntime>::new(
+        let mut receiver = DatagramManager::<MockRuntime>::new(
             receiver_destination,
             receiver_tx,
-            HashMap::from_iter([("PORT".to_string(), "8888".to_string())]),
             receiver_signing_key,
         );
+        receiver
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram2,
+                &options(&[("PORT", "8888")]),
+            )
+            .unwrap();
 
         let datagram =
             sender.make_datagram2(b"hello, world".to_vec(), &receiver.destination_hash, None);
@@ -645,13 +1085,16 @@ mod tests {
             })
             .unwrap();
 
-        let (port, data) = receiver_rx.try_recv().unwrap();
+        let ForwardedDatagram {
+            target,
+            datagram: data,
+        } = receiver_rx.try_recv().unwrap();
         let info = format!(
             "{} FROM_PORT=0 TO_PORT=0\n",
             base64_encode(&*sender_destination)
         );
 
-        assert_eq!(port, 8888);
+        assert_eq!(target, localhost(8888));
         assert!(data.starts_with(info.as_bytes()));
         assert_eq!(&data[info.len()..], b"hello, world");
 
@@ -659,7 +1102,6 @@ mod tests {
         let mut sender = DatagramManager::<MockRuntime>::new(
             sender_destination,
             sender.datagram_tx.clone(),
-            HashMap::new(),
             keys.transient_key().clone(),
         );
         let datagram =

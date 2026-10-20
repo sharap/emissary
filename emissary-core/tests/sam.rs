@@ -37,6 +37,7 @@ use tokio::{
 use yosemite::{
     style::{Anonymous, Primary, Repliable, Stream},
     DestinationKind, Error, I2pError, ProtocolError, RouterApi, Session, SessionOptions,
+    StreamOptions,
 };
 
 use std::{fs::File, future::Future, io::Read, pin::Pin, sync::Arc, time::Duration};
@@ -2936,4 +2937,210 @@ async fn offline_keys_work(kind: TransportKind) {
         .await
         .expect("no timeout")
         .expect("to succeed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn sub_sessions_routed_by_port_ntcp2() {
+    sub_sessions_routed_by_port(TransportKind::Ntcp2).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn sub_sessions_routed_by_port_ssu2() {
+    sub_sessions_routed_by_port(TransportKind::Ssu2).await;
+}
+
+/// Primary session with two stream sub-sessions: one listening on port 10 and a default one.
+/// Inbound streams are routed to the sub-session by their destination port and `SESSION REMOVE`
+/// closes a sub-session.
+///
+/// The primary session is driven over a raw SAMv3 socket since the client library doesn't
+/// support listen ports or `SESSION REMOVE`.
+async fn sub_sessions_routed_by_port(kind: TransportKind) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let mut router_infos = Vec::<Vec<u8>>::new();
+    let net_id = (TokioRuntime::rng().next_u32() % 255) as u8;
+
+    for i in 0..4 {
+        let (router, _events, router_info) =
+            make_router(i < 2, net_id, router_infos.clone(), kind).await;
+
+        router_infos.push(router_info);
+        tokio::spawn(router);
+    }
+
+    // create two more routers, fetch their sam tcp ports and spawn them in the background
+    let mut ports = Vec::<u16>::new();
+
+    for _ in 0..2 {
+        let router = make_router(false, net_id, router_infos.clone(), kind).await.0;
+        ports.push(router.protocol_address_info().sam_tcp.unwrap().port());
+        tokio::spawn(router);
+    }
+
+    // let the network boot up
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    // create primary session with two stream sub-sessions
+    let server_port = ports[0];
+    let mut control = tokio::net::TcpStream::connect(format!("127.0.0.1:{server_port}"))
+        .await
+        .expect("to succeed");
+    control.write_all(b"HELLO VERSION\n").await.unwrap();
+    assert!(read_sam_line(&mut control).await.starts_with("HELLO REPLY RESULT=OK"));
+    control
+        .write_all(b"SESSION CREATE STYLE=PRIMARY ID=primary DESTINATION=TRANSIENT\n")
+        .await
+        .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), read_sam_line(&mut control))
+        .await
+        .expect("no timeout");
+    let destination = status
+        .strip_prefix("SESSION STATUS RESULT=OK DESTINATION=")
+        .unwrap_or_else(|| panic!("unexpected session status: {status}"))
+        .to_string();
+    let destination = base64_encode(
+        Destination::parse(base64_decode(destination.trim()).expect("valid base64"))
+            .unwrap()
+            .serialize(),
+    );
+
+    control
+        .write_all(b"SESSION ADD STYLE=STREAM ID=port10 LISTEN_PORT=10\n")
+        .await
+        .unwrap();
+    assert!(read_sam_line(&mut control).await.starts_with("SESSION STATUS RESULT=OK"));
+    control.write_all(b"SESSION ADD STYLE=STREAM ID=any\n").await.unwrap();
+    assert!(read_sam_line(&mut control).await.starts_with("SESSION STATUS RESULT=OK"));
+
+    // the same listen port cannot be used twice
+    control
+        .write_all(b"SESSION ADD STYLE=STREAM ID=port10b LISTEN_PORT=10\n")
+        .await
+        .unwrap();
+    assert!(read_sam_line(&mut control).await.starts_with("SESSION STATUS RESULT=I2P_ERROR"));
+
+    // accept one stream on each sub-session
+    async fn accept(port: u16, id: &str) -> tokio::net::TcpStream {
+        let mut socket = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("to succeed");
+        socket.write_all(b"HELLO VERSION\n").await.unwrap();
+        assert!(read_sam_line(&mut socket).await.starts_with("HELLO REPLY RESULT=OK"));
+        socket
+            .write_all(format!("STREAM ACCEPT ID={id} SILENT=false\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(read_sam_line(&mut socket).await.starts_with("STREAM STATUS RESULT=OK"));
+        socket
+    }
+    let mut accept_10 = accept(server_port, "port10").await;
+    let mut accept_any = accept(server_port, "any").await;
+
+    // connect to port 10 and to port 11 from another router
+    let mut session = tokio::time::timeout(
+        Duration::from_secs(30),
+        Session::<Stream>::new(SessionOptions {
+            samv3_tcp_port: ports[1],
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("no timeout")
+    .expect("to succeed");
+
+    let mut stream_10 = tokio::time::timeout(
+        Duration::from_secs(60),
+        session.connect_with_options(
+            &destination,
+            StreamOptions {
+                dst_port: 10,
+                src_port: 0,
+            },
+        ),
+    )
+    .await
+    .expect("no timeout")
+    .expect("to succeed");
+    stream_10.write_all(b"to port 10\n").await.unwrap();
+
+    let mut stream_11 = tokio::time::timeout(
+        Duration::from_secs(60),
+        session.connect_with_options(
+            &destination,
+            StreamOptions {
+                dst_port: 11,
+                src_port: 0,
+            },
+        ),
+    )
+    .await
+    .expect("no timeout")
+    .expect("to succeed");
+    stream_11.write_all(b"to port 11\n").await.unwrap();
+
+    // each accept socket first receives the peer's destination and then the stream data
+    for (socket, expected) in [
+        (&mut accept_10, "to port 10"),
+        (&mut accept_any, "to port 11"),
+    ] {
+        let peer = tokio::time::timeout(Duration::from_secs(60), read_sam_line(socket))
+            .await
+            .expect("no timeout");
+        assert!(!peer.is_empty());
+
+        let data = tokio::time::timeout(Duration::from_secs(60), read_sam_line(socket))
+            .await
+            .expect("no timeout");
+        assert_eq!(data, expected);
+    }
+
+    // remove the port 10 sub-session: its stream is closed and new streams to port 10 are
+    // routed to the default sub-session
+    let mut accept_any2 = accept(server_port, "any").await;
+
+    control.write_all(b"SESSION REMOVE ID=port10\n").await.unwrap();
+    assert!(read_sam_line(&mut control).await.starts_with("SESSION STATUS RESULT=OK"));
+    control.write_all(b"SESSION REMOVE ID=port10\n").await.unwrap();
+    assert!(read_sam_line(&mut control)
+        .await
+        .starts_with("SESSION STATUS RESULT=INVALID_ID"));
+
+    let mut buffer = vec![0u8; 64];
+    let nread = tokio::time::timeout(Duration::from_secs(60), stream_10.read(&mut buffer))
+        .await
+        .expect("no timeout")
+        .unwrap_or(0);
+    assert_eq!(
+        nread, 0,
+        "stream of the removed sub-session should be closed"
+    );
+
+    let mut stream_10b = tokio::time::timeout(
+        Duration::from_secs(60),
+        session.connect_with_options(
+            &destination,
+            StreamOptions {
+                dst_port: 10,
+                src_port: 0,
+            },
+        ),
+    )
+    .await
+    .expect("no timeout")
+    .expect("to succeed");
+    stream_10b.write_all(b"to port 10 again\n").await.unwrap();
+
+    let peer = tokio::time::timeout(Duration::from_secs(60), read_sam_line(&mut accept_any2))
+        .await
+        .expect("no timeout");
+    assert!(!peer.is_empty());
+    let data = tokio::time::timeout(Duration::from_secs(60), read_sam_line(&mut accept_any2))
+        .await
+        .expect("no timeout");
+    assert_eq!(data, "to port 10 again");
+
+    drop(control);
 }

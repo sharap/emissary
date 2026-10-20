@@ -220,6 +220,12 @@ pub enum StreamKind {
     Inbound {
         /// Payload of the `SYN` packet, may be empty.
         payload: Vec<u8>,
+
+        /// Local I2CP port, i.e., the port the remote peer opened the stream to.
+        src_port: u16,
+
+        /// I2CP port of the remote peer.
+        dst_port: u16,
     },
 
     /// Stream was pending before a listener was ready to accept it and there may have been data
@@ -234,6 +240,12 @@ pub enum StreamKind {
 
         /// Received packets, if any.
         packets: VecDeque<Vec<u8>>,
+
+        /// Local I2CP port, i.e., the port the remote peer opened the stream to.
+        src_port: u16,
+
+        /// I2CP port of the remote peer.
+        dst_port: u16,
     },
 
     /// Outbound stream.
@@ -594,7 +606,11 @@ impl<R: Runtime> Stream<R> {
 
         let (send_stream_id, initial_message, highest_ack, src_port, dst_port, unacked, rto_timer) =
             match state {
-                StreamKind::Inbound { payload } => {
+                StreamKind::Inbound {
+                    payload,
+                    src_port,
+                    dst_port,
+                } => {
                     let send_stream_id = R::rng().next_u32();
                     let packet = PacketBuilder::new(send_stream_id)
                         .with_send_stream_id(recv_stream_id)
@@ -613,8 +629,8 @@ impl<R: Runtime> Stream<R> {
                             Some(routing_path) => DeliveryStyle::ViaRoute { routing_path },
                         },
                         packet.to_vec(),
-                        0u16,
-                        0u16,
+                        src_port,
+                        dst_port,
                     )) {
                         tracing::warn!(
                             target: LOG_TARGET,
@@ -639,8 +655,8 @@ impl<R: Runtime> Stream<R> {
                             (None, true) => None,
                         },
                         0u32,
-                        0u16, // TODO: correct?
-                        0u16, // TODO: correct?
+                        src_port,
+                        dst_port,
                         BTreeMap::from([(
                             0,
                             PendingPacket {
@@ -656,6 +672,8 @@ impl<R: Runtime> Stream<R> {
                     send_stream_id,
                     seq_nro,
                     packets,
+                    src_port,
+                    dst_port,
                 } => {
                     let combined = packets.into_iter().fold(Vec::new(), |mut message, packet| {
                         message.extend_from_slice(&packet);
@@ -684,8 +702,8 @@ impl<R: Runtime> Stream<R> {
                             }
                         },
                         seq_nro,
-                        0u16, // TODO: correct?
-                        0u16, // TODO: correct?
+                        src_port,
+                        dst_port,
                         BTreeMap::new(),
                         None,
                     )
@@ -1567,7 +1585,11 @@ mod tests {
                         signing_key,
                     },
                     Default::default(),
-                    StreamKind::Inbound { payload: vec![] },
+                    StreamKind::Inbound {
+                        payload: vec![],
+                        src_port: 0,
+                        dst_port: 0,
+                    },
                     handle,
                 ),
                 Self {
@@ -1696,7 +1718,11 @@ mod tests {
                             signing_key: inbound_signing_key,
                         },
                         Default::default(),
-                        StreamKind::Inbound { payload: vec![] },
+                        StreamKind::Inbound {
+                            payload: vec![],
+                            src_port: 0,
+                            dst_port: 0,
+                        },
                         inbound_path_handle,
                     ),
                     Self {

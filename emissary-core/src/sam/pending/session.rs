@@ -25,6 +25,7 @@ use crate::{
     runtime::{AddressBook, Runtime},
     sam::{
         parser::{DestinationContext, SessionKind},
+        protocol::datagram::ForwardedDatagram,
         socket::SamSocket,
         types::{SamSessionCommand, SamSessionCommandRecycle},
         SubSessionCommand,
@@ -36,7 +37,7 @@ use futures::{future::BoxFuture, StreamExt};
 use hashbrown::{HashMap, HashSet};
 use thingbuf::mpsc::{Receiver, Sender};
 
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc};
 use core::time::Duration;
 
 /// Logging target for the file.
@@ -51,7 +52,7 @@ pub struct SamSessionContext<R: Runtime> {
     pub address_book: Option<Arc<dyn AddressBook>>,
 
     /// TX channel which can be used to send datagrams to clients.
-    pub datagram_tx: Sender<(u16, Vec<u8>)>,
+    pub datagram_tx: Sender<ForwardedDatagram>,
 
     /// Destination context.
     pub destination: DestinationContext,
@@ -103,7 +104,7 @@ pub struct PendingSamSession<R: Runtime> {
     address_book: Option<Arc<dyn AddressBook>>,
 
     /// TX channel which can be used to send datagrams to clients.
-    datagram_tx: Sender<(u16, Vec<u8>)>,
+    datagram_tx: Sender<ForwardedDatagram>,
 
     /// Destination context.
     destination: DestinationContext,
@@ -156,7 +157,7 @@ impl<R: Runtime> PendingSamSession<R> {
         session_kind: SessionKind,
         options: HashMap<String, String>,
         receiver: Receiver<SamSessionCommand<R>, SamSessionCommandRecycle>,
-        datagram_tx: Sender<(u16, Vec<u8>)>,
+        datagram_tx: Sender<ForwardedDatagram>,
         tunnel_pool_future: BoxFuture<'static, TunnelPoolHandle>,
         netdb_handle: NetDbHandle,
         address_book: Option<Arc<dyn AddressBook>>,

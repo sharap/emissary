@@ -223,6 +223,9 @@ struct PendingOutboundStream<R: Runtime> {
     /// Destination port.
     dst_port: u16,
 
+    /// Listen port of the (sub-)session which opened the stream.
+    listen_port: u16,
+
     /// Number of `SYN`s sent thus far.
     num_sent: usize,
 
@@ -242,12 +245,24 @@ struct PendingOutboundStream<R: Runtime> {
     src_port: u16,
 }
 
+/// Active stream.
+struct ActiveStream {
+    /// ID of the remote destination.
+    destination_id: DestinationId,
+
+    /// Listen port of the (sub-)session the stream belongs to.
+    listen_port: u16,
+
+    /// TX channel for sending [`StreamEvent`]s to the stream.
+    tx: Sender<StreamEvent>,
+}
+
 /// I2P virtual stream manager.
 pub struct StreamManager<R: Runtime> {
-    /// TX channels for sending [`Packet`]'s to active streams.
+    /// Active streams.
     ///
     /// Indexed with receive stream ID.
-    active: HashMap<u32, (DestinationId, Sender<StreamEvent>)>,
+    active: HashMap<u32, ActiveStream>,
 
     /// Destination of the session the stream manager is bound to.
     destination: Destination,
@@ -261,8 +276,11 @@ pub struct StreamManager<R: Runtime> {
     /// Destination ID -> stream ID mappings.
     destination_streams: HashMap<DestinationId, HashSet<u32>>,
 
-    /// Stream listener.
-    listener: StreamListener<R>,
+    /// Stream listeners, indexed by the listen port of the (sub-)session which registered them.
+    ///
+    /// Inbound streams are routed to the listener whose port matches the destination port of the
+    /// stream, falling back to the listener with the wildcard port `0`.
+    listeners: HashMap<u16, StreamListener<R>>,
 
     /// RX channel for receiving [`Packet`]s from active streams.
     outbound_rx: Receiver<(DeliveryStyle, Vec<u8>, u16, u16)>,
@@ -308,7 +326,7 @@ impl<R: Runtime> StreamManager<R> {
             destination,
             destination_id: destination_id.clone(),
             destination_streams: HashMap::new(),
-            listener: StreamListener::new(destination_id),
+            listeners: HashMap::new(),
             offline_signature: None,
             outbound_rx,
             outbound_timers: R::join_set(),
@@ -436,6 +454,7 @@ impl<R: Runtime> StreamManager<R> {
             dst_port,
             src_port,
             routing_path_handle,
+            listen_port,
             ..
         }) = self.pending_outbound.remove(&send_stream_id)
         {
@@ -463,6 +482,7 @@ impl<R: Runtime> StreamManager<R> {
                     src_port,
                     payload: payload.to_vec(),
                 },
+                listen_port,
             );
 
             return Ok(());
@@ -506,7 +526,7 @@ impl<R: Runtime> StreamManager<R> {
             return Err(StreamingError::TooManyStreams);
         }
 
-        if self.listener.is_empty() && self.pending_inbound.len() >= MAX_PENDING_INBOUND_STREAMS {
+        if !self.has_listener() && self.pending_inbound.len() >= MAX_PENDING_INBOUND_STREAMS {
             tracing::warn!(
                 target: LOG_TARGET,
                 local = %self.destination_id,
@@ -531,15 +551,18 @@ impl<R: Runtime> StreamManager<R> {
         // attempt to acquire a socket from `StreamListener`
         //
         // if no listener exists, the stream is marked as pending
-        match self.listener.pop_socket() {
-            Some(socket) => self.spawn_stream(
+        match self.pop_socket(dst_port) {
+            Some((listen_port, socket)) => self.spawn_stream(
                 socket,
                 recv_stream_id,
                 destination.id(),
                 Some(destination.clone()),
                 StreamKind::Inbound {
                     payload: payload.to_vec(),
+                    src_port: dst_port,
+                    dst_port: src_port,
                 },
+                listen_port,
             ),
             None => {
                 tracing::info!(
@@ -561,6 +584,8 @@ impl<R: Runtime> StreamManager<R> {
                     payload.to_vec(),
                     &self.signing_key,
                     self.offline_signature.as_deref(),
+                    src_port,
+                    dst_port,
                 );
 
                 let _ = self.outbound_tx.try_send((
@@ -597,6 +622,7 @@ impl<R: Runtime> StreamManager<R> {
         destination_id: DestinationId,
         destination: Option<Destination>,
         stream_kind: StreamKind,
+        listen_port: u16,
     ) {
         // create context for the stream
         //
@@ -636,7 +662,14 @@ impl<R: Runtime> StreamManager<R> {
         //
         // `StreamManager` sends all inbound messages with `recv_stream_id` to this stream and all
         // outbound messages from the stream to remote peer are send through `event_tx`
-        self.active.insert(recv_stream_id, (destination_id.clone(), tx));
+        self.active.insert(
+            recv_stream_id,
+            ActiveStream {
+                destination_id: destination_id.clone(),
+                listen_port,
+                tx,
+            },
+        );
         self.destination_streams
             .entry(destination_id.clone())
             .or_default()
@@ -763,25 +796,27 @@ impl<R: Runtime> StreamManager<R> {
             "listener ready",
         );
 
-        // loop through all pending streams until either:
-        //  a) there are no more pending streams
-        //  b) there are no more available listeners
-        loop {
-            let Some(stream_id) = self.pending_inbound.keys().next().copied() else {
-                return;
+        // go through all pending streams and start those for which a listener is available
+        let pending = self
+            .pending_inbound
+            .iter()
+            .map(|(stream_id, stream)| (*stream_id, stream.dst_port))
+            .collect::<Vec<_>>();
+
+        for (stream_id, dst_port) in pending {
+            let Some((listen_port, socket)) = self.pop_socket(dst_port) else {
+                continue;
             };
 
-            let Some(socket) = self.listener.pop_socket() else {
-                return;
-            };
-
-            // stream must exist since it was checked earlier that it's in the map
+            // stream must exist since it was just fetched from the map
             let PendingStream {
                 remote_destination,
                 destination_id,
                 send_stream_id,
                 packets,
                 seq_nro,
+                src_port,
+                dst_port,
                 ..
             } = self.pending_inbound.remove(&stream_id).expect("to exist");
 
@@ -795,8 +830,73 @@ impl<R: Runtime> StreamManager<R> {
                     send_stream_id,
                     seq_nro,
                     packets,
+                    src_port: dst_port,
+                    dst_port: src_port,
                 },
+                listen_port,
             );
+        }
+    }
+
+    /// Is there any listener which could accept an inbound stream.
+    fn has_listener(&self) -> bool {
+        self.listeners.values().any(|listener| !listener.is_empty())
+    }
+
+    /// Attempt to acquire a socket for an inbound stream opened to `dst_port`.
+    ///
+    /// The listener registered for `dst_port` is tried first and the listener registered for the
+    /// wildcard port `0` second. Returns the listen port of the listener and the socket.
+    fn pop_socket(&mut self, dst_port: u16) -> Option<(u16, SocketKind<R>)> {
+        for listen_port in [dst_port, 0u16] {
+            if let Some(socket) =
+                self.listeners.get_mut(&listen_port).and_then(|listener| listener.pop_socket())
+            {
+                return Some((listen_port, socket));
+            }
+        }
+
+        None
+    }
+
+    /// Remove the listener and close all streams of the (sub-)session with `listen_port`.
+    ///
+    /// Active streams are asked to shut down which causes them to send `CLOSE` to the remote peer
+    /// and pending outbound streams are destroyed.
+    pub fn remove_sub_session(&mut self, listen_port: u16) {
+        let num_streams =
+            self.active.values().filter(|stream| stream.listen_port == listen_port).count();
+
+        tracing::debug!(
+            target: LOG_TARGET,
+            local = %self.destination_id,
+            ?listen_port,
+            ?num_streams,
+            "remove sub-session",
+        );
+
+        self.listeners.remove(&listen_port);
+        self.active
+            .values()
+            .filter(|stream| stream.listen_port == listen_port)
+            .for_each(|stream| {
+                let _ = stream.tx.try_send(StreamEvent::ShutDown);
+            });
+
+        let pending = self
+            .pending_outbound
+            .iter()
+            .filter_map(|(stream_id, stream)| {
+                (stream.listen_port == listen_port).then_some(*stream_id)
+            })
+            .collect::<Vec<_>>();
+
+        for stream_id in pending {
+            if let Some(stream) = self.pending_outbound.remove(&stream_id) {
+                if let Some(streams) = self.destination_streams.get_mut(&stream.destination_id) {
+                    streams.remove(&stream_id);
+                }
+            }
         }
     }
 
@@ -814,8 +914,21 @@ impl<R: Runtime> StreamManager<R> {
     /// [`StreamListener::register_listener()`] returns `Ok(true)` to indicate that
     /// [`StreamManager`] can accept a pending inbound stream using the registered listener,
     /// if a pending stream exists.
-    pub fn register_listener(&mut self, kind: ListenerKind<R>) -> Result<(), StreamingError> {
-        if self.listener.register_listener(kind)? {
+    ///
+    /// `listen_port` is the listen port of the (sub-)session registering the listener: inbound
+    /// streams opened to that port are routed to the listener. `0` accepts streams opened to any
+    /// port which no other listener claims.
+    pub fn register_listener(
+        &mut self,
+        kind: ListenerKind<R>,
+        listen_port: u16,
+    ) -> Result<(), StreamingError> {
+        let listener = self
+            .listeners
+            .entry(listen_port)
+            .or_insert_with(|| StreamListener::new(self.destination_id.clone()));
+
+        if listener.register_listener(kind)? {
             self.on_listener_ready();
         }
 
@@ -845,7 +958,7 @@ impl<R: Runtime> StreamManager<R> {
         );
 
         // forward received packet to an active handler if it exists
-        if let Some((_, tx)) = self.active.get(&packet.recv_stream_id()) {
+        if let Some(ActiveStream { tx, .. }) = self.active.get(&packet.recv_stream_id()) {
             if let Err(error) = tx.try_send(StreamEvent::Packet { packet: payload }) {
                 tracing::debug!(
                     target: LOG_TARGET,
@@ -963,12 +1076,15 @@ impl<R: Runtime> StreamManager<R> {
     ///
     /// Returns the initial packet and the selected receive stream ID which the caller
     /// can use to remove the pending stream if the session is rejected at a lower layer.
+    ///
+    /// `listen_port` is the listen port of the (sub-)session which opens the stream.
     pub fn create_stream(
         &mut self,
         destination_id: DestinationId,
         mut routing_path_handle: RoutingPathHandle<R>,
         socket: Box<SamSocket<R>>,
         options: HashMap<String, String>,
+        listen_port: u16,
     ) -> (u32, BytesMut, DeliveryStyle, u16, u16) {
         let silent = options
             .get("SILENT")
@@ -1028,6 +1144,7 @@ impl<R: Runtime> StreamManager<R> {
             PendingOutboundStream {
                 destination_id: destination_id.clone(),
                 dst_port,
+                listen_port,
                 num_sent: 1usize,
                 packet: packet.clone().to_vec(),
                 routing_path_handle,
@@ -1084,7 +1201,7 @@ impl<R: Runtime> StreamManager<R> {
             "shut down stream manager",
         );
 
-        self.active.values().for_each(|(_, tx)| {
+        self.active.values().for_each(|ActiveStream { tx, .. }| {
             if let Err(error) = tx.try_send(StreamEvent::ShutDown) {
                 tracing::error!(
                     target: LOG_TARGET,
@@ -1162,7 +1279,8 @@ impl<R: Runtime> futures::Stream for StreamManager<R> {
 
                     // active stream may not exist if it was removed by calling
                     // `StreamManager::remove_session()`
-                    let Some((destination_id, _)) = self.active.remove(&stream_id) else {
+                    let Some(ActiveStream { destination_id, .. }) = self.active.remove(&stream_id)
+                    else {
                         tracing::debug!(
                             target: LOG_TARGET,
                             local = %self.destination_id,
@@ -1189,11 +1307,21 @@ impl<R: Runtime> futures::Stream for StreamManager<R> {
         }
 
         loop {
-            match self.listener.poll_next_unpin(cx) {
-                Poll::Pending => break,
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Ready(Some(StreamListenerEvent::ListenerReady)) => self.on_listener_ready(),
+            let mut ready = false;
+
+            for listener in self.listeners.values_mut() {
+                while let Poll::Ready(Some(StreamListenerEvent::ListenerReady)) =
+                    listener.poll_next_unpin(cx)
+                {
+                    ready = true;
+                }
             }
+
+            if !ready {
+                break;
+            }
+
+            self.on_listener_ready();
         }
 
         loop {
@@ -1381,11 +1509,14 @@ mod tests {
         let mut manager = StreamManager::<MockRuntime>::new(destination, signing_key);
 
         assert!(manager
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: false,
-                pending_routing_path_handle: PendingRoutingPathHandle::create(),
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: false,
+                    pending_routing_path_handle: PendingRoutingPathHandle::create(),
+                },
+                0,
+            )
             .is_ok());
     }
 
@@ -1575,11 +1706,14 @@ mod tests {
         let socket = Box::new(SamSocket::<MockRuntime>::new(stream2.unwrap()));
 
         assert!(manager
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: true,
-                pending_routing_path_handle: PendingRoutingPathHandle::create(),
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: true,
+                    pending_routing_path_handle: PendingRoutingPathHandle::create(),
+                },
+                0,
+            )
             .is_ok());
         assert!(manager.pending_inbound.is_empty());
 
@@ -1665,11 +1799,14 @@ mod tests {
         tokio::spawn(async move { while routing_path_manager.next().await.is_some() {} });
 
         assert!(manager
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: false,
-                pending_routing_path_handle,
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: false,
+                    pending_routing_path_handle,
+                },
+                0,
+            )
             .is_ok());
         assert!(!manager.pending_inbound.is_empty());
 
@@ -1768,12 +1905,15 @@ mod tests {
         tokio::spawn(async move { while routing_path_manager.next().await.is_some() {} });
 
         assert!(manager
-            .register_listener(ListenerKind::Persistent {
-                socket,
-                port,
-                silent: false,
-                pending_routing_path_handle,
-            })
+            .register_listener(
+                ListenerKind::Persistent {
+                    socket,
+                    address: format!("127.0.0.1:{port}").parse().unwrap(),
+                    silent: false,
+                    pending_routing_path_handle,
+                },
+                0,
+            )
             .is_ok());
         assert!(!manager.pending_inbound.is_empty());
 
@@ -1958,11 +2098,14 @@ mod tests {
         tokio::spawn(async move { while let Some(_) = path_manager.next().await {} });
 
         assert!(manager
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: true,
-                pending_routing_path_handle: pending_handle,
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: true,
+                    pending_routing_path_handle: pending_handle,
+                },
+                0,
+            )
             .is_ok());
         assert!(manager.pending_inbound.is_empty());
 
@@ -2022,11 +2165,14 @@ mod tests {
         // register listener for `manager1`
         let (socket, _) = socket_factory.socket().await;
         assert!(manager1
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: true,
-                pending_routing_path_handle: pending_handle,
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: true,
+                    pending_routing_path_handle: pending_handle,
+                },
+                0,
+            )
             .is_ok());
 
         // create new oubound stream to `manager1`
@@ -2036,6 +2182,7 @@ mod tests {
             handle,
             socket,
             HashMap::new(),
+            0,
         );
 
         assert!(manager1
@@ -2116,6 +2263,7 @@ mod tests {
             path_manager.handle(remote.clone()),
             socket,
             HashMap::new(),
+            0,
         );
 
         // verify the syn packet is sent 4 more times
@@ -2190,11 +2338,14 @@ mod tests {
         // register listener for `manager1`
         let (socket, mut client_socket) = socket_factory.socket().await;
         assert!(manager
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: true,
-                pending_routing_path_handle: pending_handle,
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: true,
+                    pending_routing_path_handle: pending_handle,
+                },
+                0,
+            )
             .is_ok());
 
         // handle syn packet and spawn manager in the background
@@ -2256,11 +2407,14 @@ mod tests {
         // register listener for `manager1`
         let (socket, client_socket) = socket_factory.socket().await;
         assert!(manager
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: false,
-                pending_routing_path_handle: pending_handle,
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: false,
+                    pending_routing_path_handle: pending_handle,
+                },
+                0,
+            )
             .is_ok());
 
         // handle syn packet and spawn manager in the background
@@ -2339,11 +2493,14 @@ mod tests {
         // register listener for `manager1`
         let (socket, client_socket) = socket_factory.socket().await;
         assert!(manager
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: false,
-                pending_routing_path_handle: pending_handle,
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: false,
+                    pending_routing_path_handle: pending_handle,
+                },
+                0,
+            )
             .is_ok());
 
         tokio::spawn(async move { while let Some(_) = manager.next().await {} });
@@ -2411,11 +2568,14 @@ mod tests {
         // register listener for `manager1`
         let (socket, client_socket) = socket_factory.socket().await;
         assert!(manager
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: true,
-                pending_routing_path_handle: pending_handle,
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: true,
+                    pending_routing_path_handle: pending_handle,
+                },
+                0,
+            )
             .is_ok());
 
         tokio::spawn(async move { while let Some(_) = manager.next().await {} });
@@ -2475,11 +2635,14 @@ mod tests {
         // register listener for `manager1`
         let (socket, mut listener_stream) = socket_factory.socket().await;
         assert!(manager1
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: true,
-                pending_routing_path_handle: pending_handle,
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: true,
+                    pending_routing_path_handle: pending_handle,
+                },
+                0,
+            )
             .is_ok());
 
         // create new oubound stream to `manager1`
@@ -2489,6 +2652,7 @@ mod tests {
             handle,
             socket,
             HashMap::new(),
+            0,
         );
 
         assert!(manager1
@@ -2860,11 +3024,14 @@ mod tests {
         // register listener for `manager1`
         let (socket, _) = socket_factory.socket().await;
         assert!(manager1
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: true,
-                pending_routing_path_handle: PendingRoutingPathHandle::create(),
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: true,
+                    pending_routing_path_handle: PendingRoutingPathHandle::create(),
+                },
+                0,
+            )
             .is_ok());
 
         let mut path_manager = RoutingPathManager::<MockRuntime>::new(
@@ -2880,6 +3047,7 @@ mod tests {
             path_manager.handle(manager1.destination_id.clone()),
             socket,
             HashMap::new(),
+            0,
         );
 
         // verify there's one outbound timer active
@@ -2950,11 +3118,14 @@ mod tests {
         // register listener for `manager1`
         let (socket, _) = socket_factory.socket().await;
         assert!(manager1
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: true,
-                pending_routing_path_handle: pending_handle,
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: true,
+                    pending_routing_path_handle: pending_handle,
+                },
+                0,
+            )
             .is_ok());
 
         // create new oubound stream to `manager1`
@@ -2967,6 +3138,7 @@ mod tests {
                 (String::from("FROM_PORT"), String::from("1337")),
                 (String::from("TO_PORT"), String::from("1338")),
             ]),
+            0,
         );
         assert_eq!(src_port, 1337);
         assert_eq!(dst_port, 1338);
@@ -3058,6 +3230,7 @@ mod tests {
             path_manager.handle(remote.clone()),
             socket,
             HashMap::new(),
+            0,
         );
 
         match delivery_style {
@@ -3176,11 +3349,14 @@ mod tests {
         // register listener for `manager1`
         let (socket, _) = socket_factory.socket().await;
         assert!(manager1
-            .register_listener(ListenerKind::Ephemeral {
-                socket,
-                silent: true,
-                pending_routing_path_handle: pending_handle,
-            })
+            .register_listener(
+                ListenerKind::Ephemeral {
+                    socket,
+                    silent: true,
+                    pending_routing_path_handle: pending_handle,
+                },
+                0,
+            )
             .is_ok());
 
         // create new oubound stream to `manager1`
@@ -3191,6 +3367,7 @@ mod tests {
             handle,
             socket,
             HashMap::new(),
+            0,
         );
 
         assert!(manager1
@@ -3272,6 +3449,7 @@ mod tests {
             path_manager.handle(remote.clone()),
             socket,
             HashMap::new(),
+            0,
         );
 
         // verify that stream rejection is emitted
@@ -3450,5 +3628,228 @@ mod tests {
             }
             _ => panic!("unexpected event"),
         }
+    }
+
+    /// Name of `event`, for assertion messages.
+    fn event_name(event: &Option<StreamManagerEvent>) -> &'static str {
+        match event {
+            None => "none",
+            Some(StreamManagerEvent::StreamOpened { .. }) => "stream opened",
+            Some(StreamManagerEvent::StreamClosed { .. }) => "stream closed",
+            Some(StreamManagerEvent::StreamRejected { .. }) => "stream rejected",
+            Some(StreamManagerEvent::SendPacket { .. }) => "send packet",
+            Some(StreamManagerEvent::ShutDown) => "shut down",
+        }
+    }
+
+    /// Create a signed `SYN` from a fresh remote destination to `destination_id`.
+    fn make_remote_syn(destination_id: &DestinationId, stream_id: u32) -> (Vec<u8>, DestinationId) {
+        let signing_key = SigningPrivateKey::random(MockRuntime::rng());
+        let destination = Destination::new::<MockRuntime>(signing_key.public());
+        let remote_destination_id = destination.id();
+
+        (
+            PacketBuilder::new(stream_id)
+                .with_synchronize()
+                .with_send_stream_id(0u32)
+                .with_replay_protection(destination_id)
+                .with_from_included(&destination)
+                .with_signature()
+                .build_and_sign(&signing_key)
+                .to_vec(),
+            remote_destination_id,
+        )
+    }
+
+    /// Create a silent ephemeral listener, returning the listener kind and the client's socket.
+    async fn silent_listener(
+        pending_routing_path_handle: PendingRoutingPathHandle,
+    ) -> (ListenerKind<MockRuntime>, tokio::net::TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stream1, stream2) = tokio::join!(listener.accept(), MockTcpStream::connect(address));
+        let (client, _) = stream1.unwrap();
+
+        (
+            ListenerKind::Ephemeral {
+                socket: Box::new(SamSocket::<MockRuntime>::new(stream2.unwrap())),
+                silent: true,
+                pending_routing_path_handle,
+            },
+            client,
+        )
+    }
+
+    #[tokio::test]
+    async fn inbound_streams_routed_by_listen_port() {
+        let signing_key = SigningPrivateKey::from_bytes(&[0u8; 32]).unwrap();
+        let destination = Destination::new::<MockRuntime>(signing_key.public());
+        let destination_id = destination.id();
+        let mut manager = StreamManager::<MockRuntime>::new(destination, signing_key);
+
+        // routing paths for the inbound streams
+        let mut path_manager = RoutingPathManager::<MockRuntime>::new(
+            destination_id.clone(),
+            vec![TunnelId::random()],
+        );
+        let (syn_10, remote_10) = make_remote_syn(&destination_id, 1u32);
+        let (syn_11, remote_11) = make_remote_syn(&destination_id, 2u32);
+        let (syn_10b, remote_10b) = make_remote_syn(&destination_id, 3u32);
+        for remote in [&remote_10, &remote_11, &remote_10b] {
+            path_manager.register_leases(remote, Ok(vec![Lease::random()]));
+        }
+        let handles = (0..4).map(|_| path_manager.pending_handle()).collect::<Vec<_>>();
+        tokio::spawn(async move { while path_manager.next().await.is_some() {} });
+
+        // listeners for port 10 and for any port
+        let (listener, client_10) = silent_listener(handles[0].clone()).await;
+        assert!(manager.register_listener(listener, 10).is_ok());
+        let (listener, mut client_any) = silent_listener(handles[1].clone()).await;
+        assert!(manager.register_listener(listener, 0).is_ok());
+        assert!(manager.has_listener());
+
+        // stream to port 10 is accepted by the port 10 listener
+        let syn = syn_10;
+        manager
+            .on_packet(I2cpPayload {
+                src_port: 13u16,
+                dst_port: 10u16,
+                protocol: Protocol::Streaming,
+                payload: syn,
+            })
+            .unwrap();
+        assert!(manager.pending_inbound.is_empty());
+        assert_eq!(
+            manager.active.get(&1u32).map(|stream| stream.listen_port),
+            Some(10)
+        );
+        assert!(std::matches!(
+            manager.next().await,
+            Some(StreamManagerEvent::StreamOpened { .. })
+        ));
+
+        // the syn-ack is sent from port 10 to the remote's port
+        let local_stream_id = match tokio::time::timeout(Duration::from_secs(5), manager.next())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            StreamManagerEvent::SendPacket {
+                delivery_style,
+                src_port,
+                dst_port,
+                packet,
+            } => {
+                assert_eq!(delivery_style.destination_id(), &remote_10);
+                assert_eq!((src_port, dst_port), (10u16, 13u16));
+
+                let packet = Packet::parse::<MockRuntime>(&packet).unwrap();
+                assert!(packet.flags.synchronize());
+                assert_eq!(packet.send_stream_id, 1u32);
+                packet.recv_stream_id
+            }
+            event => panic!("invalid event: {}", event_name(&Some(event))),
+        };
+
+        // the remote acks the syn-ack so the stream is established
+        manager
+            .on_packet(I2cpPayload {
+                src_port: 13u16,
+                dst_port: 10u16,
+                protocol: Protocol::Streaming,
+                payload: PacketBuilder::new(1u32)
+                    .with_send_stream_id(local_stream_id)
+                    .with_seq_nro(0u32)
+                    .with_ack_through(0u32)
+                    .build()
+                    .to_vec(),
+            })
+            .unwrap();
+
+        // stream to port 11 is accepted by the wildcard listener
+        let syn = syn_11;
+        manager
+            .on_packet(I2cpPayload {
+                src_port: 14u16,
+                dst_port: 11u16,
+                protocol: Protocol::Streaming,
+                payload: syn,
+            })
+            .unwrap();
+        assert!(manager.pending_inbound.is_empty());
+        assert_eq!(
+            manager.active.get(&2u32).map(|stream| stream.listen_port),
+            Some(0)
+        );
+        assert!(!manager.has_listener());
+
+        // another stream to port 10 is pending since both listeners are consumed
+        let syn = syn_10b;
+        manager
+            .on_packet(I2cpPayload {
+                src_port: 15u16,
+                dst_port: 10u16,
+                protocol: Protocol::Streaming,
+                payload: syn,
+            })
+            .unwrap();
+        assert_eq!(manager.pending_inbound.len(), 1);
+        assert_eq!(
+            manager.pending_inbound.get(&3u32).map(|stream| stream.dst_port),
+            Some(10)
+        );
+
+        // a listener for port 12 doesn't accept it, a listener for port 10 does
+        let (listener, _client_12) = silent_listener(handles[2].clone()).await;
+        assert!(manager.register_listener(listener, 12).is_ok());
+        assert_eq!(manager.pending_inbound.len(), 1);
+
+        let (listener, _client_10b) = silent_listener(handles[3].clone()).await;
+        assert!(manager.register_listener(listener, 10).is_ok());
+        assert!(manager.pending_inbound.is_empty());
+        assert_eq!(
+            manager.active.get(&3u32).map(|stream| stream.listen_port),
+            Some(10)
+        );
+
+        // removing the port 10 sub-session drops its listener and asks its streams to shut down
+        // which makes them send `CLOSE` to the remote peers
+        manager.remove_sub_session(10);
+        assert!(!manager.listeners.contains_key(&10));
+        assert!(manager.listeners.contains_key(&0));
+
+        let mut closed = HashSet::<DestinationId>::new();
+        let collect = tokio::time::timeout(Duration::from_secs(10), async {
+            while closed.len() < 2 {
+                match manager.next().await {
+                    Some(StreamManagerEvent::SendPacket {
+                        delivery_style,
+                        packet,
+                        src_port,
+                        ..
+                    }) =>
+                        if Packet::parse::<MockRuntime>(&packet).unwrap().flags.close() {
+                            assert_eq!(src_port, 10u16);
+                            closed.insert(delivery_style.destination_id().clone());
+                        },
+                    Some(StreamManagerEvent::StreamClosed { destination_id }) => {
+                        closed.insert(destination_id);
+                    }
+                    Some(_) => {}
+                    None => panic!("manager exited"),
+                }
+            }
+        });
+        collect.await.expect("streams closed");
+        assert_eq!(closed, HashSet::from_iter([remote_10, remote_10b]));
+
+        // the stream of the wildcard sub-session stays open
+        let mut buffer = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), client_any.read(&mut buffer))
+                .await
+                .is_err()
+        );
+        drop(client_10);
     }
 }

@@ -41,7 +41,7 @@ use crate::{
         socket::SamSocket,
         types::{
             PendingSession, PendingSessionState, PublicKeyContext, SamSessionCommand,
-            SamSessionCommandRecycle, SamSessionKind,
+            SamSessionCommandRecycle, SamSessionKind, SubSession,
         },
         SubSessionCommand,
     },
@@ -62,6 +62,7 @@ use alloc::{
 };
 use core::{
     future::Future,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     task::{Context, Poll, Waker},
     time::Duration,
@@ -363,15 +364,28 @@ impl<R: Runtime> SamSession<R> {
             .as_ref()
             .map(|keys| Bytes::copy_from_slice(keys.signature().serialized()));
 
+        let mut datagram_manager =
+            DatagramManager::new(dest.clone(), datagram_tx, *signing_key.clone())
+                .with_offline_signature(offline_signature.clone());
+
+        // datagram sessions forward inbound datagrams to the client's udp socket
+        if core::matches!(
+            session_kind,
+            SessionKind::Datagram | SessionKind::Anonymous | SessionKind::Datagram2
+        ) && datagram_manager
+            .add_listener(Arc::clone(&session_id), session_kind, &options)
+            .is_err()
+        {
+            tracing::warn!(
+                target: LOG_TARGET,
+                %session_id,
+                "invalid datagram forwarding configuration, inbound datagrams are dropped",
+            );
+        }
+
         Self {
             address_book,
-            datagram_manager: DatagramManager::new(
-                dest.clone(),
-                datagram_tx,
-                options.clone(),
-                *signing_key.clone(),
-            )
-            .with_offline_signature(offline_signature.clone()),
+            datagram_manager,
             dest: dest.clone(),
             destination: session_destination,
             public_key_context,
@@ -416,11 +430,12 @@ impl<R: Runtime> SamSession<R> {
         destination_id: DestinationId,
         socket: Box<SamSocket<R>>,
         options: HashMap<String, String>,
+        listen_port: u16,
     ) {
         let handle = self.destination.routing_path_handle(destination_id.clone());
         let (stream_id, packet, delivery_style, src_port, dst_port) = self
             .stream_manager
-            .create_stream(destination_id.clone(), handle, socket, options);
+            .create_stream(destination_id.clone(), handle, socket, options, listen_port);
 
         tracing::trace!(
             target: LOG_TARGET,
@@ -515,6 +530,8 @@ impl<R: Runtime> SamSession<R> {
             debug_assert_eq!(registered, destination_id);
         }
 
+        let listen_port = self.session_kind.listen_port(&session_id);
+
         match self.destination.query_lease_set(&destination_id) {
             LeaseSetStatus::Found => {
                 tracing::trace!(
@@ -524,7 +541,7 @@ impl<R: Runtime> SamSession<R> {
                     "lease set found, create outbound stream",
                 );
 
-                self.create_outbound_stream(destination_id, socket, options);
+                self.create_outbound_stream(destination_id, socket, options, listen_port);
             }
             status @ (LeaseSetStatus::NotFound | LeaseSetStatus::Pending) => {
                 tracing::trace!(
@@ -539,7 +556,11 @@ impl<R: Runtime> SamSession<R> {
                     .entry(destination_id.clone())
                     .or_insert(PendingSession::<R>::new())
                     .streams
-                    .push(PendingSessionState::AwaitingLeaseSet { socket, options });
+                    .push(PendingSessionState::AwaitingLeaseSet {
+                        socket,
+                        options,
+                        listen_port,
+                    });
             }
         }
     }
@@ -566,13 +587,18 @@ impl<R: Runtime> SamSession<R> {
             return drop(socket);
         };
 
-        if let Err(error) = self.stream_manager.register_listener(ListenerKind::Ephemeral {
-            pending_routing_path_handle: self.destination.pending_routing_path_handle(),
-            socket,
-            silent: options
-                .get("SILENT")
-                .is_some_and(|value| value.parse::<bool>().unwrap_or(false)),
-        }) {
+        let listen_port = self.session_kind.listen_port(&session_id);
+
+        if let Err(error) = self.stream_manager.register_listener(
+            ListenerKind::Ephemeral {
+                pending_routing_path_handle: self.destination.pending_routing_path_handle(),
+                socket,
+                silent: options
+                    .get("SILENT")
+                    .is_some_and(|value| value.parse::<bool>().unwrap_or(false)),
+            },
+            listen_port,
+        ) {
             tracing::warn!(
                 target: LOG_TARGET,
                 ?error,
@@ -605,14 +631,46 @@ impl<R: Runtime> SamSession<R> {
             return drop(socket);
         };
 
-        if let Err(error) = self.stream_manager.register_listener(ListenerKind::Persistent {
-            pending_routing_path_handle: self.destination.pending_routing_path_handle(),
-            socket,
-            port,
-            silent: options
-                .get("SILENT")
-                .is_some_and(|value| value.parse::<bool>().unwrap_or(false)),
-        }) {
+        // streams are forwarded to `HOST`:`PORT`, `HOST` defaults to localhost
+        let host = match options.get("HOST") {
+            None => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Some(host) => match host.parse::<IpAddr>() {
+                Ok(host) => host,
+                Err(error) => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        session_id = %self.session_id,
+                        %host,
+                        ?error,
+                        "invalid `HOST` for `STREAM FORWARD`, must be an ip address",
+                    );
+
+                    let mut socket = socket;
+                    R::spawn(async move {
+                        let _ = socket
+                            .send_message_blocking(
+                                b"STREAM STATUS RESULT=I2P_ERROR MESSAGE=\"invalid host\"\n"
+                                    .to_vec(),
+                            )
+                            .await;
+                    });
+                    return;
+                }
+            },
+        };
+        let listen_port = self.session_kind.listen_port(&session_id);
+
+        if let Err(error) = self.stream_manager.register_listener(
+            ListenerKind::Persistent {
+                pending_routing_path_handle: self.destination.pending_routing_path_handle(),
+                socket,
+                address: SocketAddr::new(host, port),
+                silent: options
+                    .get("SILENT")
+                    .is_some_and(|value| value.parse::<bool>().unwrap_or(false)),
+            },
+            listen_port,
+        ) {
             tracing::warn!(
                 target: LOG_TARGET,
                 ?error,
@@ -759,8 +817,17 @@ impl<R: Runtime> SamSession<R> {
             self.pending_outbound.remove(&destination_id)
         {
             streams.into_iter().for_each(|state| match state {
-                PendingSessionState::AwaitingLeaseSet { socket, options } => {
-                    self.create_outbound_stream(destination_id.clone(), socket, options);
+                PendingSessionState::AwaitingLeaseSet {
+                    socket,
+                    options,
+                    listen_port,
+                } => {
+                    self.create_outbound_stream(
+                        destination_id.clone(),
+                        socket,
+                        options,
+                        listen_port,
+                    );
                 }
                 PendingSessionState::AwaitingSession { .. } => {
                     // new stream was opened but by the the time the initial `SYN` packet was sent,
@@ -1202,6 +1269,81 @@ impl<R: Runtime> SamSession<R> {
             return b"SESSION STATUS RESULT=DUPLICATE_ID\n".to_vec();
         }
 
+        // inbound traffic is routed to sub-sessions by its local port, `LISTEN_PORT` which
+        // defaults to `FROM_PORT`
+        //
+        // https://geti2p.net/en/docs/api/samv3#primary-sessions
+        let listen_port = match options
+            .get("LISTEN_PORT")
+            .or_else(|| options.get("FROM_PORT"))
+            .map_or(Ok(0u16), |port| port.parse::<u16>())
+        {
+            Ok(listen_port) => listen_port,
+            Err(error) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    session_id = %self.session_id,
+                    sub_session_id = %session_id,
+                    ?error,
+                    "invalid listen port for sub-session",
+                );
+
+                return b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"invalid listen port\"\n"
+                    .to_vec();
+            }
+        };
+
+        match session_kind {
+            SessionKind::Stream => {
+                // inbound streams are routed by port alone, two stream sub-sessions cannot share
+                // a listen port
+                if sub_sessions.values().any(|sub_session| {
+                    core::matches!(sub_session.kind, SessionKind::Stream)
+                        && sub_session.listen_port == listen_port
+                }) {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        session_id = %self.session_id,
+                        sub_session_id = %session_id,
+                        ?listen_port,
+                        "stream sub-session with the same listen port already exists",
+                    );
+
+                    return b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"duplicate listen port\"\n"
+                        .to_vec();
+                }
+            }
+            SessionKind::Datagram | SessionKind::Anonymous | SessionKind::Datagram2 => {
+                // repliable datagram1 datagrams cannot carry an offline signature
+                if self.offline_keys.is_some()
+                    && core::matches!(session_kind, SessionKind::Datagram)
+                {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        session_id = %self.session_id,
+                        sub_session_id = %session_id,
+                        "offline keys are not supported for `STYLE=DATAGRAM` sub-sessions",
+                    );
+
+                    return b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"offline keys not supported for datagram sessions\"\n".to_vec();
+                }
+
+                // inbound datagrams are routed to the sub-session's udp socket by the datagram
+                // manager
+                if self
+                    .datagram_manager
+                    .add_listener(Arc::clone(&session_id), session_kind, &options)
+                    .is_err()
+                {
+                    return b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"invalid datagram configuration\"\n".to_vec();
+                }
+            }
+            SessionKind::Primary => {
+                return b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"invalid sub-session style\"\n"
+                    .to_vec();
+            }
+        }
+
         // `sub_session_tx` must exist since the session kind is `Primary`
         if let Err(error) =
             self.sub_session_tx
@@ -1219,30 +1361,9 @@ impl<R: Runtime> SamSession<R> {
                 ?error,
                 "failed register sub-session to sam server",
             );
+            self.datagram_manager.remove_listener(&session_id);
 
             return b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"internal error\"\n".to_vec();
-        }
-
-        // repliable datagram1 datagrams cannot carry an offline signature
-        if self.offline_keys.is_some() && core::matches!(session_kind, SessionKind::Datagram) {
-            tracing::warn!(
-                target: LOG_TARGET,
-                session_id = %self.session_id,
-                sub_session_id = %session_id,
-                "offline keys are not supported for `STYLE=DATAGRAM` sub-sessions",
-            );
-
-            return b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"offline keys not supported for datagram sessions\"\n".to_vec();
-        }
-
-        // if session kind indicated datagrams, attempt to add listener into `DatagramManager`
-        if core::matches!(
-            session_kind,
-            SessionKind::Datagram | SessionKind::Anonymous | SessionKind::Datagram2
-        ) {
-            if let Err(()) = self.datagram_manager.add_listener(options) {
-                return b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"invalid datagram configuration\"\n".to_vec();
-            }
         }
 
         tracing::debug!(
@@ -1250,12 +1371,83 @@ impl<R: Runtime> SamSession<R> {
             session_id = %self.session_id,
             sub_session_id = %session_id,
             ?session_kind,
+            ?listen_port,
             "create new sub-session",
         );
 
-        sub_sessions.insert(Arc::clone(&session_id), session_kind);
+        sub_sessions.insert(
+            Arc::clone(&session_id),
+            SubSession {
+                kind: session_kind,
+                listen_port,
+            },
+        );
 
         format!("SESSION STATUS RESULT=OK ID=\"{session_id}\" MESSAGE=\"ADD {session_id}\"\n")
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// Handle `SESSION REMOVE` command.
+    ///
+    /// The sub-session's listeners are removed and its streams are closed, after which the
+    /// sub-session ID can no longer be used to send or receive data.
+    fn on_remove_sub_session(&mut self, session_id: Arc<str>) -> Vec<u8> {
+        let SamSessionKind::Primary { sub_sessions } = &mut self.session_kind else {
+            tracing::warn!(
+                target: LOG_TARGET,
+                session_id = %self.session_id,
+                sub_session_id = %session_id,
+                kind = ?self.session_kind,
+                "sub-sessions not supported for the configured session kind",
+            );
+
+            return b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"not a primary session\"\n".to_vec();
+        };
+
+        let Some(sub_session) = sub_sessions.remove(&session_id) else {
+            tracing::warn!(
+                target: LOG_TARGET,
+                session_id = %self.session_id,
+                sub_session_id = %session_id,
+                "cannot remove unknown sub-session",
+            );
+
+            return b"SESSION STATUS RESULT=INVALID_ID MESSAGE=\"unknown sub-session\"\n".to_vec();
+        };
+
+        match sub_session.kind {
+            SessionKind::Stream => self.stream_manager.remove_sub_session(sub_session.listen_port),
+            _ => self.datagram_manager.remove_listener(&session_id),
+        }
+
+        // `sub_session_tx` must exist since the session kind is `Primary`
+        if let Err(error) =
+            self.sub_session_tx
+                .as_ref()
+                .expect("to exist")
+                .try_send(SubSessionCommand::Remove {
+                    sub_session_id: Arc::clone(&session_id),
+                })
+        {
+            tracing::warn!(
+                target: LOG_TARGET,
+                session_id = %self.session_id,
+                sub_session_id = %session_id,
+                ?error,
+                "failed to unregister sub-session from sam server",
+            );
+        }
+
+        tracing::info!(
+            target: LOG_TARGET,
+            session_id = %self.session_id,
+            sub_session_id = %session_id,
+            kind = ?sub_session.kind,
+            "sub-session removed",
+        );
+
+        format!("SESSION STATUS RESULT=OK ID=\"{session_id}\" MESSAGE=\"REMOVE {session_id}\"\n")
             .as_bytes()
             .to_vec()
     }
@@ -1294,6 +1486,17 @@ impl<R: Runtime> Future for SamSession<R> {
                 } => {
                     let message =
                         self.on_create_sub_session(Arc::from(session_id), session_kind, options);
+
+                    if let Some(socket) = &mut self.socket {
+                        socket.send_message(message);
+
+                        if let Some(waker) = self.waker.take() {
+                            waker.wake_by_ref();
+                        }
+                    }
+                }
+                SamCommand::RemoveSubSession { session_id } => {
+                    let message = self.on_remove_sub_session(Arc::from(session_id));
 
                     if let Some(socket) = &mut self.socket {
                         socket.send_message(message);
@@ -1563,7 +1766,7 @@ mod tests {
             mock::{MockRuntime, MockTcpStream},
             TcpStream,
         },
-        sam::{parser::SessionKind, socket::SamSocket},
+        sam::{parser::SessionKind, protocol::datagram::ForwardedDatagram, socket::SamSocket},
         tunnel::{TunnelMessage, TunnelMessageRecycle, TunnelPoolEvent, TunnelPoolHandle},
     };
     use thingbuf::mpsc;
@@ -1575,7 +1778,7 @@ mod tests {
     #[allow(unused)]
     struct TestSessionContext {
         client_socket: net::TcpStream,
-        datagram_rx: Receiver<(u16, Vec<u8>)>,
+        datagram_rx: Receiver<ForwardedDatagram>,
         event_manager: EventManager<MockRuntime>,
         event_subscriber: EventSubscriber,
         netdb_rx: mpsc::Receiver<NetDbAction, NetDbActionRecycle>,
@@ -1760,7 +1963,10 @@ mod tests {
 
         if let SamSessionKind::Primary { sub_sessions } = &session.session_kind {
             assert!(sub_sessions.contains_key("sub1"));
-            assert_eq!(sub_sessions.get("sub1"), Some(&SessionKind::Stream));
+            assert_eq!(
+                sub_sessions.get("sub1").map(|sub_session| sub_session.kind),
+                Some(SessionKind::Stream)
+            );
         }
     }
 
@@ -1806,7 +2012,10 @@ mod tests {
 
         if let SamSessionKind::Primary { sub_sessions } = &session.session_kind {
             assert!(sub_sessions.contains_key("sub1"));
-            assert_eq!(sub_sessions.get("sub1"), Some(&SessionKind::Datagram));
+            assert_eq!(
+                sub_sessions.get("sub1").map(|sub_session| sub_session.kind),
+                Some(SessionKind::Datagram)
+            );
         }
     }
 
@@ -1846,9 +2055,18 @@ mod tests {
         // Verify all subsessions were registered
         if let SamSessionKind::Primary { sub_sessions } = &session.session_kind {
             assert_eq!(sub_sessions.len(), 3);
-            assert_eq!(sub_sessions.get("sub1"), Some(&SessionKind::Datagram));
-            assert_eq!(sub_sessions.get("sub2"), Some(&SessionKind::Datagram));
-            assert_eq!(sub_sessions.get("sub3"), Some(&SessionKind::Datagram));
+            assert_eq!(
+                sub_sessions.get("sub1").map(|sub_session| sub_session.kind),
+                Some(SessionKind::Datagram)
+            );
+            assert_eq!(
+                sub_sessions.get("sub2").map(|sub_session| sub_session.kind),
+                Some(SessionKind::Datagram)
+            );
+            assert_eq!(
+                sub_sessions.get("sub3").map(|sub_session| sub_session.kind),
+                Some(SessionKind::Datagram)
+            );
         }
 
         // Try to create subsession with duplicate FROM_PORT (should fail)
@@ -1894,7 +2112,10 @@ mod tests {
         // Verify only the first subsession was registered
         if let SamSessionKind::Primary { sub_sessions } = &session.session_kind {
             assert_eq!(sub_sessions.len(), 1);
-            assert_eq!(sub_sessions.get("sub1"), Some(&SessionKind::Datagram));
+            assert_eq!(
+                sub_sessions.get("sub1").map(|sub_session| sub_session.kind),
+                Some(SessionKind::Datagram)
+            );
         }
     }
 
@@ -2352,5 +2573,171 @@ mod tests {
         assert_eq!(destination.id(), destination_id);
         assert_eq!(&rest[..32], &[0u8; 32]);
         assert_eq!(&rest[32..], &keys.serialize()[..]);
+    }
+
+    #[tokio::test]
+    async fn remove_sub_session() {
+        let (mut session, ctx) = create_session().await;
+        session.session_kind = SamSessionKind::Primary {
+            sub_sessions: HashMap::new(),
+        };
+
+        // stream sub-session on port 10 and a datagram sub-session on port 20
+        let result = session.on_create_sub_session(
+            "stream".into(),
+            SessionKind::Stream,
+            HashMap::from_iter([("LISTEN_PORT".to_string(), "10".to_string())]),
+        );
+        assert!(String::from_utf8_lossy(&result).contains("RESULT=OK"));
+
+        let result = session.on_create_sub_session(
+            "datagram".into(),
+            SessionKind::Datagram,
+            HashMap::from_iter([
+                ("PORT".to_string(), "1234".to_string()),
+                ("LISTEN_PORT".to_string(), "20".to_string()),
+            ]),
+        );
+        assert!(String::from_utf8_lossy(&result).contains("RESULT=OK"));
+        assert_eq!(session.session_kind.listen_port(&Arc::from("stream")), 10);
+        assert_eq!(session.session_kind.listen_port(&Arc::from("datagram")), 20);
+
+        // both sub-sessions were registered to the sam server
+        for _ in 0..2 {
+            assert!(core::matches!(
+                ctx.sub_rx.try_recv(),
+                Ok(SubSessionCommand::Add { .. })
+            ));
+        }
+
+        // unknown sub-session cannot be removed
+        let result = session.on_remove_sub_session("unknown".into());
+        assert!(String::from_utf8_lossy(&result).contains("RESULT=INVALID_ID"));
+
+        // remove the datagram sub-session, its listener is gone
+        let result = session.on_remove_sub_session("datagram".into());
+        assert!(String::from_utf8_lossy(&result).contains("RESULT=OK"));
+        assert!(session
+            .datagram_manager
+            .on_datagram(I2cpPayload {
+                dst_port: 20,
+                payload: vec![1, 2, 3, 4],
+                protocol: Protocol::Datagram,
+                src_port: 0,
+            })
+            .is_err());
+        assert!(!session.session_kind.supports_datagrams(&Arc::from("datagram")));
+        match ctx.sub_rx.try_recv() {
+            Ok(SubSessionCommand::Remove { sub_session_id }) => {
+                assert_eq!(&*sub_session_id, "datagram");
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        // the listen port can be reused by a new sub-session
+        let result = session.on_create_sub_session(
+            "datagram2".into(),
+            SessionKind::Datagram,
+            HashMap::from_iter([
+                ("PORT".to_string(), "1234".to_string()),
+                ("LISTEN_PORT".to_string(), "20".to_string()),
+            ]),
+        );
+        assert!(String::from_utf8_lossy(&result).contains("RESULT=OK"));
+
+        // remove the stream sub-session
+        let result = session.on_remove_sub_session("stream".into());
+        assert!(String::from_utf8_lossy(&result).contains("RESULT=OK"));
+        assert!(!session.session_kind.supports_streams(&Arc::from("stream")));
+        assert_eq!(session.session_kind.listen_port(&Arc::from("stream")), 0);
+
+        // a plain stream session has no sub-sessions to remove
+        session.session_kind = SamSessionKind::Stream;
+        let result = session.on_remove_sub_session("stream".into());
+        assert!(String::from_utf8_lossy(&result).contains("not a primary session"));
+    }
+
+    #[tokio::test]
+    async fn stream_sub_sessions_need_unique_listen_ports() {
+        let (mut session, _ctx) = create_session().await;
+        session.session_kind = SamSessionKind::Primary {
+            sub_sessions: HashMap::new(),
+        };
+
+        // default listen port
+        let result =
+            session.on_create_sub_session("sub1".into(), SessionKind::Stream, HashMap::new());
+        assert!(String::from_utf8_lossy(&result).contains("RESULT=OK"));
+
+        // same listen port, explicitly
+        let result = session.on_create_sub_session(
+            "sub2".into(),
+            SessionKind::Stream,
+            HashMap::from_iter([("LISTEN_PORT".to_string(), "0".to_string())]),
+        );
+        assert!(String::from_utf8_lossy(&result).contains("duplicate listen port"));
+
+        // `LISTEN_PORT` defaults to `FROM_PORT`
+        let result = session.on_create_sub_session(
+            "sub3".into(),
+            SessionKind::Stream,
+            HashMap::from_iter([("FROM_PORT".to_string(), "10".to_string())]),
+        );
+        assert!(String::from_utf8_lossy(&result).contains("RESULT=OK"));
+        assert_eq!(session.session_kind.listen_port(&Arc::from("sub3")), 10);
+
+        let result = session.on_create_sub_session(
+            "sub4".into(),
+            SessionKind::Stream,
+            HashMap::from_iter([("LISTEN_PORT".to_string(), "10".to_string())]),
+        );
+        assert!(String::from_utf8_lossy(&result).contains("duplicate listen port"));
+
+        // datagram sub-sessions don't conflict with stream sub-sessions
+        let result = session.on_create_sub_session(
+            "sub5".into(),
+            SessionKind::Anonymous,
+            HashMap::from_iter([
+                ("PORT".to_string(), "1234".to_string()),
+                ("LISTEN_PORT".to_string(), "10".to_string()),
+            ]),
+        );
+        assert!(String::from_utf8_lossy(&result).contains("RESULT=OK"));
+
+        // invalid listen port
+        let result = session.on_create_sub_session(
+            "sub6".into(),
+            SessionKind::Stream,
+            HashMap::from_iter([("LISTEN_PORT".to_string(), "70000".to_string())]),
+        );
+        assert!(String::from_utf8_lossy(&result).contains("invalid listen port"));
+
+        if let SamSessionKind::Primary { sub_sessions } = &session.session_kind {
+            assert_eq!(sub_sessions.len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_forward_with_invalid_host_is_rejected() {
+        let (mut session, _ctx) = create_session().await;
+        let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (stream, mut client) = tokio::join!(
+            MockTcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let socket = Box::new(SamSocket::<MockRuntime>::new(stream.unwrap()));
+        let (mut client, _) = client.as_mut().map(|(stream, address)| (stream, *address)).unwrap();
+
+        session.on_stream_forward(
+            socket,
+            8080,
+            HashMap::from_iter([("HOST".to_string(), "not-an-ip".to_string())]),
+            Arc::from("test"),
+        );
+
+        let mut reader = BufReader::new(&mut client);
+        let mut response = String::new();
+        reader.read_line(&mut response).await.expect("to succeed");
+        assert!(response.contains("STREAM STATUS RESULT=I2P_ERROR"));
     }
 }

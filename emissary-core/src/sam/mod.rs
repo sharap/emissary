@@ -34,6 +34,7 @@ use crate::{
             connection::{ConnectionKind, PendingSamConnection},
             session::{PendingSamSession, SamSessionContext},
         },
+        protocol::datagram::ForwardedDatagram,
         session::SamSession,
         types::{SamSessionCommand, SamSessionCommandRecycle},
     },
@@ -54,7 +55,7 @@ use alloc::{
 use core::{
     future::Future,
     mem,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -182,7 +183,7 @@ impl<R: Runtime, T: 'static + Send + Unpin> Stream for SessionContext<R, T> {
 }
 
 /// Sub-session command.
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 enum SubSessionCommand {
     /// Associate sub-session with an active primary session.
     Add {
@@ -194,7 +195,6 @@ enum SubSessionCommand {
     },
 
     /// Remove sub-session.
-    #[allow(unused)]
     Remove {
         /// Sub-session ID.
         sub_session_id: Arc<str>,
@@ -232,10 +232,10 @@ pub struct SamServer<R: Runtime> {
     address_book: Option<Arc<dyn AddressBook>>,
 
     /// RX channel for receiving datagrams that should be to clients.
-    datagram_rx: Receiver<(u16, Vec<u8>)>,
+    datagram_rx: Receiver<ForwardedDatagram>,
 
     /// TX channel given to active sessions they can use to send datagrams to clients.
-    datagram_tx: Sender<(u16, Vec<u8>)>,
+    datagram_tx: Sender<ForwardedDatagram>,
 
     /// Datagra writer state.
     datagram_writer_state: DatagramWriterState,
@@ -424,11 +424,9 @@ impl<R: Runtime> Future for SamServer<R> {
                 DatagramWriterState::GetMessage => match this.datagram_rx.poll_recv(cx) {
                     Poll::Pending => break,
                     Poll::Ready(None) => return Poll::Ready(()),
-                    Poll::Ready(Some((port, datagram))) => {
-                        this.datagram_writer_state = DatagramWriterState::WriteMessage {
-                            target: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
-                            datagram,
-                        };
+                    Poll::Ready(Some(ForwardedDatagram { target, datagram })) => {
+                        this.datagram_writer_state =
+                            DatagramWriterState::WriteMessage { target, datagram };
                     }
                 },
                 DatagramWriterState::WriteMessage { target, datagram } => {
