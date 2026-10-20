@@ -50,6 +50,9 @@ pub struct DatagramManager<R: Runtime> {
     /// Listeners.
     listeners: HashMap<u16, u16>,
 
+    /// Serialized offline signature section, if the local destination uses offline keys.
+    offline_signature: Option<Bytes>,
+
     /// Signing key.
     signing_key: SigningPrivateKey,
 
@@ -78,9 +81,20 @@ impl<R: Runtime> DatagramManager<R> {
                     HashMap::from_iter([(dst_port.unwrap_or(0), port)])
                 })
             },
+            offline_signature: None,
             signing_key,
             _runtime: Default::default(),
         }
+    }
+
+    /// Use offline keys: `signing_key` given to [`DatagramManager::new()`] is the transient key
+    /// and `offline_signature` is the serialized offline signature section proving it belongs to
+    /// the destination.
+    ///
+    /// Only Datagram2 supports offline signatures, repliable Datagram1 datagrams cannot be sent.
+    pub fn with_offline_signature(mut self, offline_signature: Option<Bytes>) -> Self {
+        self.offline_signature = offline_signature;
+        self
     }
 
     /// Make anonymous datagram.
@@ -110,12 +124,13 @@ impl<R: Runtime> DatagramManager<R> {
         destination_hash: &[u8],
         options: Option<Mapping>,
     ) -> Bytes {
-        // TODO datagram2: support sessions with offline_signature
-        let flags = DatagramFlags::new_v2(options, false).serialize();
+        let flags = DatagramFlags::new_v2(options, self.offline_signature.is_some()).serialize();
+        let offline_signature = self.offline_signature.as_deref().unwrap_or(&[]);
 
         let mut out = BytesMut::with_capacity(
             self.destination.serialized_len()
                 + flags.len()
+                + offline_signature.len()
                 + payload.len()
                 + self.signing_key.signature_len(),
         );
@@ -126,11 +141,8 @@ impl<R: Runtime> DatagramManager<R> {
         let signed_data_start = out.len();
 
         out.put_slice(destination_hash);
-        //TODO datagram2: write offsig data
-        //out.put_slice(&self.offsig_expiration_date);
-        //out.put_slice(&self.transient_key);
-        //out.put_slice(&self.offline_signature);
         out.put_slice(&flags);
+        out.put_slice(offline_signature);
         out.put_slice(&payload);
         // end of signed data
 
@@ -139,6 +151,7 @@ impl<R: Runtime> DatagramManager<R> {
         // remove destination hash from message
         out.truncate(signed_data_start);
         out.put_slice(&flags);
+        out.put_slice(offline_signature);
         out.put_slice(&payload);
         out.put_slice(&signature);
 
@@ -214,7 +227,7 @@ impl<R: Runtime> DatagramManager<R> {
                         OfflineSignature::parse_frame::<R>(rest, destination.verifying_key())
                             .map_err(|_| Error::InvalidData)?;
 
-                    (rest, Cow::Owned(offsig))
+                    (rest, Cow::Owned(offsig.transient_key().clone()))
                 } else {
                     (rest, Cow::Borrowed(destination.verifying_key()))
                 };
@@ -328,7 +341,7 @@ impl<R: Runtime> DatagramManager<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::mock::MockRuntime;
+    use crate::{primitives::OfflineKeys, runtime::mock::MockRuntime};
     use thingbuf::mpsc::channel;
 
     #[test]
@@ -408,7 +421,10 @@ mod tests {
             .unwrap();
 
         let (port, data) = receiver_rx.try_recv().unwrap();
-        let info = format!("{} FROM_PORT=0 TO_PORT=0\n", base64_encode(&*sender_destination));
+        let info = format!(
+            "{} FROM_PORT=0 TO_PORT=0\n",
+            base64_encode(&*sender_destination)
+        );
 
         assert_eq!(port, 8888);
         assert!(data.starts_with(info.as_bytes()));
@@ -585,5 +601,78 @@ mod tests {
             ),]))
             .is_err());
         assert_eq!(manager.listeners.get(&0), Some(&1337));
+    }
+
+    #[test]
+    fn datagram2_offline_signed_roundtrip() {
+        let (sender_destination, sender_signing_key) = Destination::random();
+        let (receiver_destination, receiver_signing_key) = Destination::random();
+        let (sender_tx, _sender_rx) = channel(16);
+        let (receiver_tx, receiver_rx) = channel(16);
+        let now = MockRuntime::time_since_epoch().as_secs() as u32;
+        let keys = OfflineKeys::create::<MockRuntime>(&sender_signing_key, now + 3600);
+
+        let mut sender = DatagramManager::<MockRuntime>::new(
+            sender_destination.clone(),
+            sender_tx,
+            HashMap::new(),
+            keys.transient_key().clone(),
+        )
+        .with_offline_signature(Some(Bytes::copy_from_slice(keys.signature().serialized())));
+        let receiver = DatagramManager::<MockRuntime>::new(
+            receiver_destination,
+            receiver_tx,
+            HashMap::from_iter([("PORT".to_string(), "8888".to_string())]),
+            receiver_signing_key,
+        );
+
+        let datagram =
+            sender.make_datagram2(b"hello, world".to_vec(), &receiver.destination_hash, None);
+
+        // flags advertise the offline signature
+        let (rest, _) = Destination::parse_frame(&datagram).unwrap();
+        match DatagramFlags::parse_frame(rest).unwrap().1 {
+            DatagramFlags::V2 { has_offsig, .. } => assert!(has_offsig),
+            _ => panic!("invalid flags"),
+        }
+
+        receiver
+            .on_datagram(I2cpPayload {
+                dst_port: 0,
+                payload: datagram.to_vec(),
+                protocol: Protocol::Datagram2,
+                src_port: 0,
+            })
+            .unwrap();
+
+        let (port, data) = receiver_rx.try_recv().unwrap();
+        let info = format!(
+            "{} FROM_PORT=0 TO_PORT=0\n",
+            base64_encode(&*sender_destination)
+        );
+
+        assert_eq!(port, 8888);
+        assert!(data.starts_with(info.as_bytes()));
+        assert_eq!(&data[info.len()..], b"hello, world");
+
+        // transient key without the offline signature section is rejected
+        let mut sender = DatagramManager::<MockRuntime>::new(
+            sender_destination,
+            sender.datagram_tx.clone(),
+            HashMap::new(),
+            keys.transient_key().clone(),
+        );
+        let datagram =
+            sender.make_datagram2(b"hello, world".to_vec(), &receiver.destination_hash, None);
+
+        assert!(receiver
+            .on_datagram(I2cpPayload {
+                dst_port: 0,
+                payload: datagram.to_vec(),
+                protocol: Protocol::Datagram2,
+                src_port: 0,
+            })
+            .is_err());
+        assert!(receiver_rx.try_recv().is_err());
     }
 }

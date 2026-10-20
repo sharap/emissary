@@ -42,6 +42,9 @@ pub enum OfflineSignatureParseError {
 
     /// Offline signature has expired.
     Expired,
+
+    /// Transient private key doesn't match the transient public key.
+    InvalidPrivateKey,
 }
 
 /// Destination parse error.

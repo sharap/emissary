@@ -18,7 +18,7 @@
 
 use crate::{
     crypto::{base32_decode, base64_decode, blinding::BlindedPublicKey, SigningPrivateKey},
-    primitives::{Destination, DestinationId, Str},
+    primitives::{Destination, DestinationId, OfflineKeys, Str},
     runtime::Runtime,
 };
 
@@ -145,12 +145,19 @@ pub struct DestinationContext {
     pub private_key: Vec<u8>,
 
     /// Signing key of the destination.
+    ///
+    /// The transient signing key if `offline_keys` is `Some`.
     pub signing_key: Box<SigningPrivateKey>,
+
+    /// Offline keys, if the destination's own signing key is kept offline.
+    pub offline_keys: Option<OfflineKeys>,
 }
 
 impl fmt::Debug for DestinationContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DestinationContext").finish_non_exhaustive()
+        f.debug_struct("DestinationContext")
+            .field("offline", &self.offline_keys.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -160,6 +167,7 @@ impl PartialEq for DestinationContext {
             && AsRef::<[u8]>::as_ref(&self.private_key) == AsRef::<[u8]>::as_ref(&other.private_key)
             && AsRef::<[u8]>::as_ref(&*self.signing_key)
                 == AsRef::<[u8]>::as_ref(&*other.signing_key)
+            && self.offline_keys == other.offline_keys
     }
 }
 
@@ -445,6 +453,7 @@ impl<'a, R: Runtime> TryFrom<ParsedCommand<'a, R>> for SamCommand {
                                 bytes
                             },
                             signing_key: Box::new(signing_key),
+                            offline_keys: None,
                         }
                     }
                     Some(destination) => {
@@ -468,9 +477,9 @@ impl<'a, R: Runtime> TryFrom<ParsedCommand<'a, R>> for SamCommand {
                                 "failed to parse encryption key from persistent destination",
                             );
                         })?;
-                        let (_, signing_key) = take::<_, _, ()>(destination.signing_key_length())(
-                            rest,
-                        )
+                        let (rest, signing_key) = take::<_, _, ()>(
+                            destination.signing_key_length(),
+                        )(rest)
                         .map_err(|error| {
                             tracing::warn!(
                                 target: LOG_TARGET,
@@ -479,15 +488,42 @@ impl<'a, R: Runtime> TryFrom<ParsedCommand<'a, R>> for SamCommand {
                             );
                         })?;
 
-                        // conversion is expected to succeed since the client is interacting with
-                        // a local router and would only crash their own router if they provided
-                        // invalid keying material
+                        // an all-zero signing private key means the destination's signing key is
+                        // kept offline and the offline signature section + transient private key
+                        // follow
+                        //
+                        // https://geti2p.net/en/docs/api/samv3#private-key-file
+                        let (signing_key, offline_keys) = match signing_key
+                            .iter()
+                            .all(|byte| *byte == 0)
+                        {
+                            true => {
+                                let offline_keys =
+                                    OfflineKeys::parse::<R>(rest, destination.verifying_key())
+                                        .map_err(|error| {
+                                            tracing::warn!(
+                                                target: LOG_TARGET,
+                                                ?error,
+                                                "invalid offline keys in persistent destination",
+                                            );
+                                        })?;
+
+                                (offline_keys.transient_key().clone(), Some(offline_keys))
+                            }
+                            false => (
+                                // conversion is expected to succeed since the client is
+                                // interacting with a local router and would only crash their own
+                                // router if they provided invalid keying material
+                                SigningPrivateKey::from_bytes(signing_key).expect("to succeed"),
+                                None,
+                            ),
+                        };
+
                         DestinationContext {
                             destination,
                             private_key: private_key.to_vec(),
-                            signing_key: Box::new(
-                                SigningPrivateKey::from_bytes(signing_key).expect("to succeed"),
-                            ),
+                            signing_key: Box::new(signing_key),
+                            offline_keys,
                         }
                     }
                     None => {
@@ -508,6 +544,26 @@ impl<'a, R: Runtime> TryFrom<ParsedCommand<'a, R>> for SamCommand {
                     .into_iter()
                     .map(|(key, value)| (key.to_string(), value.to_string()))
                     .collect::<HashMap<_, _>>();
+
+                if destination.offline_keys.is_some() {
+                    // repliable datagrams (datagram1) have no room for the offline signature and
+                    // encrypted lease sets would have to be blinded with the offline key
+                    if core::matches!(session_kind, SessionKind::Datagram) {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            "offline keys are not supported for `STYLE=DATAGRAM` sessions",
+                        );
+                        return Err(());
+                    }
+
+                    if options.get("i2cp.leaseSetType").map(|value| value == "5").unwrap_or(false) {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            "offline keys are not supported for encrypted lease sets",
+                        );
+                        return Err(());
+                    }
+                }
 
                 let Some(encryption_type) = options.get("i2cp.leaseSetEncType") else {
                     options.insert("i2cp.leaseSetEncType".to_string(), "6,4".to_string());
@@ -2081,5 +2137,101 @@ mod tests {
             }
             response => panic!("invalid response: {response:?}"),
         }
+    }
+
+    #[test]
+    fn parse_session_create_offline_keys() {
+        use crate::primitives::OfflineKeys;
+
+        let signing_key = SigningPrivateKey::random(MockRuntime::rng());
+        let destination = Destination::new::<MockRuntime>(signing_key.public());
+        let now = MockRuntime::time_since_epoch().as_secs() as u32;
+        let keys = OfflineKeys::create::<MockRuntime>(&signing_key, now + 3600);
+        let privkey = |keys: &OfflineKeys, truncate: usize| {
+            let mut out = destination.serialize().to_vec();
+            out.extend_from_slice(&[1u8; 256]);
+            out.extend_from_slice(&[0u8; 32]);
+            out.extend_from_slice(&keys.serialize());
+            out.truncate(out.len() - truncate);
+
+            base64_encode(out)
+        };
+
+        match SamCommand::parse::<MockRuntime>(&format!(
+            "SESSION CREATE STYLE=STREAM ID=test DESTINATION={}",
+            privkey(&keys, 0)
+        )) {
+            Some(SamCommand::CreateSession {
+                destination: context,
+                session_kind: SessionKind::Stream,
+                ..
+            }) => {
+                assert_eq!(context.destination.id(), destination.id());
+                assert_eq!(context.private_key, vec![1u8; 256]);
+                assert_eq!(context.offline_keys.as_ref(), Some(&keys));
+                assert_eq!(
+                    AsRef::<[u8]>::as_ref(&*context.signing_key),
+                    keys.transient_key().as_ref()
+                );
+            }
+            response => panic!("invalid response: {response:?}"),
+        }
+
+        // raw datagram and primary sessions can use offline keys as well
+        assert!(SamCommand::parse::<MockRuntime>(&format!(
+            "SESSION CREATE STYLE=RAW ID=test PORT=8888 DESTINATION={}",
+            privkey(&keys, 0)
+        ))
+        .is_some());
+        assert!(SamCommand::parse::<MockRuntime>(&format!(
+            "SESSION CREATE STYLE=PRIMARY ID=test DESTINATION={}",
+            privkey(&keys, 0)
+        ))
+        .is_some());
+
+        // repliable datagrams and encrypted lease sets don't support offline keys
+        assert!(SamCommand::parse::<MockRuntime>(&format!(
+            "SESSION CREATE STYLE=DATAGRAM ID=test PORT=8888 DESTINATION={}",
+            privkey(&keys, 0)
+        ))
+        .is_none());
+        assert!(SamCommand::parse::<MockRuntime>(&format!(
+            "SESSION CREATE STYLE=STREAM ID=test DESTINATION={} i2cp.leaseSetType=5",
+            privkey(&keys, 0)
+        ))
+        .is_none());
+
+        // expired offline keys
+        let expired = OfflineKeys::create::<MockRuntime>(&signing_key, now - 1);
+        assert!(SamCommand::parse::<MockRuntime>(&format!(
+            "SESSION CREATE STYLE=STREAM ID=test DESTINATION={}",
+            privkey(&expired, 0)
+        ))
+        .is_none());
+
+        // offline keys of another destination
+        let other = OfflineKeys::create::<MockRuntime>(
+            &SigningPrivateKey::random(MockRuntime::rng()),
+            now + 3600,
+        );
+        assert!(SamCommand::parse::<MockRuntime>(&format!(
+            "SESSION CREATE STYLE=STREAM ID=test DESTINATION={}",
+            privkey(&other, 0)
+        ))
+        .is_none());
+
+        // truncated transient private key
+        assert!(SamCommand::parse::<MockRuntime>(&format!(
+            "SESSION CREATE STYLE=STREAM ID=test DESTINATION={}",
+            privkey(&keys, 1)
+        ))
+        .is_none());
+
+        // all-zero signing key without the offline section
+        assert!(SamCommand::parse::<MockRuntime>(&format!(
+            "SESSION CREATE STYLE=STREAM ID=test DESTINATION={}",
+            privkey(&keys, keys.serialize().len())
+        ))
+        .is_none());
     }
 }

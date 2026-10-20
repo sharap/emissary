@@ -26,7 +26,8 @@ use crate::{
     events::EventHandle,
     i2cp::{I2cpPayload, I2cpPayloadBuilder},
     primitives::{
-        Destination as Dest, DestinationId, EncryptedLeaseSet2, LeaseSet2, LeaseSet2Header, Mapping,
+        Destination as Dest, DestinationId, EncryptedLeaseSet2, Lease, LeaseSet2, LeaseSet2Header,
+        Mapping, OfflineKeys,
     },
     protocol::Protocol,
     runtime::{AddressBook, JoinSet, Runtime},
@@ -72,9 +73,44 @@ const LOG_TARGET: &str = "emissary::sam::session";
 /// How long a published lease set is valid.
 const LEASE_SET_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
+/// Create a lease set for the local destination `destination` from `leases`.
+///
+/// The lease set is signed with `signing_key` which is the transient key if `offline_keys` is
+/// `Some`, in which case the lease set header advertises the offline signature.
+fn make_local_lease_set(
+    destination: &Dest,
+    options: &HashMap<String, String>,
+    public_key_context: &PublicKeyContext,
+    signing_key: &SigningPrivateKey,
+    offline_keys: Option<&OfflineKeys>,
+    leases: Vec<Lease>,
+    published: u32,
+) -> Bytes {
+    Bytes::from(
+        LeaseSet2 {
+            header: LeaseSet2Header {
+                destination: destination.clone(),
+                expires: LEASE_SET_LIFETIME.as_secs() as u32,
+                is_unpublished: options
+                    .get("i2cp.dontPublishLeaseSet")
+                    .map(|value| value.parse::<bool>().unwrap_or(false))
+                    .unwrap_or(false),
+                offline_signature: offline_keys.map(|keys| keys.signature().clone()),
+                published,
+            },
+            public_keys: public_key_context.public_keys(),
+            leases,
+        }
+        .serialize(signing_key),
+    )
+}
+
 /// Does the session publish its lease set encrypted (`i2cp.leaseSetType=5`).
 fn is_encrypted_lease_set(options: &HashMap<String, String>) -> bool {
-    options.get("i2cp.leaseSetType").map(|value| value.trim() == "5").unwrap_or(false)
+    options
+        .get("i2cp.leaseSetType")
+        .map(|value| value.trim() == "5")
+        .unwrap_or(false)
 }
 
 /// Publish `lease_set`, expiring at `expires` (seconds since epoch), to `NetDb`.
@@ -123,6 +159,11 @@ pub struct SamSession<R: Runtime> {
 
     /// Pending host lookups
     lookup_futures: R::JoinSet<(String, Option<String>)>,
+
+    /// Offline keys, if the destination's own signing key is kept offline.
+    ///
+    /// `signing_key` is the transient key in that case.
+    offline_keys: Option<OfflineKeys>,
 
     /// Session options.
     options: HashMap<String, String>,
@@ -202,11 +243,12 @@ impl<R: Runtime> SamSession<R> {
             tunnel_pool_handle,
         } = context;
 
-        let (session_destination, dest, privkey, public_key_context, signing_key) = {
+        let (session_destination, dest, privkey, public_key_context, signing_key, offline_keys) = {
             let DestinationContext {
                 destination,
                 private_key,
                 signing_key,
+                offline_keys,
             } = destination;
             let destination_id = destination.id();
 
@@ -216,11 +258,22 @@ impl<R: Runtime> SamSession<R> {
             // Private Key followed by the Signing Private Key, optionally followed by the Offline
             // Signature, which is 663 or more bytes in binary and 884 or more bytes in base 64,
             // depending on signature type. The binary format is specified in Private Key File."
+            //
+            // "If the SESSION CREATE contained a signing private key of all zeros and an Offline
+            // Signature section, the SESSION STATUS reply will include the same data in the same
+            // format."
             let privkey = {
                 let mut out = BytesMut::with_capacity(destination.serialized_len() + 2 * 32);
                 out.put_slice(&destination.serialize());
                 out.put_slice((*private_key).as_ref());
-                out.put_slice((*signing_key).as_ref());
+
+                match &offline_keys {
+                    Some(offline_keys) => {
+                        out.put_slice(&vec![0u8; destination.signing_key_length()]);
+                        out.put_slice(&offline_keys.serialize());
+                    }
+                    None => out.put_slice((*signing_key).as_ref()),
+                }
 
                 base64_encode(out)
             };
@@ -236,19 +289,14 @@ impl<R: Runtime> SamSession<R> {
             let is_encrypted = is_encrypted_lease_set(&options);
             let published = R::time_since_epoch().as_secs() as u32;
 
-            let local_leaseset = Bytes::from(
-                LeaseSet2 {
-                    header: LeaseSet2Header {
-                        destination: destination.clone(),
-                        expires: LEASE_SET_LIFETIME.as_secs() as u32,
-                        is_unpublished,
-                        offline_signature: None,
-                        published,
-                    },
-                    public_keys: public_key_context.public_keys(),
-                    leases: inbound.values().cloned().collect(),
-                }
-                .serialize(&signing_key),
+            let local_leaseset = make_local_lease_set(
+                &destination,
+                &options,
+                &public_key_context,
+                &signing_key,
+                offline_keys.as_ref(),
+                inbound.values().cloned().collect(),
+                published,
             );
 
             // publish the new destination to the event system
@@ -293,6 +341,7 @@ impl<R: Runtime> SamSession<R> {
                 %session_id,
                 %destination_id,
                 b33 = ?address,
+                offline_keys = ?offline_keys.as_ref().map(|keys| keys.signature().expires()),
                 "start active session",
             );
 
@@ -302,12 +351,17 @@ impl<R: Runtime> SamSession<R> {
                 privkey,
                 public_key_context,
                 signing_key,
+                offline_keys,
             )
         };
 
         socket.send_message(
             format!("SESSION STATUS RESULT=OK DESTINATION={privkey}\n").as_bytes().to_vec(),
         );
+
+        let offline_signature = offline_keys
+            .as_ref()
+            .map(|keys| Bytes::copy_from_slice(keys.signature().serialized()));
 
         Self {
             address_book,
@@ -316,12 +370,14 @@ impl<R: Runtime> SamSession<R> {
                 datagram_tx,
                 options.clone(),
                 *signing_key.clone(),
-            ),
+            )
+            .with_offline_signature(offline_signature.clone()),
             dest: dest.clone(),
             destination: session_destination,
             public_key_context,
             event_handle,
             lookup_futures: R::join_set(),
+            offline_keys,
             options,
             pending_host_lookups: HashMap::new(),
             pending_outbound: HashMap::new(),
@@ -344,7 +400,8 @@ impl<R: Runtime> SamSession<R> {
             },
             signing_key: *signing_key.clone(),
             socket: Some(socket),
-            stream_manager: StreamManager::new(dest, *signing_key),
+            stream_manager: StreamManager::new(dest, *signing_key)
+                .with_offline_signature(offline_signature),
             sub_session_tx,
             waker: None,
         }
@@ -1166,6 +1223,18 @@ impl<R: Runtime> SamSession<R> {
             return b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"internal error\"\n".to_vec();
         }
 
+        // repliable datagram1 datagrams cannot carry an offline signature
+        if self.offline_keys.is_some() && core::matches!(session_kind, SessionKind::Datagram) {
+            tracing::warn!(
+                target: LOG_TARGET,
+                session_id = %self.session_id,
+                sub_session_id = %session_id,
+                "offline keys are not supported for `STYLE=DATAGRAM` sub-sessions",
+            );
+
+            return b"SESSION STATUS RESULT=I2P_ERROR MESSAGE=\"offline keys not supported for datagram sessions\"\n".to_vec();
+        }
+
         // if session kind indicated datagrams, attempt to add listener into `DatagramManager`
         if core::matches!(
             session_kind,
@@ -1402,23 +1471,14 @@ impl<R: Runtime> Future for SamSession<R> {
                     );
 
                     let published = R::time_since_epoch().as_secs() as u32;
-                    let lease_set = Bytes::from(
-                        LeaseSet2 {
-                            header: LeaseSet2Header {
-                                destination: self.dest.clone(),
-                                is_unpublished: self
-                                    .options
-                                    .get("i2cp.dontPublishLeaseSet")
-                                    .map(|value| value.parse::<bool>().unwrap_or(false))
-                                    .unwrap_or(false),
-                                expires: LEASE_SET_LIFETIME.as_secs() as u32,
-                                offline_signature: None,
-                                published,
-                            },
-                            public_keys: self.public_key_context.public_keys(),
-                            leases,
-                        }
-                        .serialize(&self.signing_key),
+                    let lease_set = make_local_lease_set(
+                        &self.dest,
+                        &self.options,
+                        &self.public_key_context,
+                        &self.signing_key,
+                        self.offline_keys.as_ref(),
+                        leases,
+                        published,
                     );
 
                     let this = self.as_mut().get_mut();
@@ -1615,10 +1675,20 @@ mod tests {
     }
 
     async fn create_session() -> (SamSession<MockRuntime>, TestSessionContext) {
+        create_session_with_keys(None).await
+    }
+
+    /// Create session, optionally for a destination with the given signing key and offline keys.
+    async fn create_session_with_keys(
+        offline_keys: Option<(SigningPrivateKey, OfflineKeys)>,
+    ) -> (SamSession<MockRuntime>, TestSessionContext) {
         let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
 
-        let signing_key = SigningPrivateKey::random(MockRuntime::rng());
+        let (signing_key, offline_keys) = match offline_keys {
+            Some((signing_key, offline_keys)) => (signing_key, Some(offline_keys)),
+            None => (SigningPrivateKey::random(MockRuntime::rng()), None),
+        };
         let destination = Destination::new::<MockRuntime>(signing_key.public());
 
         let (datagram_tx, datagram_rx) = mpsc::channel(10);
@@ -1643,7 +1713,11 @@ mod tests {
                 destination: DestinationContext {
                     destination,
                     private_key: Vec::new(),
-                    signing_key: Box::new(signing_key),
+                    signing_key: Box::new(match &offline_keys {
+                        Some(offline_keys) => offline_keys.transient_key().clone(),
+                        None => signing_key,
+                    }),
+                    offline_keys,
                 },
                 event_handle,
                 inbound: Default::default(),
@@ -2220,5 +2294,63 @@ mod tests {
             assert!(response.contains("STREAM STATUS RESULT=I2P_ERROR"));
         };
         assert!(tokio::time::timeout(Duration::from_secs(1), future).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn offline_keys_sign_lease_set_and_are_reported_back() {
+        use crate::crypto::base64_decode;
+
+        let signing_key = SigningPrivateKey::random(MockRuntime::rng());
+        let now = MockRuntime::time_since_epoch().as_secs() as u32;
+        let keys = OfflineKeys::create::<MockRuntime>(&signing_key, now + 3600);
+        let (mut session, mut ctx) =
+            create_session_with_keys(Some((signing_key.clone(), keys.clone()))).await;
+
+        // the session signs with the transient key and advertises the offline signature
+        assert_eq!(session.signing_key.as_ref(), keys.transient_key().as_ref());
+
+        let lease_set = make_local_lease_set(
+            &session.dest,
+            &session.options,
+            &session.public_key_context,
+            &session.signing_key,
+            session.offline_keys.as_ref(),
+            vec![LeaseSet2::random().0.leases[0].clone()],
+            now,
+        );
+        let parsed = LeaseSet2::parse::<MockRuntime>(&lease_set).unwrap();
+        assert_eq!(parsed.header.destination.id(), session.dest.id());
+        assert_eq!(
+            parsed.header.offline_signature,
+            Some(keys.signature().clone())
+        );
+
+        // the same lease set without the offline section wouldn't verify
+        let mut without_section = parsed.clone();
+        without_section.header.offline_signature = None;
+        assert!(
+            LeaseSet2::parse::<MockRuntime>(&without_section.serialize(keys.transient_key()))
+                .is_err()
+        );
+
+        // `SESSION STATUS` reports the all-zero signing key followed by the offline keys
+        let destination_id = session.dest.id();
+        tokio::spawn(async move { session.socket.as_mut().expect("to exist").next().await });
+
+        let mut reader = BufReader::new(&mut ctx.client_socket);
+        let mut response = String::new();
+        reader.read_line(&mut response).await.expect("to succeed");
+
+        let privkey = response
+            .trim()
+            .strip_prefix("SESSION STATUS RESULT=OK DESTINATION=")
+            .unwrap_or_else(|| panic!("unexpected response: {response}"));
+        let decoded = base64_decode(privkey).unwrap();
+        let (rest, destination) = Destination::parse_frame(&decoded).unwrap();
+
+        // the test session has an empty encryption private key
+        assert_eq!(destination.id(), destination_id);
+        assert_eq!(&rest[..32], &[0u8; 32]);
+        assert_eq!(&rest[32..], &keys.serialize()[..]);
     }
 }

@@ -208,6 +208,7 @@ impl<R: Runtime> I2cpSession<R> {
                 destination,
                 date,
                 options,
+                ..
             } => {
                 tracing::warn!(
                     target: LOG_TARGET,

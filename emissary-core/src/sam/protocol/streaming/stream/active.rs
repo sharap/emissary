@@ -28,6 +28,7 @@ use crate::{
     },
 };
 
+use bytes::Bytes;
 use futures::FutureExt;
 use rand::Rng;
 use thingbuf::mpsc::{Receiver, Sender};
@@ -264,6 +265,9 @@ pub struct StreamContext {
 
     /// ID of the local destination.
     pub local: DestinationId,
+
+    /// Serialized offline signature section, if the local destination uses offline keys.
+    pub offline_signature: Option<Bytes>,
 
     /// Stream ID selected by the stream originator.
     pub recv_stream_id: u32,
@@ -545,6 +549,9 @@ pub struct Stream<R: Runtime> {
     /// Send stream ID (selected by us).
     send_stream_id: u32,
 
+    /// Serialized offline signature section, if the local destination uses offline keys.
+    offline_signature: Option<Bytes>,
+
     /// Signing key.
     signing_key: SigningPrivateKey,
 
@@ -579,6 +586,7 @@ impl<R: Runtime> Stream<R> {
             remote,
             cmd_rx,
             event_tx,
+            offline_signature,
             recv_stream_id,
             signing_key,
             destination,
@@ -594,6 +602,7 @@ impl<R: Runtime> Stream<R> {
                         .with_seq_nro(0)
                         .with_synchronize()
                         .with_signature()
+                        .with_offline_signature(offline_signature.as_deref())
                         .build_and_sign(&signing_key);
 
                     if let Err(error) = event_tx.try_send((
@@ -724,6 +733,7 @@ impl<R: Runtime> Stream<R> {
             rto_timer,
             rtt: Rtt::new(),
             send_stream_id,
+            offline_signature,
             signing_key,
             src_port,
             stream,
@@ -1113,6 +1123,7 @@ impl<R: Runtime> Stream<R> {
             .with_close()
             .with_from_included(&self.destination)
             .with_signature()
+            .with_offline_signature(self.offline_signature.as_deref())
             .build_and_sign(&self.signing_key)
             .to_vec();
 
@@ -1449,6 +1460,7 @@ impl<R: Runtime> Future for Stream<R> {
                     .with_close()
                     .with_from_included(&this.destination)
                     .with_signature()
+                    .with_offline_signature(this.offline_signature.as_deref())
                     .build_and_sign(&this.signing_key)
             } else {
                 builder.build()
@@ -1549,6 +1561,7 @@ mod tests {
                         cmd_rx,
                         event_tx,
                         local: destination_id,
+                        offline_signature: None,
                         recv_stream_id: 1337u32,
                         remote: DestinationId::random(),
                         signing_key,
@@ -1646,6 +1659,7 @@ mod tests {
                             cmd_rx: outbound_cmd_rx,
                             event_tx: outbound_event_tx,
                             local: outbound_destination_id.clone(),
+                            offline_signature: None,
                             recv_stream_id: 1337u32,
                             remote: inbound_destination_id.clone(),
                             signing_key: outbound_signing_key,
@@ -1676,6 +1690,7 @@ mod tests {
                             cmd_rx: inbound_cmd_rx,
                             event_tx: inbound_event_tx,
                             local: inbound_destination_id,
+                            offline_signature: None,
                             recv_stream_id: 1338u32,
                             remote: outbound_destination_id,
                             signing_key: inbound_signing_key,

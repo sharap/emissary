@@ -17,9 +17,11 @@
 // DEALINGS IN THE SOFTWARE.
 
 use emissary_core::{
-    crypto::{base32_encode, base64_decode, blinding::BlindedPublicKey},
-    primitives::Destination,
+    crypto::{
+        base32_encode, base64_decode, base64_encode, blinding::BlindedPublicKey, SigningPrivateKey,
+    },
     events::EventSubscriber,
+    primitives::{Destination, OfflineKeys},
     router::Router,
     runtime::{AddressBook, Runtime},
     Config, Ntcp2Config, SamConfig, Ssu2Config, TransitConfig,
@@ -2796,4 +2798,142 @@ async fn ping_pong_works() {
         session.send_command("PING hello world!\n").await.unwrap(),
         "PONG hello world!\n"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn offline_keys_work_ntcp2() {
+    offline_keys_work(TransportKind::Ntcp2).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn offline_keys_work_ssu2() {
+    offline_keys_work(TransportKind::Ssu2).await;
+}
+
+/// Server session is created with offline keys: the router only gets a transient signing key and
+/// the offline signature proving it belongs to the destination. The lease set and the streaming
+/// handshake are signed with the transient key and the client verifies them through the offline
+/// signature.
+async fn offline_keys_work(kind: TransportKind) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let mut router_infos = Vec::<Vec<u8>>::new();
+    let net_id = (TokioRuntime::rng().next_u32() % 255) as u8;
+
+    for i in 0..4 {
+        let (router, _events, router_info) =
+            make_router(i < 2, net_id, router_infos.clone(), kind).await;
+
+        router_infos.push(router_info);
+        tokio::spawn(router);
+    }
+
+    // create two more routers, fetch their sam tcp ports and spawn them in the background
+    let mut ports = Vec::<u16>::new();
+
+    for _ in 0..2 {
+        let router = make_router(false, net_id, router_infos.clone(), kind).await.0;
+        ports.push(router.protocol_address_info().sam_tcp.unwrap().port());
+        tokio::spawn(router);
+    }
+
+    // let the network boot up
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    // destination whose signing key stays offline
+    let signing_key = SigningPrivateKey::random(TokioRuntime::rng());
+    let destination = Destination::new::<TokioRuntime>(signing_key.public());
+    let expires = (TokioRuntime::time_since_epoch() + Duration::from_secs(24 * 60 * 60)).as_secs();
+    let keys = OfflineKeys::create::<TokioRuntime>(&signing_key, expires as u32);
+    let private_key = {
+        let mut out = destination.serialized().to_vec();
+        out.extend_from_slice(&[0u8; 256]); // encryption private key, unused
+        out.extend_from_slice(&[0u8; 32]); // signing private key kept offline
+        out.extend_from_slice(&keys.serialize());
+
+        base64_encode(out)
+    };
+    let address = format!("{}.b32.i2p", base32_encode(destination.id().to_vec()));
+
+    // create server session with the offline keys
+    let mut control = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ports[0]))
+        .await
+        .expect("to succeed");
+    control.write_all(b"HELLO VERSION\n").await.unwrap();
+    assert!(read_sam_line(&mut control).await.starts_with("HELLO REPLY RESULT=OK"));
+    control
+        .write_all(
+            format!("SESSION CREATE STYLE=STREAM ID=offline DESTINATION={private_key}\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), read_sam_line(&mut control))
+        .await
+        .expect("no timeout");
+
+    // the reply contains the same private key file, offline section included
+    assert_eq!(
+        status.trim(),
+        format!("SESSION STATUS RESULT=OK DESTINATION={private_key}")
+    );
+
+    // accept one stream on the server session
+    let server_port = ports[0];
+    let handle = tokio::spawn(async move {
+        let mut socket = tokio::net::TcpStream::connect(format!("127.0.0.1:{server_port}"))
+            .await
+            .expect("to succeed");
+        socket.write_all(b"HELLO VERSION\n").await.unwrap();
+        assert!(read_sam_line(&mut socket).await.starts_with("HELLO REPLY RESULT=OK"));
+        socket.write_all(b"STREAM ACCEPT ID=offline SILENT=false\n").await.unwrap();
+        assert!(read_sam_line(&mut socket).await.starts_with("STREAM STATUS RESULT=OK"));
+
+        // the destination of the client precedes the stream data
+        let peer = tokio::time::timeout(Duration::from_secs(60), read_sam_line(&mut socket))
+            .await
+            .expect("no timeout");
+        assert!(!peer.is_empty());
+
+        socket.write_all(b"hello, world!\n").await.unwrap();
+        let mut buffer = vec![0u8; 64];
+        let nread = socket.read(&mut buffer).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&buffer[..nread]),
+            Ok("goodbye, world!\n")
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // keep the control socket alive until the end of the test
+        drop(control);
+    });
+
+    // connect to the destination from another router
+    let mut session = tokio::time::timeout(
+        Duration::from_secs(30),
+        Session::<Stream>::new(SessionOptions {
+            samv3_tcp_port: ports[1],
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("no timeout")
+    .expect("to succeed");
+
+    let mut stream = tokio::time::timeout(Duration::from_secs(60), session.connect(&address))
+        .await
+        .expect("no timeout")
+        .expect("to succeed");
+
+    let mut buffer = vec![0u8; 64];
+    let nread = stream.read(&mut buffer).await.unwrap();
+    assert_eq!(std::str::from_utf8(&buffer[..nread]), Ok("hello, world!\n"));
+    stream.write_all(b"goodbye, world!\n").await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("no timeout")
+        .expect("to succeed");
 }

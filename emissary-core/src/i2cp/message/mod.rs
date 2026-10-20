@@ -17,9 +17,9 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    crypto::StaticPrivateKey,
+    crypto::{base64_decode, StaticPrivateKey},
     i2cp::payload::I2cpParameters,
-    primitives::{Date, Destination, LeaseSet2, Mapping, Str},
+    primitives::{Date, Destination, LeaseSet2, Mapping, OfflineSignature, Str},
     runtime::Runtime,
 };
 
@@ -29,7 +29,7 @@ use nom::{
     number::complete::{be_u16, be_u32, be_u8},
 };
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::{fmt, time::Duration};
 
 pub use bandwidth::BandwidthLimits;
@@ -53,9 +53,6 @@ const LOG_TARGET: &str = "emissary::i2cp::message";
 ///
 /// Header is payload size (4 bytes) + message type (1 bytes).
 pub const I2CP_HEADER_SIZE: usize = 5;
-
-/// Signature length.
-const SIGNATURE_LEN: usize = 64usize;
 
 /// Session ID.
 #[derive(Debug)]
@@ -301,6 +298,12 @@ pub enum Message {
 
         /// Session options.
         options: Mapping,
+
+        /// Offline signature, if the destination's signing key is kept offline.
+        ///
+        /// The session configuration and the lease sets of the session are signed with the
+        /// transient key.
+        offline_signature: Option<Box<OfflineSignature>>,
     },
 
     /// Lookup destination.
@@ -459,19 +462,29 @@ impl Message {
     /// Attempt to parse [`Message::CreateSession`] from `input`.
     ///
     /// https://geti2p.net/spec/i2cp#createsessionmessage
-    fn parse_create_session(input: impl AsRef<[u8]>) -> Option<Self> {
+    fn parse_create_session<R: Runtime>(input: impl AsRef<[u8]>) -> Option<Self> {
         let (rest, destination) = Destination::parse_frame(input.as_ref()).ok()?;
         let (rest, options) = Mapping::parse_frame(rest).ok()?;
         let (rest, date) = Date::parse_frame(rest).ok()?;
-        let (_rest, signature) = take::<_, _, ()>(SIGNATURE_LEN)(rest).ok()?;
 
-        if let Err(error) = destination.verifying_key().verify(
-            &input.as_ref()[..input.as_ref().len() - SIGNATURE_LEN],
+        // if the destination's signing key is kept offline, the options carry an offline
+        // signature and the session configuration is signed with the transient key
+        let offline_signature = Self::parse_offline_signature::<R>(&destination, &options)?;
+        let verifying_key =
+            offline_signature.as_ref().map_or(destination.verifying_key(), |signature| {
+                signature.transient_key()
+            });
+
+        let (_rest, signature) = take::<_, _, ()>(verifying_key.signature_len())(rest).ok()?;
+
+        if let Err(error) = verifying_key.verify(
+            &input.as_ref()[..input.as_ref().len() - signature.len()],
             signature,
         ) {
             tracing::warn!(
                 target: LOG_TARGET,
                 ?error,
+                offline = ?offline_signature.is_some(),
                 "failed to verify `CreateSession` signature",
             );
 
@@ -482,7 +495,67 @@ impl Message {
             destination,
             date,
             options,
+            offline_signature: offline_signature.map(Box::new),
         })
+    }
+
+    /// Parse offline signature from session `options`, if the destination uses offline keys.
+    ///
+    /// `i2cp.leaseSetOfflineExpiration` (seconds since epoch), `i2cp.leaseSetTransientPublicKey`
+    /// (`<signature type>:<base64 key>`) and `i2cp.leaseSetOfflineSignature` (base64) are
+    /// reassembled into an offline signature section which is verified with the destination's
+    /// signing key.
+    ///
+    /// Returns `Some(None)` if the options contain no offline signature and `None` if the offline
+    /// signature is incomplete or invalid.
+    ///
+    /// https://geti2p.net/spec/i2cp#sessionconfig
+    fn parse_offline_signature<R: Runtime>(
+        destination: &Destination,
+        options: &Mapping,
+    ) -> Option<Option<OfflineSignature>> {
+        let expiration = options.get(&Str::from("i2cp.leaseSetOfflineExpiration"));
+        let transient_key = options.get(&Str::from("i2cp.leaseSetTransientPublicKey"));
+        let signature = options.get(&Str::from("i2cp.leaseSetOfflineSignature"));
+
+        let (expiration, transient_key, signature) = match (expiration, transient_key, signature) {
+            (None, None, None) => return Some(None),
+            (Some(expiration), Some(transient_key), Some(signature)) =>
+                (expiration, transient_key, signature),
+            _ => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    "incomplete offline signature in `CreateSession`",
+                );
+
+                return None;
+            }
+        };
+
+        let expiration = expiration.parse::<u32>().ok()?;
+        let (signature_type, transient_key) = transient_key.split_once(':')?;
+        let signature_type = signature_type.parse::<u16>().ok()?;
+        let transient_key = base64_decode(transient_key)?;
+        let signature = base64_decode(&**signature)?;
+
+        let mut section = Vec::with_capacity(6 + transient_key.len() + signature.len());
+        section.extend_from_slice(&expiration.to_be_bytes());
+        section.extend_from_slice(&signature_type.to_be_bytes());
+        section.extend_from_slice(&transient_key);
+        section.extend_from_slice(&signature);
+
+        match OfflineSignature::parse::<R>(&section, destination.verifying_key()) {
+            Ok(offline_signature) => Some(Some(offline_signature)),
+            Err(error) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    ?error,
+                    "invalid offline signature in `CreateSession`",
+                );
+
+                None
+            }
+        }
     }
 
     /// Attempt to parse [`Message::HostLookup`] from `input`.
@@ -663,7 +736,7 @@ impl Message {
             MessageType::SetDate => Self::parse_set_date(input),
             MessageType::GetBandwidthLimits => Self::parse_get_bandwidth_limits(input),
             MessageType::DestroySession => Self::parse_destroy_session(input),
-            MessageType::CreateSession => Self::parse_create_session(input),
+            MessageType::CreateSession => Self::parse_create_session::<R>(input),
             MessageType::HostLookup => Self::parse_host_lookup(input),
             MessageType::CreateLeaseSet2 => Self::parse_create_leaseset2::<R>(input),
             MessageType::SendMessageExpires => Self::parse_send_message_expires(input),
@@ -758,5 +831,129 @@ mod tests {
             }
             _ => panic!("invalid message"),
         }
+    }
+
+    /// Create serialized `CreateSession` message signed with `signing_key`.
+    fn create_session_message(
+        destination: &Destination,
+        options: &Mapping,
+        signing_key: &crate::crypto::SigningPrivateKey,
+    ) -> Vec<u8> {
+        let mut out = BytesMut::new();
+        out.put_slice(&destination.serialize());
+        out.put_slice(&options.serialize());
+        out.put_slice(&Date::new(1337).serialize());
+
+        let signature = signing_key.sign(&out);
+        out.put_slice(&signature);
+
+        out.to_vec()
+    }
+
+    #[test]
+    fn parse_create_session_offline_keys() {
+        use crate::{
+            crypto::{base64_encode, SigningPrivateKey},
+            primitives::OfflineKeys,
+        };
+        use alloc::{format, string::ToString};
+
+        let (destination, signing_key) = Destination::random();
+        let now = MockRuntime::time_since_epoch().as_secs() as u32;
+        let keys = OfflineKeys::create::<MockRuntime>(&signing_key, now + 3600);
+        let options = |keys: &OfflineKeys| {
+            let section = keys.signature().serialized();
+            let mut options = Mapping::default();
+            options.insert(
+                Str::from("i2cp.leaseSetOfflineExpiration"),
+                Str::from(keys.signature().expires().to_string()),
+            );
+            options.insert(
+                Str::from("i2cp.leaseSetTransientPublicKey"),
+                Str::from(format!("7:{}", base64_encode(&section[6..38]))),
+            );
+            options.insert(
+                Str::from("i2cp.leaseSetOfflineSignature"),
+                Str::from(base64_encode(&section[38..])),
+            );
+            options
+        };
+        let parse =
+            |message: Vec<u8>| Message::parse::<MockRuntime>(MessageType::CreateSession, message);
+
+        // signed with the transient key
+        match parse(create_session_message(
+            &destination,
+            &options(&keys),
+            keys.transient_key(),
+        )) {
+            Some(Message::CreateSession {
+                destination: parsed,
+                offline_signature,
+                ..
+            }) => {
+                assert_eq!(parsed.id(), destination.id());
+                assert_eq!(offline_signature.as_deref(), Some(keys.signature()));
+            }
+            _ => panic!("invalid message"),
+        }
+
+        // offline signature present but signed with the destination's own key
+        assert!(parse(create_session_message(
+            &destination,
+            &options(&keys),
+            &signing_key
+        ))
+        .is_none());
+
+        // expired offline signature
+        let expired = OfflineKeys::create::<MockRuntime>(&signing_key, now - 1);
+        assert!(parse(create_session_message(
+            &destination,
+            &options(&expired),
+            expired.transient_key()
+        ))
+        .is_none());
+
+        // offline signature of another destination
+        let other = OfflineKeys::create::<MockRuntime>(
+            &SigningPrivateKey::random(MockRuntime::rng()),
+            now + 3600,
+        );
+        assert!(parse(create_session_message(
+            &destination,
+            &options(&other),
+            other.transient_key()
+        ))
+        .is_none());
+
+        // incomplete options
+        let mut incomplete = options(&keys);
+        incomplete.remove(&Str::from("i2cp.leaseSetOfflineSignature"));
+        assert!(parse(create_session_message(
+            &destination,
+            &incomplete,
+            keys.transient_key()
+        ))
+        .is_none());
+
+        // without offline keys the destination's own key signs
+        match parse(create_session_message(
+            &destination,
+            &Mapping::default(),
+            &signing_key,
+        )) {
+            Some(Message::CreateSession {
+                offline_signature: None,
+                ..
+            }) => {}
+            _ => panic!("invalid message"),
+        }
+        assert!(parse(create_session_message(
+            &destination,
+            &Mapping::default(),
+            keys.transient_key()
+        ))
+        .is_none());
     }
 }

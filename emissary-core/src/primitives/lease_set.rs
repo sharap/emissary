@@ -17,7 +17,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::{
-    crypto::{SigningPrivateKey, SigningPublicKey, StaticPublicKey},
+    crypto::{SigningPrivateKey, StaticPublicKey},
     error::parser::LeaseSetParseError,
     primitives::{Destination, Mapping, OfflineSignature, RouterId, TunnelId, LOG_TARGET},
     runtime::Runtime,
@@ -38,6 +38,9 @@ use core::{fmt, iter, time::Duration};
 /// <https://geti2p.net/spec/common-structures#leaseset2header>
 const UNPUBLISHED: u16 = 1u16 << 1;
 
+/// Lease set is signed with offline keys.
+const OFFLINE_KEYS: u16 = 1u16;
+
 /// Header for [`LeaseSet2`].
 ///
 /// https://geti2p.net/spec/common-structures#leaseset2header
@@ -49,8 +52,8 @@ pub struct LeaseSet2Header {
     /// When [`LeaseSet2`] expires.
     pub expires: u32,
 
-    /// Offline key, if specified.
-    pub offline_signature: Option<SigningPublicKey>,
+    /// Offline signature, if the lease set is signed with a transient key.
+    pub offline_signature: Option<OfflineSignature>,
 
     /// When [`LeaseSet2`] was published.
     pub published: u32,
@@ -84,7 +87,7 @@ impl LeaseSet2Header {
         }
 
         // parse and verify offline signature and get key for verifying the lease set's signature
-        let (rest, verifying_key) =
+        let (rest, offline_signature) =
             OfflineSignature::parse_frame::<R>(rest, destination.verifying_key())
                 .map_err(Err::convert)?;
 
@@ -94,7 +97,7 @@ impl LeaseSet2Header {
                 destination,
                 expires: published.saturating_add(expires as u32),
                 is_unpublished: (flags >> 1) & 1 == 1,
-                offline_signature: Some(verifying_key),
+                offline_signature: Some(offline_signature),
                 published,
             },
         ))
@@ -102,22 +105,40 @@ impl LeaseSet2Header {
 
     /// Get serialized length of [`LeaseSet2Header`].
     pub fn serialized_len(&self) -> usize {
-        // destination + published + expires + flags
-        self.destination.serialized_len() + 4usize + 2usize + 2usize
+        // destination + published + expires + flags + offline signature
+        self.destination.serialized_len()
+            + 4usize
+            + 2usize
+            + 2usize
+            + self
+                .offline_signature
+                .as_ref()
+                .map_or(0usize, |signature| signature.serialized_len())
     }
 
     /// Serialize [`LeaseSet2Header`] into a byte vector.
+    ///
+    /// If the header contains an offline signature, the lease set must be signed with the
+    /// transient key of that signature.
     pub fn serialize(self) -> BytesMut {
         let mut out = BytesMut::with_capacity(self.serialized_len());
+
+        let mut flags = 0u16;
+        if self.offline_signature.is_some() {
+            flags |= OFFLINE_KEYS;
+        }
+        if self.is_unpublished {
+            flags |= UNPUBLISHED;
+        }
 
         out.put_slice(&self.destination.serialize());
         out.put_u32(self.published);
         out.put_u16(self.expires as u16);
-        out.put_u16(if self.is_unpublished {
-            UNPUBLISHED
-        } else {
-            0u16
-        });
+        out.put_u16(flags);
+
+        if let Some(signature) = self.offline_signature {
+            out.put_slice(signature.serialized());
+        }
 
         out
     }
@@ -360,8 +381,9 @@ impl LeaseSet2 {
                     .verify(&bytes, signature)
                     .map_err(|_| Err::Error(LeaseSetParseError::InvalidSignature))?;
             }
-            Some(verifying_key) => {
-                verifying_key
+            Some(offline_signature) => {
+                offline_signature
+                    .transient_key()
                     .verify(&bytes, signature)
                     .map_err(|_| Err::Error(LeaseSetParseError::InvalidOfflineSignature))?;
             }
@@ -384,12 +406,15 @@ impl LeaseSet2 {
 
     /// Get serialized length of [`LeaseSet2`].
     pub fn serialized_len(&self) -> usize {
-        // header + no options + public keys + leases
+        // header + no options + public keys (count + type + length + key) + leases (count +
+        // leases) + signature
         self.header.serialized_len()
             + 2usize
-            + self.public_keys.iter().fold(0usize, |acc, _| acc + 32)
+            + 1usize
+            + self.public_keys.iter().fold(0usize, |acc, _| acc + 2 + 2 + 32)
+            + 1usize
             + self.leases.iter().fold(0usize, |acc, x| acc + x.serialized_len_lease2())
-            + 64usize // signature
+            + 64usize
     }
 
     /// Serialize [`LeaseSet2`] into a byte vector.
@@ -514,6 +539,7 @@ mod tests {
     use crate::{
         crypto::StaticPrivateKey,
         error::parser::OfflineSignatureParseError,
+        primitives::OfflineKeys,
         runtime::{mock::MockRuntime, Runtime},
     };
     use rand::Rng;
@@ -1115,6 +1141,62 @@ mod tests {
         assert_eq!(
             LeaseSet2::parse::<MockRuntime>(&input).unwrap_err(),
             LeaseSetParseError::OfflineSignature(OfflineSignatureParseError::Expired)
+        );
+    }
+
+    #[test]
+    fn serialize_and_parse_offline_signed() {
+        let (destination, signing_key) = Destination::random();
+        let expires =
+            (MockRuntime::time_since_epoch() + Duration::from_secs(3600)).as_secs() as u32;
+        let keys = OfflineKeys::create::<MockRuntime>(&signing_key, expires);
+        let published = MockRuntime::time_since_epoch().as_secs() as u32;
+        let lease = Lease {
+            router_id: RouterId::random(),
+            tunnel_id: TunnelId::from(MockRuntime::rng().next_u32()),
+            expires: MockRuntime::time_since_epoch() + Duration::from_secs(600),
+        };
+        let make = || LeaseSet2 {
+            header: LeaseSet2Header {
+                destination: destination.clone(),
+                expires: 600,
+                is_unpublished: true,
+                offline_signature: Some(keys.signature().clone()),
+                published,
+            },
+            public_keys: vec![StaticPrivateKey::random(MockRuntime::rng()).public()],
+            leases: vec![lease.clone()],
+        };
+
+        // signed with the transient key
+        let lease_set = make();
+        let serialized_len = lease_set.serialized_len();
+        let serialized = lease_set.serialize(keys.transient_key());
+        assert_eq!(serialized.len(), serialized_len);
+
+        let parsed = LeaseSet2::parse::<MockRuntime>(&serialized).unwrap();
+        assert_eq!(parsed.header.destination.id(), destination.id());
+        assert_eq!(
+            parsed.header.offline_signature,
+            Some(keys.signature().clone())
+        );
+        assert!(parsed.header.is_unpublished);
+        assert_eq!(parsed.header.expires, published + 600);
+        assert_eq!(parsed.leases.len(), 1);
+
+        // signed with the destination's own key even though offline keys are advertised
+        assert_eq!(
+            LeaseSet2::parse::<MockRuntime>(&make().serialize(&signing_key)).unwrap_err(),
+            LeaseSetParseError::InvalidOfflineSignature,
+        );
+
+        // signed with the transient key but the offline section is missing
+        let mut without_section = make();
+        without_section.header.offline_signature = None;
+        assert_eq!(
+            LeaseSet2::parse::<MockRuntime>(&without_section.serialize(keys.transient_key()))
+                .unwrap_err(),
+            LeaseSetParseError::InvalidSignature,
         );
     }
 

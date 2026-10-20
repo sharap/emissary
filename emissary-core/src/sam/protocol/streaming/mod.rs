@@ -36,7 +36,7 @@ use crate::{
     },
 };
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::{FutureExt, StreamExt};
 use hashbrown::{HashMap, HashSet};
 use rand::Rng;
@@ -252,6 +252,9 @@ pub struct StreamManager<R: Runtime> {
     /// Destination of the session the stream manager is bound to.
     destination: Destination,
 
+    /// Serialized offline signature section, if the local destination uses offline keys.
+    offline_signature: Option<Bytes>,
+
     /// ID of the `Destination` the stream manager is bound to.
     destination_id: DestinationId,
 
@@ -306,6 +309,7 @@ impl<R: Runtime> StreamManager<R> {
             destination_id: destination_id.clone(),
             destination_streams: HashMap::new(),
             listener: StreamListener::new(destination_id),
+            offline_signature: None,
             outbound_rx,
             outbound_timers: R::join_set(),
             outbound_tx,
@@ -317,6 +321,14 @@ impl<R: Runtime> StreamManager<R> {
             signing_key,
             streams: R::join_set(),
         }
+    }
+
+    /// Use offline keys: `signing_key` given to [`StreamManager::new()`] is the transient key and
+    /// `offline_signature` is the serialized offline signature section proving it belongs to the
+    /// destination. The section is included in every signed packet.
+    pub fn with_offline_signature(mut self, offline_signature: Option<Bytes>) -> Self {
+        self.offline_signature = offline_signature;
+        self
     }
 
     /// Handle message with `SYN`.
@@ -548,6 +560,7 @@ impl<R: Runtime> StreamManager<R> {
                     recv_stream_id,
                     payload.to_vec(),
                     &self.signing_key,
+                    self.offline_signature.as_deref(),
                 );
 
                 let _ = self.outbound_tx.try_send((
@@ -596,6 +609,7 @@ impl<R: Runtime> StreamManager<R> {
             cmd_rx: rx,
             event_tx: self.outbound_tx.clone(),
             local: self.destination_id.clone(),
+            offline_signature: self.offline_signature.clone(),
             recv_stream_id,
             remote: destination_id.clone(),
             signing_key: self.signing_key.clone(),
@@ -987,6 +1001,7 @@ impl<R: Runtime> StreamManager<R> {
             .with_synchronize()
             .with_signature()
             .with_from_included(&self.destination)
+            .with_offline_signature(self.offline_signature.as_deref())
             .build_and_sign(&self.signing_key);
 
         tracing::debug!(
@@ -1313,9 +1328,10 @@ impl<R: Runtime> futures::Stream for StreamManager<R> {
 mod tests {
     use super::*;
     use crate::{
+        crypto::SigningPublicKey,
         destination::routing_path::{PendingRoutingPathHandle, RoutingPathManager},
         error::QueryError,
-        primitives::{Destination, Lease, RouterId, TunnelId},
+        primitives::{Destination, Lease, OfflineKeys, RouterId, TunnelId},
         protocol::Protocol,
         runtime::{
             mock::{MockRuntime, MockTcpStream},
@@ -3276,5 +3292,163 @@ mod tests {
             .expect("to succeed");
 
         assert_eq!(response, "STREAM STATUS RESULT=CANT_REACH_PEER\n");
+    }
+
+    /// Verify `packet`, signed with `FROM_INCLUDED` and `SIGNATURE_INCLUDED`, with `key`.
+    fn verify_packet_signature(packet: &[u8], key: &SigningPublicKey) -> bool {
+        let parsed = Packet::parse::<MockRuntime>(packet).unwrap();
+        let signature = parsed.flags.signature().unwrap().to_vec();
+        let signature_start = packet.len() - parsed.payload.len() - signature.len();
+
+        let mut original = packet.to_vec();
+        original[signature_start..signature_start + signature.len()].fill(0u8);
+
+        key.verify(&original, &signature).is_ok()
+    }
+
+    #[tokio::test]
+    async fn offline_signed_syn_is_verified_with_transient_key() {
+        let signing_key = SigningPrivateKey::from_bytes(&[0u8; 32]).unwrap();
+        let destination = Destination::new::<MockRuntime>(signing_key.public());
+        let destination_id = destination.id();
+        let mut manager = StreamManager::<MockRuntime>::new(destination, signing_key);
+
+        let remote_key = SigningPrivateKey::random(MockRuntime::rng());
+        let remote = Destination::new::<MockRuntime>(remote_key.public());
+        let now = MockRuntime::time_since_epoch().as_secs() as u32;
+        let keys = OfflineKeys::create::<MockRuntime>(&remote_key, now + 3600);
+
+        let make_syn = |stream_id: u32, section: Option<&[u8]>, key: &SigningPrivateKey| {
+            PacketBuilder::new(stream_id)
+                .with_synchronize()
+                .with_send_stream_id(0u32)
+                .with_replay_protection(&destination_id)
+                .with_from_included(&remote)
+                .with_offline_signature(section)
+                .with_signature()
+                .build_and_sign(key)
+                .to_vec()
+        };
+        let payload = |payload: Vec<u8>| I2cpPayload {
+            src_port: 13u16,
+            dst_port: 37u16,
+            protocol: Protocol::Streaming,
+            payload,
+        };
+
+        // signed with the transient key and carrying the offline signature section
+        manager
+            .on_packet(payload(make_syn(
+                1,
+                Some(keys.signature().serialized()),
+                keys.transient_key(),
+            )))
+            .unwrap();
+        assert_eq!(manager.pending_inbound.len(), 1);
+
+        // signed with the transient key but the section is missing
+        match manager.on_packet(payload(make_syn(2, None, keys.transient_key()))) {
+            Err(StreamingError::InvalidSignature) => {}
+            result => panic!("unexpected result: {result:?}"),
+        }
+
+        // section included but signed with the destination's own key
+        match manager.on_packet(payload(make_syn(
+            3,
+            Some(keys.signature().serialized()),
+            &remote_key,
+        ))) {
+            Err(StreamingError::InvalidSignature) => {}
+            result => panic!("unexpected result: {result:?}"),
+        }
+
+        // expired section
+        let expired = OfflineKeys::create::<MockRuntime>(&remote_key, now - 1);
+        match manager.on_packet(payload(make_syn(
+            4,
+            Some(expired.signature().serialized()),
+            expired.transient_key(),
+        ))) {
+            Err(StreamingError::Malformed(_)) => {}
+            result => panic!("unexpected result: {result:?}"),
+        }
+
+        // section signed by another destination
+        let other = OfflineKeys::create::<MockRuntime>(
+            &SigningPrivateKey::random(MockRuntime::rng()),
+            now + 3600,
+        );
+        match manager.on_packet(payload(make_syn(
+            5,
+            Some(other.signature().serialized()),
+            other.transient_key(),
+        ))) {
+            Err(StreamingError::Malformed(_)) => {}
+            result => panic!("unexpected result: {result:?}"),
+        }
+
+        assert_eq!(manager.pending_inbound.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn offline_keys_sign_syn_ack() {
+        let signing_key = SigningPrivateKey::random(MockRuntime::rng());
+        let destination = Destination::new::<MockRuntime>(signing_key.public());
+        let destination_id = destination.id();
+        let now = MockRuntime::time_since_epoch().as_secs() as u32;
+        let keys = OfflineKeys::create::<MockRuntime>(&signing_key, now + 3600);
+        let mut manager =
+            StreamManager::<MockRuntime>::new(destination, keys.transient_key().clone())
+                .with_offline_signature(Some(Bytes::copy_from_slice(
+                    keys.signature().serialized(),
+                )));
+
+        // inbound syn from a remote destination without offline keys
+        let remote_key = SigningPrivateKey::random(MockRuntime::rng());
+        let remote = Destination::new::<MockRuntime>(remote_key.public());
+        let syn = PacketBuilder::new(1337u32)
+            .with_synchronize()
+            .with_send_stream_id(0u32)
+            .with_replay_protection(&destination_id)
+            .with_from_included(&remote)
+            .with_signature()
+            .build_and_sign(&remote_key)
+            .to_vec();
+
+        manager
+            .on_packet(I2cpPayload {
+                src_port: 13u16,
+                dst_port: 37u16,
+                protocol: Protocol::Streaming,
+                payload: syn,
+            })
+            .unwrap();
+
+        // there are no listeners so a pending stream is created and a syn-ack is sent
+        match tokio::time::timeout(Duration::from_secs(5), manager.next())
+            .await
+            .expect("no timeout")
+        {
+            Some(StreamManagerEvent::SendPacket { packet, .. }) => {
+                let parsed = Packet::parse::<MockRuntime>(&packet).unwrap();
+                assert!(parsed.flags.synchronize());
+                assert_eq!(
+                    parsed.flags.from_included().as_ref().map(|dest| dest.id()),
+                    Some(destination_id)
+                );
+                assert_eq!(
+                    parsed.flags.offline_signature(),
+                    Some(&keys.transient_key().public())
+                );
+
+                // signed with the transient key, not with the destination's own key
+                assert!(verify_packet_signature(
+                    &packet,
+                    &keys.transient_key().public()
+                ));
+                assert!(!verify_packet_signature(&packet, &signing_key.public()));
+            }
+            _ => panic!("unexpected event"),
+        }
     }
 }

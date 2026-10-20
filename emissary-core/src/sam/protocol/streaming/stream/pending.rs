@@ -99,6 +99,7 @@ impl<R: Runtime> PendingStream<R> {
         recv_stream_id: u32,
         syn_payload: Vec<u8>,
         signing_key: &SigningPrivateKey,
+        offline_signature: Option<&[u8]>,
     ) -> (Self, Vec<u8>) {
         let send_stream_id = R::rng().next_u32();
         let packet = PacketBuilder::new(send_stream_id)
@@ -107,6 +108,7 @@ impl<R: Runtime> PendingStream<R> {
             .with_from_included(destination)
             .with_synchronize()
             .with_signature()
+            .with_offline_signature(offline_signature)
             .build_and_sign(signing_key)
             .to_vec();
 
@@ -220,6 +222,7 @@ mod tests {
             1337u32,
             vec![],
             &SigningPrivateKey::random(NoopRuntime::rng()),
+            None,
         );
 
         let packet = PacketBuilder::new(stream.send_stream_id)
@@ -243,6 +246,7 @@ mod tests {
             1337u32,
             vec![],
             &SigningPrivateKey::random(NoopRuntime::rng()),
+            None,
         );
 
         let packet = PacketBuilder::new(stream.send_stream_id)
@@ -267,6 +271,7 @@ mod tests {
             1337u32,
             vec![],
             &SigningPrivateKey::random(NoopRuntime::rng()),
+            None,
         );
 
         let packet = PacketBuilder::new(stream.send_stream_id)
@@ -291,6 +296,7 @@ mod tests {
             1337u32,
             vec![],
             &SigningPrivateKey::random(NoopRuntime::rng()),
+            None,
         );
 
         for i in 1..=3 {
@@ -337,6 +343,7 @@ mod tests {
             1337u32,
             vec![],
             &SigningPrivateKey::random(NoopRuntime::rng()),
+            None,
         );
 
         match stream.on_packet(vec![1, 2, 3, 4]) {
@@ -354,6 +361,7 @@ mod tests {
             1337u32,
             vec![],
             &SigningPrivateKey::random(NoopRuntime::rng()),
+            None,
         );
 
         for i in 1..=INITIAL_WINDOW_SIZE {
@@ -402,6 +410,7 @@ mod tests {
             1337u32,
             vec![1, 2, 3, 4],
             &SigningPrivateKey::random(NoopRuntime::rng()),
+            None,
         );
 
         match stream.packets.pop_front() {

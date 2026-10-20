@@ -100,8 +100,8 @@ pub struct EncryptedLeaseSet2 {
     /// When the lease set expires, seconds since epoch.
     pub expires: u32,
 
-    /// Transient key which signed the lease set, if offline keys are used.
-    offline_key: Option<SigningPublicKey>,
+    /// Offline signature, if the lease set is signed with a transient key.
+    offline_signature: Option<OfflineSignature>,
 
     /// Outer ciphertext, including its salt.
     outer_ciphertext: Vec<u8>,
@@ -134,11 +134,11 @@ impl EncryptedLeaseSet2 {
         let (rest, expires) = be_u16(rest)?;
         let (rest, flags) = be_u16(rest)?;
 
-        let (rest, offline_key) = if flags & FLAG_OFFLINE_KEYS != 0 {
-            let (rest, key) =
+        let (rest, offline_signature) = if flags & FLAG_OFFLINE_KEYS != 0 {
+            let (rest, signature) =
                 OfflineSignature::parse_frame::<R>(rest, &verifying_key).map_err(Err::convert)?;
 
-            (rest, Some(key))
+            (rest, Some(signature))
         } else {
             (rest, None)
         };
@@ -157,9 +157,9 @@ impl EncryptedLeaseSet2 {
         signed.put_u8(STORE_TYPE_ENCRYPTED_LEASESET2);
         signed.put_slice(&input[..signed_len]);
 
-        offline_key
+        offline_signature
             .as_ref()
-            .unwrap_or(&verifying_key)
+            .map_or(&verifying_key, |signature| signature.transient_key())
             .verify(&signed, signature)
             .map_err(|_| Err::Error(LeaseSetParseError::InvalidSignature))?;
 
@@ -168,7 +168,7 @@ impl EncryptedLeaseSet2 {
             Self {
                 blinded_public_key,
                 expires: published.saturating_add(expires as u32),
-                offline_key,
+                offline_signature,
                 outer_ciphertext: outer_ciphertext.to_vec(),
                 published,
             },
@@ -192,7 +192,7 @@ impl EncryptedLeaseSet2 {
 
     /// Is the lease set signed with offline keys.
     pub fn is_offline_signed(&self) -> bool {
-        self.offline_key.is_some()
+        self.offline_signature.is_some()
     }
 
     /// Decrypt the lease set of the destination identified by `key`.

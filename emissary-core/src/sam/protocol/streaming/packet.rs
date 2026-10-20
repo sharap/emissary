@@ -167,11 +167,11 @@ impl<'a> Flags<'a> {
                     return Err(Err::Error(FlagsParseError::DestinationMissing));
                 }
                 Some(destination) => {
-                    let (rest, verifying_key) =
+                    let (rest, offline_signature) =
                         OfflineSignature::parse_frame::<R>(rest, destination.verifying_key())
                             .map_err(Err::convert)?;
 
-                    (rest, Some(verifying_key))
+                    (rest, Some(offline_signature.transient_key().clone()))
                 }
             },
             false => (rest, None),
@@ -458,7 +458,7 @@ pub struct FlagsBuilder<'a> {
     signature: Option<&'a [u8]>,
 }
 
-impl FlagsBuilder<'_> {
+impl<'a> FlagsBuilder<'a> {
     /// Specify `SYNCHRONIZE` .
     pub fn with_synchronize(mut self) -> Self {
         self.flags |= 1;
@@ -520,6 +520,18 @@ impl FlagsBuilder<'_> {
         self
     }
 
+    /// Include serialized offline signature section, if the local destination uses offline keys.
+    ///
+    /// `FROM_INCLUDED` must also be set and the packet must be signed with the transient key.
+    pub fn with_offline_signature(mut self, offline_signature: Option<&'a [u8]>) -> Self {
+        if let Some(offline_signature) = offline_signature {
+            self.options_len += offline_signature.len();
+            self.offline_signature = Some(offline_signature);
+            self.flags |= 1 << 11;
+        }
+        self
+    }
+
     /// Build [`FlagsBuilder`] and return `(flags, options)` tuple.
     fn build(self) -> (u16, Option<BytesMut>) {
         // no options
@@ -539,6 +551,10 @@ impl FlagsBuilder<'_> {
 
         if let Some(max_packet_size) = self.max_packet_size {
             out.put_u16(max_packet_size);
+        }
+
+        if let Some(offline_signature) = self.offline_signature {
+            out.put_slice(offline_signature);
         }
 
         // the field needs to be all zeros when the signature is calculated
@@ -691,6 +707,12 @@ impl<'a> PacketBuilder<'a> {
     /// Specify `NO_ACK`.
     pub fn with_no_ack(mut self) -> Self {
         self.flags_builder = self.flags_builder.with_no_ack();
+        self
+    }
+
+    /// Include serialized offline signature section, if the local destination uses offline keys.
+    pub fn with_offline_signature(mut self, offline_signature: Option<&'a [u8]>) -> Self {
+        self.flags_builder = self.flags_builder.with_offline_signature(offline_signature);
         self
     }
 

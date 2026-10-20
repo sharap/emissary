@@ -301,6 +301,7 @@ impl<R: Runtime> PendingI2cpSession<R> {
                 destination,
                 date,
                 mut options,
+                offline_signature,
             } => match mem::replace(&mut self.state, PendingSessionState::Poisoned) {
                 PendingSessionState::Inactive {
                     session_id,
@@ -312,6 +313,7 @@ impl<R: Runtime> PendingI2cpSession<R> {
                         destination = %destination.id(),
                         ?date,
                         num_options = ?options.len(),
+                        offline_keys = ?offline_signature.map(|signature| signature.expires()),
                         "create session",
                     );
 
