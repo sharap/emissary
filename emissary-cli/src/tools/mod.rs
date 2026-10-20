@@ -20,6 +20,7 @@ use clap::{ArgGroup, Subcommand};
 
 mod base64;
 mod devnet;
+mod offline_keys;
 
 #[cfg(feature = "web-ui")]
 mod router_ui_dev;
@@ -77,6 +78,28 @@ pub enum RouterCommand {
         /// Path to output file where the Base64-decoded string is written to.
         #[arg(short = 'o', long, value_name = "OUTPUT")]
         output: Option<String>,
+    },
+
+    /// Create offline keys for a destination.
+    ///
+    /// The destination's signing private key in the input file is replaced with a transient
+    /// signing key, signed by the destination's key and valid for a limited time. The output
+    /// file can be used as `destination_path` of a server tunnel while the original file stays
+    /// offline.
+    OfflineKeys {
+        /// Private key file of the destination (Base64 as written by the router, or binary).
+        #[arg(short = 'f', long, value_name = "FILE")]
+        file: String,
+
+        /// Path to the output file where the Base64-encoded private key file is written to.
+        ///
+        /// Written to stdout if not specified.
+        #[arg(short = 'o', long, value_name = "OUTPUT")]
+        output: Option<String>,
+
+        /// How many days the transient signing key is valid for.
+        #[arg(short = 'd', long, value_name = "DAYS", default_value_t = 30)]
+        days: u32,
     },
 
     /// Spawn an isolated, local I2P network.
@@ -140,6 +163,15 @@ impl RouterCommand {
                         target: LOG_TARGET,
                         ?error,
                         "failed to base64-decode input",
+                    );
+                    std::process::exit(1);
+                },
+            RouterCommand::OfflineKeys { file, output, days } =>
+                if let Err(error) = offline_keys::generate(file, output, days) {
+                    tracing::error!(
+                        target: LOG_TARGET,
+                        ?error,
+                        "failed to create offline keys",
                     );
                     std::process::exit(1);
                 },
