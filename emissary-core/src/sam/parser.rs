@@ -52,6 +52,9 @@ const LOG_TARGET: &str = "emissary::sam::parser";
 /// ElGamal key length.
 const ELGAMAL_KEY_LEN: usize = 256usize;
 
+/// Maximum payload size accepted for `DATAGRAM SEND`/`RAW SEND`.
+const MAX_DATAGRAM_SEND_SIZE: usize = 64 * 1024;
+
 /// Parsed command.
 ///
 /// Represent a command that had value form but isn't necessarily
@@ -307,6 +310,26 @@ pub enum SamCommand {
         options: HashMap<String, String>,
     },
 
+    /// `DATAGRAM SEND`/`RAW SEND` message sent over the control socket.
+    ///
+    /// The payload of `size` bytes follows the command line and is read by the socket.
+    SendDatagram {
+        /// Destination of the remote peer.
+        destination: Box<Destination>,
+
+        /// Datagram kind: `Datagram` for `DATAGRAM SEND` and `Anonymous` for `RAW SEND`.
+        kind: SessionKind,
+
+        /// Payload size.
+        size: usize,
+
+        /// Payload, filled in by the socket once it has been read.
+        datagram: Vec<u8>,
+
+        /// Options (`FROM_PORT`, `TO_PORT`, `PROTOCOL`).
+        options: HashMap<String, String>,
+    },
+
     /// `NAMING LOOKUP` message.
     NamingLookup {
         /// Hostname to lookup.
@@ -341,6 +364,8 @@ impl fmt::Display for SamCommand {
                 write!(f, "SamCommand::StreamConnect({session_id})"),
             Self::Accept { session_id, .. } => write!(f, "SamCommand::StreamAccept({session_id})"),
             Self::Forward { session_id, .. } => write!(f, "SamCommand::Forward({session_id})"),
+            Self::SendDatagram { kind, size, .. } =>
+                write!(f, "SamCommand::SendDatagram({kind:?}, {size})"),
             Self::NamingLookup { name } => write!(f, "SamCommand::NamingLookup({name})"),
             Self::GenerateDestination => write!(f, "SamCommand::GenerateDestination"),
             Self::Quit => write!(f, "SamCommand::Quit"),
@@ -873,6 +898,56 @@ impl<'a, R: Runtime> TryFrom<ParsedCommand<'a, R>> for SamCommand {
                         .collect(),
                 })
             }
+            (command @ ("DATAGRAM" | "RAW"), Some("SEND")) => {
+                let destination = parsed_cmd
+                    .key_value_pairs
+                    .remove("DESTINATION")
+                    .ok_or_else(|| {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            %command,
+                            "destination missing from `SEND`",
+                        );
+                    })
+                    .and_then(|destination| {
+                        base64_decode(destination)
+                            .and_then(|destination| Destination::parse(&destination).ok())
+                            .ok_or_else(|| {
+                                tracing::warn!(
+                                    target: LOG_TARGET,
+                                    %command,
+                                    "invalid destination in `SEND`",
+                                );
+                            })
+                    })?;
+                let size = parsed_cmd
+                    .key_value_pairs
+                    .remove("SIZE")
+                    .and_then(|size| size.parse::<usize>().ok())
+                    .filter(|size| *size <= MAX_DATAGRAM_SEND_SIZE)
+                    .ok_or_else(|| {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            %command,
+                            "size missing or invalid in `SEND`",
+                        );
+                    })?;
+
+                Ok(SamCommand::SendDatagram {
+                    destination: Box::new(destination),
+                    kind: match command {
+                        "DATAGRAM" => SessionKind::Datagram,
+                        _ => SessionKind::Anonymous,
+                    },
+                    size,
+                    datagram: Vec::new(),
+                    options: parsed_cmd
+                        .key_value_pairs
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                })
+            }
             ("NAMING", Some("LOOKUP")) => Ok(SamCommand::NamingLookup {
                 name: parsed_cmd.key_value_pairs.get("NAME").ok_or(())?.to_string(),
             }),
@@ -924,6 +999,8 @@ impl SamCommand {
                 tag("SESSION"),
                 tag("STREAM"),
                 tag("NAMING"),
+                tag("DATAGRAM"),
+                tag("RAW"),
                 tag("DEST"),
                 tag("QUIT"),
                 tag("EXIT"),
@@ -941,6 +1018,7 @@ impl SamCommand {
                 tag("FORWARD"),
                 tag("LOOKUP"),
                 tag("GENERATE"),
+                tag("SEND"),
             ))),
             opt(char(' ')),
             opt(parse_key_value_pairs),
@@ -2268,5 +2346,64 @@ mod tests {
         }
 
         assert!(SamCommand::parse::<MockRuntime>("SESSION REMOVE").is_none());
+    }
+
+    #[test]
+    fn parse_datagram_send() {
+        let (destination, _) = Destination::random();
+        let encoded = base64_encode(destination.serialize());
+
+        match SamCommand::parse::<MockRuntime>(&format!(
+            "DATAGRAM SEND DESTINATION={encoded} SIZE=12 FROM_PORT=1 TO_PORT=2"
+        )) {
+            Some(SamCommand::SendDatagram {
+                destination: parsed,
+                kind: SessionKind::Datagram,
+                size: 12,
+                datagram,
+                options,
+            }) => {
+                assert_eq!(parsed.id(), destination.id());
+                assert!(datagram.is_empty());
+                assert_eq!(options.get("FROM_PORT"), Some(&"1".to_string()));
+                assert_eq!(options.get("TO_PORT"), Some(&"2".to_string()));
+                assert!(!options.contains_key("SIZE"));
+            }
+            response => panic!("invalid response: {response:?}"),
+        }
+
+        match SamCommand::parse::<MockRuntime>(&format!(
+            "RAW SEND DESTINATION={encoded} SIZE=0 PROTOCOL=18"
+        )) {
+            Some(SamCommand::SendDatagram {
+                kind: SessionKind::Anonymous,
+                size: 0,
+                options,
+                ..
+            }) => {
+                assert_eq!(options.get("PROTOCOL"), Some(&"18".to_string()));
+            }
+            response => panic!("invalid response: {response:?}"),
+        }
+
+        // size missing, invalid or too large
+        assert!(
+            SamCommand::parse::<MockRuntime>(&format!("RAW SEND DESTINATION={encoded}")).is_none()
+        );
+        assert!(SamCommand::parse::<MockRuntime>(&format!(
+            "RAW SEND DESTINATION={encoded} SIZE=hello"
+        ))
+        .is_none());
+        assert!(SamCommand::parse::<MockRuntime>(&format!(
+            "RAW SEND DESTINATION={encoded} SIZE={}",
+            MAX_DATAGRAM_SEND_SIZE + 1
+        ))
+        .is_none());
+
+        // destination missing or invalid
+        assert!(SamCommand::parse::<MockRuntime>("DATAGRAM SEND SIZE=1").is_none());
+        assert!(
+            SamCommand::parse::<MockRuntime>("DATAGRAM SEND DESTINATION=hello SIZE=1").is_none()
+        );
     }
 }

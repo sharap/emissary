@@ -3144,3 +3144,108 @@ async fn sub_sessions_routed_by_port(kind: TransportKind) {
 
     drop(control);
 }
+
+#[tokio::test(start_paused = true)]
+async fn raw_send_over_control_socket_ntcp2() {
+    raw_send_over_control_socket(TransportKind::Ntcp2).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn raw_send_over_control_socket_ssu2() {
+    raw_send_over_control_socket(TransportKind::Ssu2).await;
+}
+
+/// Raw datagram is sent with `RAW SEND` over the control socket of a raw session instead of the
+/// SAMv3 UDP port.
+async fn raw_send_over_control_socket(kind: TransportKind) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let mut router_infos = Vec::<Vec<u8>>::new();
+    let net_id = (TokioRuntime::rng().next_u32() % 255) as u8;
+
+    for i in 0..4 {
+        let (router, _events, router_info) =
+            make_router(i < 2, net_id, router_infos.clone(), kind).await;
+
+        router_infos.push(router_info);
+        tokio::spawn(router);
+    }
+
+    // create two more routers, fetch their sam ports and spawn them in the background
+    let mut ports = Vec::<(u16, u16)>::new();
+
+    for _ in 0..2 {
+        let router = make_router(false, net_id, router_infos.clone(), kind).await.0;
+        let addr_info = router.protocol_address_info();
+
+        ports.push((
+            addr_info.sam_tcp.unwrap().port(),
+            addr_info.sam_udp.unwrap().port(),
+        ));
+        tokio::spawn(router);
+    }
+
+    // let the network boot up
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    // receiver
+    let mut receiver = tokio::time::timeout(
+        Duration::from_secs(60),
+        Session::<Anonymous>::new(SessionOptions {
+            samv3_tcp_port: ports[1].0,
+            samv3_udp_port: ports[1].1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("no timeout")
+    .expect("to succeed");
+    let receiver_destination = receiver.destination().to_owned();
+
+    let handle = tokio::spawn(async move {
+        let mut buffer = vec![0u8; 64];
+        let nread = tokio::time::timeout(Duration::from_secs(60), receiver.recv(&mut buffer))
+            .await
+            .expect("no timeout")
+            .expect("to succeed");
+
+        buffer[..nread].to_vec()
+    });
+
+    // sender: raw session driven over a raw sam socket, inbound datagrams would be forwarded to
+    // a udp socket which isn't used in the test
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut control = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ports[0].0))
+        .await
+        .expect("to succeed");
+    control.write_all(b"HELLO VERSION\n").await.unwrap();
+    assert!(read_sam_line(&mut control).await.starts_with("HELLO REPLY RESULT=OK"));
+    control
+        .write_all(
+            format!(
+                "SESSION CREATE STYLE=RAW ID=raw DESTINATION=TRANSIENT PORT={}\n",
+                udp.local_addr().unwrap().port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), read_sam_line(&mut control))
+        .await
+        .expect("no timeout");
+    assert!(status.starts_with("SESSION STATUS RESULT=OK"), "{status}");
+
+    // the payload follows the command line
+    control
+        .write_all(
+            format!("RAW SEND DESTINATION={receiver_destination} SIZE=13\nhello, world!")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(handle.await.unwrap(), b"hello, world!");
+    drop(control);
+}

@@ -27,7 +27,7 @@ use crate::{
     i2cp::{I2cpPayload, I2cpPayloadBuilder},
     primitives::{
         Destination as Dest, DestinationId, EncryptedLeaseSet2, Lease, LeaseSet2, LeaseSet2Header,
-        Mapping, OfflineKeys,
+        Mapping, OfflineKeys, Str,
     },
     protocol::Protocol,
     runtime::{AddressBook, JoinSet, Runtime},
@@ -213,6 +213,9 @@ pub struct SamSession<R: Runtime> {
 
     /// I2P virtual stream manager.
     stream_manager: StreamManager<R>,
+
+    /// Number of sub-sessions created so far, used to order sub-sessions by creation time.
+    sub_session_counter: u64,
 
     /// TX channel for sending session IDs of sub-sessions to `SamServer`
     ///
@@ -416,6 +419,7 @@ impl<R: Runtime> SamSession<R> {
             socket: Some(socket),
             stream_manager: StreamManager::new(dest, *signing_key)
                 .with_offline_signature(offline_signature),
+            sub_session_counter: 0u64,
             sub_session_tx,
             waker: None,
         }
@@ -1375,17 +1379,75 @@ impl<R: Runtime> SamSession<R> {
             "create new sub-session",
         );
 
+        self.sub_session_counter += 1;
         sub_sessions.insert(
             Arc::clone(&session_id),
             SubSession {
                 kind: session_kind,
                 listen_port,
+                created: self.sub_session_counter,
             },
         );
 
         format!("SESSION STATUS RESULT=OK ID=\"{session_id}\" MESSAGE=\"ADD {session_id}\"\n")
             .as_bytes()
             .to_vec()
+    }
+
+    /// Handle `DATAGRAM SEND`/`RAW SEND` received over the control socket.
+    ///
+    /// The datagram is sent through the session itself if it's a datagram session of `kind` or,
+    /// for primary sessions, through the most recently added sub-session of `kind`.
+    ///
+    /// https://geti2p.net/en/docs/api/samv3#datagrams
+    fn on_send_datagram_command(
+        &mut self,
+        destination: Dest,
+        kind: SessionKind,
+        datagram: Vec<u8>,
+        options: HashMap<String, String>,
+    ) {
+        let session_id = match &self.session_kind {
+            SamSessionKind::Datagram { kind: session_kind } if *session_kind == kind =>
+                Arc::clone(&self.session_id),
+            SamSessionKind::Primary { sub_sessions } => match sub_sessions
+                .iter()
+                .filter(|(_, sub_session)| sub_session.kind == kind)
+                .max_by_key(|(_, sub_session)| sub_session.created)
+                .map(|(session_id, _)| Arc::clone(session_id))
+            {
+                Some(session_id) => session_id,
+                None => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        session_id = %self.session_id,
+                        ?kind,
+                        "no sub-session for datagram sent over the control socket",
+                    );
+                    return;
+                }
+            },
+            session_kind => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    session_id = %self.session_id,
+                    ?session_kind,
+                    ?kind,
+                    "session style doesn't support datagrams sent over the control socket",
+                );
+                return;
+            }
+        };
+        let options = (!options.is_empty()).then(|| {
+            Mapping::from(
+                options
+                    .into_iter()
+                    .map(|(key, value)| (Str::from(key), Str::from(value)))
+                    .collect::<HashMap<Str, Str>>(),
+            )
+        });
+
+        self.on_send_datagram(destination, datagram, session_id, options);
     }
 
     /// Handle `SESSION REMOVE` command.
@@ -1495,6 +1557,13 @@ impl<R: Runtime> Future for SamSession<R> {
                         }
                     }
                 }
+                SamCommand::SendDatagram {
+                    destination,
+                    kind,
+                    datagram,
+                    options,
+                    ..
+                } => self.on_send_datagram_command(*destination, kind, datagram, options),
                 SamCommand::RemoveSubSession { session_id } => {
                     let message = self.on_remove_sub_session(Arc::from(session_id));
 
@@ -2739,5 +2808,64 @@ mod tests {
         let mut response = String::new();
         reader.read_line(&mut response).await.expect("to succeed");
         assert!(response.contains("STREAM STATUS RESULT=I2P_ERROR"));
+    }
+
+    #[tokio::test]
+    async fn datagram_send_over_control_socket() {
+        let (mut session, _ctx) = create_session().await;
+        let (remote, _) = Destination::random();
+
+        // stream sessions cannot send datagrams
+        session.on_send_datagram_command(
+            remote.clone(),
+            SessionKind::Anonymous,
+            b"hello".to_vec(),
+            HashMap::new(),
+        );
+        assert!(session.pending_outbound.is_empty());
+
+        // primary session with a raw sub-session
+        session.session_kind = SamSessionKind::Primary {
+            sub_sessions: HashMap::new(),
+        };
+        let result = session.on_create_sub_session(
+            "raw".into(),
+            SessionKind::Anonymous,
+            HashMap::from_iter([("PORT".to_string(), "1234".to_string())]),
+        );
+        assert!(String::from_utf8_lossy(&result).contains("RESULT=OK"));
+
+        // `DATAGRAM SEND` needs a repliable sub-session
+        session.on_send_datagram_command(
+            remote.clone(),
+            SessionKind::Datagram,
+            b"hello".to_vec(),
+            HashMap::new(),
+        );
+        assert!(session.pending_outbound.is_empty());
+
+        // `RAW SEND` is sent through the raw sub-session, the remote's lease set is unknown so the
+        // datagram is queued
+        session.on_send_datagram_command(
+            remote.clone(),
+            SessionKind::Anonymous,
+            b"hello".to_vec(),
+            HashMap::from_iter([("TO_PORT".to_string(), "7".to_string())]),
+        );
+        match session.pending_outbound.get(&remote.id()) {
+            Some(PendingSession {
+                datagrams: Some((_, datagrams)),
+                ..
+            }) => {
+                assert_eq!(datagrams.len(), 1);
+                assert_eq!(datagrams[0].0, Protocol::Anonymous);
+                assert_eq!(datagrams[0].1, b"hello");
+                assert_eq!(
+                    datagrams[0].2.as_ref().and_then(|options| options.get(&Str::from("TO_PORT"))),
+                    Some(&Str::from("7"))
+                );
+            }
+            _ => panic!("datagram not queued"),
+        }
     }
 }

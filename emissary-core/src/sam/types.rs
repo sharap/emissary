@@ -190,6 +190,9 @@ pub struct SubSession {
     ///
     /// `LISTEN_PORT` of `SESSION ADD`, defaulting to `FROM_PORT` and `0` which is a wildcard.
     pub listen_port: u16,
+
+    /// Creation order of the sub-session within the primary session, higher is newer.
+    pub created: u64,
 }
 
 /// Session kind for [`SamSession`].
