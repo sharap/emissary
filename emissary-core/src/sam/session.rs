@@ -374,7 +374,10 @@ impl<R: Runtime> SamSession<R> {
         // datagram sessions forward inbound datagrams to the client's udp socket
         if core::matches!(
             session_kind,
-            SessionKind::Datagram | SessionKind::Anonymous | SessionKind::Datagram2
+            SessionKind::Datagram
+                | SessionKind::Anonymous
+                | SessionKind::Datagram2
+                | SessionKind::Datagram3
         ) && datagram_manager
             .add_listener(Arc::clone(&session_id), session_kind, &options)
             .is_err()
@@ -410,6 +413,9 @@ impl<R: Runtime> SamSession<R> {
                 },
                 SessionKind::Datagram2 => SamSessionKind::Datagram {
                     kind: SessionKind::Datagram2,
+                },
+                SessionKind::Datagram3 => SamSessionKind::Datagram {
+                    kind: SessionKind::Datagram3,
                 },
                 SessionKind::Primary => SamSessionKind::Primary {
                     sub_sessions: HashMap::new(),
@@ -724,6 +730,7 @@ impl<R: Runtime> SamSession<R> {
                         &Sha256::new().update(&*destination).finalize(),
                         options,
                     ),
+                    Protocol::Datagram3 => self.datagram_manager.make_datagram3(datagram, options),
                     Protocol::Streaming => unreachable!(),
                 };
 
@@ -855,6 +862,8 @@ impl<R: Runtime> SamSession<R> {
                             &Sha256::new().update(&*destination).finalize(),
                             options,
                         ),
+                        Protocol::Datagram3 =>
+                            self.datagram_manager.make_datagram3(datagram, options),
                         Protocol::Streaming => unreachable!(),
                     };
 
@@ -1026,8 +1035,8 @@ impl<R: Runtime> SamSession<R> {
         }
     }
 
-    /// Handle one or more inbound messages.
-    fn on_inbound_message(&mut self, messages: Vec<Vec<u8>>) {
+    /// Handle one or more inbound messages sent by `sender`.
+    fn on_inbound_message(&mut self, sender: DestinationId, messages: Vec<Vec<u8>>) {
         messages
             .into_iter()
             .for_each(|message| match I2cpPayload::decompress::<R>(message) {
@@ -1053,7 +1062,8 @@ impl<R: Runtime> SamSession<R> {
                             }
                         }
                         protocol =>
-                            if let Err(error) = self.datagram_manager.on_datagram(payload) {
+                            if let Err(error) = self.datagram_manager.on_datagram(payload, &sender)
+                            {
                                 tracing::warn!(
                                     target: LOG_TARGET,
                                     session_id = ?self.session_id,
@@ -1317,7 +1327,10 @@ impl<R: Runtime> SamSession<R> {
                         .to_vec();
                 }
             }
-            SessionKind::Datagram | SessionKind::Anonymous | SessionKind::Datagram2 => {
+            SessionKind::Datagram
+            | SessionKind::Anonymous
+            | SessionKind::Datagram2
+            | SessionKind::Datagram3 => {
                 // repliable datagram1 datagrams cannot carry an offline signature
                 if self.offline_keys.is_some()
                     && core::matches!(session_kind, SessionKind::Datagram)
@@ -1706,8 +1719,10 @@ impl<R: Runtime> Future for SamSession<R> {
             match self.destination.poll_next_unpin(cx) {
                 Poll::Pending => break,
                 Poll::Ready(None) => return Poll::Ready(Arc::clone(&self.session_id)),
-                Poll::Ready(Some(DestinationEvent::Messages { messages })) =>
-                    self.on_inbound_message(messages),
+                Poll::Ready(Some(DestinationEvent::Messages {
+                    destination_id,
+                    messages,
+                })) => self.on_inbound_message(destination_id, messages),
                 Poll::Ready(Some(DestinationEvent::LeaseSetFound { destination_id })) =>
                     self.on_lease_set_found(destination_id),
                 Poll::Ready(Some(DestinationEvent::BlindedLeaseSetFound {
@@ -2688,12 +2703,15 @@ mod tests {
         assert!(String::from_utf8_lossy(&result).contains("RESULT=OK"));
         assert!(session
             .datagram_manager
-            .on_datagram(I2cpPayload {
-                dst_port: 20,
-                payload: vec![1, 2, 3, 4],
-                protocol: Protocol::Datagram,
-                src_port: 0,
-            })
+            .on_datagram(
+                I2cpPayload {
+                    dst_port: 20,
+                    payload: vec![1, 2, 3, 4],
+                    protocol: Protocol::Datagram,
+                    src_port: 0,
+                },
+                &DestinationId::random(),
+            )
             .is_err());
         assert!(!session.session_kind.supports_datagrams(&Arc::from("datagram")));
         match ctx.sub_rx.try_recv() {

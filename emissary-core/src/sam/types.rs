@@ -251,7 +251,10 @@ impl SamSessionKind {
                 sub_sessions.get(session_id).is_some_and(|sub_session| {
                     core::matches!(
                         sub_session.kind,
-                        SessionKind::Datagram | SessionKind::Anonymous | SessionKind::Datagram2,
+                        SessionKind::Datagram
+                            | SessionKind::Anonymous
+                            | SessionKind::Datagram2
+                            | SessionKind::Datagram3,
                     )
                 }),
         }
@@ -267,6 +270,7 @@ impl SamSessionKind {
                 SessionKind::Datagram => Protocol::Datagram,
                 SessionKind::Anonymous => Protocol::Anonymous,
                 SessionKind::Datagram2 => Protocol::Datagram2,
+                SessionKind::Datagram3 => Protocol::Datagram3,
                 _ => unreachable!(),
             },
             Self::Primary { sub_sessions } =>
@@ -275,6 +279,7 @@ impl SamSessionKind {
                     SessionKind::Datagram => Protocol::Datagram,
                     SessionKind::Anonymous => Protocol::Anonymous,
                     SessionKind::Datagram2 => Protocol::Datagram2,
+                    SessionKind::Datagram3 => Protocol::Datagram3,
                     _ => unreachable!(),
                 },
         }

@@ -20,7 +20,7 @@ use crate::{
     crypto::{base64_encode, sha256::Sha256, SigningPrivateKey, SigningPublicKey},
     error::Error,
     i2cp::I2cpPayload,
-    primitives::{DatagramFlags, Destination, Mapping, OfflineSignature},
+    primitives::{DatagramFlags, Destination, DestinationId, Mapping, OfflineSignature},
     protocol::Protocol,
     runtime::Runtime,
     sam::parser::SessionKind,
@@ -203,6 +203,7 @@ impl DatagramListener {
         match self.kind {
             SessionKind::Datagram => protocol == Protocol::Datagram,
             SessionKind::Datagram2 => protocol == Protocol::Datagram2,
+            SessionKind::Datagram3 => protocol == Protocol::Datagram3,
             SessionKind::Anonymous =>
                 protocol == Protocol::Anonymous
                     || (self.listen_protocol == 0 && protocol != Protocol::Streaming),
@@ -339,6 +340,20 @@ impl<R: Runtime> DatagramManager<R> {
         out.freeze()
     }
 
+    /// Make repliable datagram3.
+    ///
+    /// The sender is identified by the hash of its destination and the datagram is not signed.
+    pub fn make_datagram3(&mut self, payload: Vec<u8>, options: Option<Mapping>) -> Bytes {
+        let flags = DatagramFlags::new_v3(options).serialize();
+
+        let mut out = BytesMut::with_capacity(32 + flags.len() + payload.len());
+        out.put_slice(&self.destination_hash);
+        out.put_slice(&flags);
+        out.put_slice(&payload);
+
+        out.freeze()
+    }
+
     /// Find listener for a datagram of `protocol` sent to `dst_port`.
     ///
     /// A listener of the matching kind with the exact port is preferred, then one with the
@@ -359,8 +374,13 @@ impl<R: Runtime> DatagramManager<R> {
             .or_else(|| candidates.clone().find(|listener| listener.listen_port == 0))
     }
 
-    /// Handle inbound datagram.
-    pub fn on_datagram(&self, payload: I2cpPayload) -> crate::Result<()> {
+    /// Handle inbound datagram sent by `sender`, the remote destination the garlic session which
+    /// delivered the datagram is bound to.
+    ///
+    /// Datagram2 and Datagram3 datagrams must come from the destination they claim to come from
+    /// (Datagram3 is otherwise unauthenticated), Datagram1 and raw datagrams are forwarded as they
+    /// are.
+    pub fn on_datagram(&self, payload: I2cpPayload, sender: &DestinationId) -> crate::Result<()> {
         let I2cpPayload {
             dst_port,
             payload,
@@ -437,6 +457,16 @@ impl<R: Runtime> DatagramManager<R> {
                 let (rest, destination) =
                     Destination::parse_frame(&payload).map_err(|_| Error::InvalidData)?;
 
+                if &destination.id() != sender {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        %sender,
+                        claimed = %destination.id(),
+                        "datagram2 sender doesn't match the garlic session, dropping",
+                    );
+                    return Err(Error::InvalidData);
+                }
+
                 // signed data starts right after the sender's destination
                 let signed_data_start = payload.len() - rest.len();
 
@@ -504,6 +534,47 @@ impl<R: Runtime> DatagramManager<R> {
 
                 out.put_slice(info);
                 out.put_slice(payload);
+
+                let _ = self.datagram_tx.try_send(ForwardedDatagram {
+                    datagram: out.to_vec(),
+                    target,
+                });
+
+                Ok(())
+            }
+            Protocol::Datagram3 => {
+                let (rest, hash) = take::<_, _, ()>(32usize)(payload.as_slice())
+                    .map_err(|_| Error::InvalidData)?;
+
+                // datagram3 isn't signed, the only assurance about the sender is that the garlic
+                // session which delivered it is bound to the claimed destination
+                if &DestinationId::from(hash) != sender {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        %sender,
+                        claimed = %DestinationId::from(hash),
+                        "datagram3 sender doesn't match the garlic session, dropping",
+                    );
+                    return Err(Error::InvalidData);
+                }
+
+                let (rest, flags) =
+                    DatagramFlags::parse_frame(rest).map_err(|_| Error::InvalidData)?;
+                let DatagramFlags::V3 { .. } = flags else {
+                    return Err(Error::InvalidData);
+                };
+
+                // the client gets the base64 hash of the sender and resolves it with a naming
+                // lookup if it wants to reply
+                let info = format!(
+                    "{} FROM_PORT={src_port} TO_PORT={dst_port}\n",
+                    base64_encode(hash)
+                );
+                let info = info.as_bytes();
+
+                let mut out = BytesMut::with_capacity(info.len() + rest.len());
+                out.put_slice(info);
+                out.put_slice(rest);
 
                 let _ = self.datagram_tx.try_send(ForwardedDatagram {
                     datagram: out.to_vec(),
@@ -659,12 +730,15 @@ mod tests {
             sender.make_datagram2(b"hello, world".to_vec(), &receiver.destination_hash, None);
 
         receiver
-            .on_datagram(I2cpPayload {
-                dst_port: 0,
-                payload: datagram.to_vec(),
-                protocol: Protocol::Datagram2,
-                src_port: 0,
-            })
+            .on_datagram(
+                I2cpPayload {
+                    dst_port: 0,
+                    payload: datagram.to_vec(),
+                    protocol: Protocol::Datagram2,
+                    src_port: 0,
+                },
+                &sender_destination.id(),
+            )
             .unwrap();
 
         let ForwardedDatagram {
@@ -679,6 +753,20 @@ mod tests {
         assert_eq!(target, localhost(8888));
         assert!(data.starts_with(info.as_bytes()));
         assert_eq!(&data[info.len()..], b"hello, world");
+
+        // a datagram2 delivered by a garlic session of another destination is dropped
+        assert!(receiver
+            .on_datagram(
+                I2cpPayload {
+                    dst_port: 0,
+                    payload: datagram.to_vec(),
+                    protocol: Protocol::Datagram2,
+                    src_port: 0,
+                },
+                &DestinationId::random(),
+            )
+            .is_err());
+        assert!(receiver_rx.try_recv().is_err());
     }
 
     #[test]
@@ -720,12 +808,15 @@ mod tests {
             datagram.len() - 1,
         ] {
             assert!(receiver
-                .on_datagram(I2cpPayload {
-                    dst_port: 0,
-                    payload: datagram[..len].to_vec(),
-                    protocol: Protocol::Datagram2,
-                    src_port: 0,
-                })
+                .on_datagram(
+                    I2cpPayload {
+                        dst_port: 0,
+                        payload: datagram[..len].to_vec(),
+                        protocol: Protocol::Datagram2,
+                        src_port: 0,
+                    },
+                    &sender.destination.id()
+                )
                 .is_err());
         }
 
@@ -739,12 +830,15 @@ mod tests {
 
         let manager = DatagramManager::<MockRuntime>::new(destination, tx, signing_key);
 
-        match manager.on_datagram(I2cpPayload {
-            dst_port: 0,
-            payload: vec![1, 3, 3, 7],
-            protocol: Protocol::Datagram,
-            src_port: 0,
-        }) {
+        match manager.on_datagram(
+            I2cpPayload {
+                dst_port: 0,
+                payload: vec![1, 3, 3, 7],
+                protocol: Protocol::Datagram,
+                src_port: 0,
+            },
+            &DestinationId::random(),
+        ) {
             Err(Error::InvalidState) => {}
             _ => panic!("invalid result"),
         }
@@ -978,15 +1072,19 @@ mod tests {
         let (sender_tx, _sender_rx) = channel(16);
         let mut sender = DatagramManager::<MockRuntime>::new(sender, sender_tx, sender_key);
 
+        let sender_id = sender.destination.id();
         let deliver =
             |manager: &DatagramManager<MockRuntime>, protocol, dst_port, payload: Bytes| {
                 manager
-                    .on_datagram(I2cpPayload {
-                        dst_port,
-                        payload: payload.to_vec(),
-                        protocol,
-                        src_port: 7,
-                    })
+                    .on_datagram(
+                        I2cpPayload {
+                            dst_port,
+                            payload: payload.to_vec(),
+                            protocol,
+                            src_port: 7,
+                        },
+                        &sender_id,
+                    )
                     .unwrap();
                 let ForwardedDatagram { target, datagram } = rx.try_recv().unwrap();
                 (target, datagram)
@@ -1028,12 +1126,15 @@ mod tests {
         // once the default sub-session is removed, unrouted datagrams are dropped
         manager.remove_listener(&Arc::from("raw-any"));
         assert!(manager
-            .on_datagram(I2cpPayload {
-                dst_port: 11,
-                payload: b"raw".to_vec(),
-                protocol: Protocol::Anonymous,
-                src_port: 7,
-            })
+            .on_datagram(
+                I2cpPayload {
+                    dst_port: 11,
+                    payload: b"raw".to_vec(),
+                    protocol: Protocol::Anonymous,
+                    src_port: 7,
+                },
+                &sender_id
+            )
             .is_err());
         assert!(rx.try_recv().is_err());
     }
@@ -1077,12 +1178,15 @@ mod tests {
         }
 
         receiver
-            .on_datagram(I2cpPayload {
-                dst_port: 0,
-                payload: datagram.to_vec(),
-                protocol: Protocol::Datagram2,
-                src_port: 0,
-            })
+            .on_datagram(
+                I2cpPayload {
+                    dst_port: 0,
+                    payload: datagram.to_vec(),
+                    protocol: Protocol::Datagram2,
+                    src_port: 0,
+                },
+                &sender_destination.id(),
+            )
             .unwrap();
 
         let ForwardedDatagram {
@@ -1108,12 +1212,137 @@ mod tests {
             sender.make_datagram2(b"hello, world".to_vec(), &receiver.destination_hash, None);
 
         assert!(receiver
-            .on_datagram(I2cpPayload {
-                dst_port: 0,
-                payload: datagram.to_vec(),
-                protocol: Protocol::Datagram2,
-                src_port: 0,
-            })
+            .on_datagram(
+                I2cpPayload {
+                    dst_port: 0,
+                    payload: datagram.to_vec(),
+                    protocol: Protocol::Datagram2,
+                    src_port: 0,
+                },
+                &sender.destination.id()
+            )
+            .is_err());
+        assert!(receiver_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn datagram3_roundtrip() {
+        let (sender_destination, sender_signing_key) = Destination::random();
+        let (receiver_destination, receiver_signing_key) = Destination::random();
+        let (sender_tx, _sender_rx) = channel(16);
+        let (receiver_tx, receiver_rx) = channel(16);
+
+        let mut sender = DatagramManager::<MockRuntime>::new(
+            sender_destination.clone(),
+            sender_tx,
+            sender_signing_key,
+        );
+        let mut receiver = DatagramManager::<MockRuntime>::new(
+            receiver_destination,
+            receiver_tx,
+            receiver_signing_key,
+        );
+        receiver
+            .add_listener(
+                "test".into(),
+                SessionKind::Datagram3,
+                &options(&[("PORT", "8888")]),
+            )
+            .unwrap();
+
+        let mut mapping = Mapping::default();
+        mapping.insert("hello".into(), "world".into());
+        let datagram = sender.make_datagram3(b"hello, world".to_vec(), Some(mapping));
+
+        // sender hash, flags with options, payload
+        assert_eq!(&datagram[..32], &sender.destination_hash);
+        assert_eq!(&datagram[32..34], &[0x00, 0x13]);
+        assert!(datagram.ends_with(b"hello, world"));
+
+        receiver
+            .on_datagram(
+                I2cpPayload {
+                    dst_port: 5,
+                    payload: datagram.to_vec(),
+                    protocol: Protocol::Datagram3,
+                    src_port: 7,
+                },
+                &sender_destination.id(),
+            )
+            .unwrap();
+
+        let ForwardedDatagram {
+            target,
+            datagram: data,
+        } = receiver_rx.try_recv().unwrap();
+        let info = format!(
+            "{} FROM_PORT=7 TO_PORT=5\n",
+            base64_encode(sender_destination.id().to_vec())
+        );
+
+        assert_eq!(target, localhost(8888));
+        assert_eq!(info.len(), 44 + " FROM_PORT=7 TO_PORT=5\n".len());
+        assert!(data.starts_with(info.as_bytes()));
+        assert_eq!(&data[info.len()..], b"hello, world");
+
+        // datagram3 without options
+        let datagram = sender.make_datagram3(b"hi".to_vec(), None);
+        assert_eq!(&datagram[32..34], &[0x00, 0x03]);
+        receiver
+            .on_datagram(
+                I2cpPayload {
+                    dst_port: 0,
+                    payload: datagram.to_vec(),
+                    protocol: Protocol::Datagram3,
+                    src_port: 0,
+                },
+                &sender_destination.id(),
+            )
+            .unwrap();
+        let ForwardedDatagram { datagram: data, .. } = receiver_rx.try_recv().unwrap();
+        assert!(data.ends_with(b"\nhi"));
+
+        // the claimed sender must be the destination of the garlic session
+        assert!(receiver
+            .on_datagram(
+                I2cpPayload {
+                    dst_port: 0,
+                    payload: datagram.to_vec(),
+                    protocol: Protocol::Datagram3,
+                    src_port: 0,
+                },
+                &DestinationId::random(),
+            )
+            .is_err());
+
+        // truncated datagrams are rejected
+        for len in [0, 1, 31, 32, 33] {
+            assert!(receiver
+                .on_datagram(
+                    I2cpPayload {
+                        dst_port: 0,
+                        payload: datagram[..len].to_vec(),
+                        protocol: Protocol::Datagram3,
+                        src_port: 0,
+                    },
+                    &sender_destination.id(),
+                )
+                .is_err());
+        }
+
+        // datagram2 flags in a datagram3 are rejected
+        let mut wrong_version = datagram.to_vec();
+        wrong_version[33] = 0x02;
+        assert!(receiver
+            .on_datagram(
+                I2cpPayload {
+                    dst_port: 0,
+                    payload: wrong_version,
+                    protocol: Protocol::Datagram3,
+                    src_port: 0,
+                },
+                &sender_destination.id(),
+            )
             .is_err());
         assert!(receiver_rx.try_recv().is_err());
     }

@@ -92,6 +92,9 @@ pub enum SessionKind {
     /// Repliable datagram with replay prevention.
     Datagram2,
 
+    /// Repliable datagram which is not authenticated, the sender is identified by a hash.
+    Datagram3,
+
     /// Anonymous datagrams.
     Anonymous,
 
@@ -440,7 +443,8 @@ impl<'a, R: Runtime> TryFrom<ParsedCommand<'a, R>> for SamCommand {
                 let session_kind = match parsed_cmd.key_value_pairs.remove("STYLE") {
                     Some("STREAM") => SessionKind::Stream,
                     Some("PRIMARY") | Some("MASTER") => SessionKind::Primary,
-                    style @ (Some("RAW") | Some("DATAGRAM") | Some("DATAGRAM2")) => {
+                    style @ (Some("RAW") | Some("DATAGRAM") | Some("DATAGRAM2")
+                    | Some("DATAGRAM3")) => {
                         // currently only forwarded datagrams are supported
                         let _ = parsed_cmd.key_value_pairs.get("PORT").ok_or_else(|| {
                             tracing::warn!(
@@ -458,6 +462,7 @@ impl<'a, R: Runtime> TryFrom<ParsedCommand<'a, R>> for SamCommand {
                             Some("RAW") => SessionKind::Anonymous,
                             Some("DATAGRAM") => SessionKind::Datagram,
                             Some("DATAGRAM2") => SessionKind::Datagram2,
+                            Some("DATAGRAM3") => SessionKind::Datagram3,
                             _ => unreachable!(),
                         }
                     }
@@ -706,7 +711,8 @@ impl<'a, R: Runtime> TryFrom<ParsedCommand<'a, R>> for SamCommand {
                         );
                         return Err(());
                     }
-                    style @ (Some("RAW") | Some("DATAGRAM") | Some("DATAGRAM2")) => {
+                    style @ (Some("RAW") | Some("DATAGRAM") | Some("DATAGRAM2")
+                    | Some("DATAGRAM3")) => {
                         // currently only forwarded datagrams are supported
                         let _ = parsed_cmd.key_value_pairs.get("PORT").ok_or_else(|| {
                             tracing::warn!(
@@ -724,6 +730,7 @@ impl<'a, R: Runtime> TryFrom<ParsedCommand<'a, R>> for SamCommand {
                             Some("RAW") => SessionKind::Anonymous,
                             Some("DATAGRAM") => SessionKind::Datagram,
                             Some("DATAGRAM2") => SessionKind::Datagram2,
+                            Some("DATAGRAM3") => SessionKind::Datagram3,
                             _ => unreachable!(),
                         }
                     }
@@ -2405,5 +2412,29 @@ mod tests {
         assert!(
             SamCommand::parse::<MockRuntime>("DATAGRAM SEND DESTINATION=hello SIZE=1").is_none()
         );
+    }
+
+    #[test]
+    fn parse_datagram3_sessions() {
+        match SamCommand::parse::<MockRuntime>(
+            "SESSION CREATE STYLE=DATAGRAM3 ID=test DESTINATION=TRANSIENT PORT=8888",
+        ) {
+            Some(SamCommand::CreateSession {
+                session_kind: SessionKind::Datagram3,
+                ..
+            }) => {}
+            response => panic!("invalid response: {response:?}"),
+        }
+
+        match SamCommand::parse::<MockRuntime>("SESSION ADD STYLE=DATAGRAM3 ID=sub PORT=8888") {
+            Some(SamCommand::CreateSubSession {
+                session_kind: SessionKind::Datagram3,
+                ..
+            }) => {}
+            response => panic!("invalid response: {response:?}"),
+        }
+
+        // forwarding port is required like for the other datagram styles
+        assert!(SamCommand::parse::<MockRuntime>("SESSION ADD STYLE=DATAGRAM3 ID=sub").is_none());
     }
 }

@@ -376,7 +376,13 @@ mod tests {
     fn short_nsr_x25519() {
         let mut session = make_session(None);
 
-        for len in [0, 1, NSR_MINIMUM_LEN - 1, NSR_MINIMUM_LEN, NSR_MINIMUM_LEN + 1] {
+        for len in [
+            0,
+            1,
+            NSR_MINIMUM_LEN - 1,
+            NSR_MINIMUM_LEN,
+            NSR_MINIMUM_LEN + 1,
+        ] {
             let entry = session.generate_new_session_reply_tags(100).next().unwrap();
 
             assert!(session.handle_new_session_reply(entry, random_message(len), 100).is_err());

@@ -31,6 +31,9 @@ pub enum Protocol {
 
     /// Raw datagrams.
     Anonymous,
+    /// Repliable datagrams which are not authenticated, the sender is identified by the hash of
+    /// its destination.
+    Datagram3,
 }
 
 impl Protocol {
@@ -41,6 +44,7 @@ impl Protocol {
             17u8 => Some(Self::Datagram),
             19u8 => Some(Self::Datagram2),
             18u8 => Some(Self::Anonymous),
+            20u8 => Some(Self::Datagram3),
             _ => {
                 tracing::warn!(?protocol, "unknown i2cp protocol");
                 None
@@ -55,6 +59,7 @@ impl Protocol {
             Self::Datagram => 17u8,
             Self::Datagram2 => 19u8,
             Self::Anonymous => 18u8,
+            Self::Datagram3 => 20u8,
         }
     }
 }

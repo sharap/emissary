@@ -3261,3 +3261,161 @@ async fn raw_send_over_control_socket(kind: TransportKind) {
     assert_eq!(handle.await.unwrap(), b"hello, world!");
     drop(control);
 }
+
+#[tokio::test(start_paused = true)]
+async fn datagram3_works_ntcp2() {
+    datagram3_works(TransportKind::Ntcp2).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn datagram3_works_ssu2() {
+    datagram3_works(TransportKind::Ssu2).await;
+}
+
+/// Two `DATAGRAM3` sessions exchange datagrams: the receiver gets the sender's destination hash,
+/// resolves it with `NAMING LOOKUP` and replies.
+///
+/// Both sessions are driven over raw SAMv3 sockets since the client library doesn't support the
+/// style.
+async fn datagram3_works(kind: TransportKind) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let mut router_infos = Vec::<Vec<u8>>::new();
+    let net_id = (TokioRuntime::rng().next_u32() % 255) as u8;
+
+    for i in 0..4 {
+        let (router, _events, router_info) =
+            make_router(i < 2, net_id, router_infos.clone(), kind).await;
+
+        router_infos.push(router_info);
+        tokio::spawn(router);
+    }
+
+    // create two more routers, fetch their sam ports and spawn them in the background
+    let mut ports = Vec::<(u16, u16)>::new();
+
+    for _ in 0..2 {
+        let router = make_router(false, net_id, router_infos.clone(), kind).await.0;
+        let addr_info = router.protocol_address_info();
+
+        ports.push((
+            addr_info.sam_tcp.unwrap().port(),
+            addr_info.sam_udp.unwrap().port(),
+        ));
+        tokio::spawn(router);
+    }
+
+    // let the network boot up
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    /// Create a `DATAGRAM3` session whose inbound datagrams are forwarded to a local udp socket.
+    async fn create_session(
+        sam_port: u16,
+        id: &str,
+    ) -> (tokio::net::TcpStream, tokio::net::UdpSocket, String) {
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut control = tokio::net::TcpStream::connect(format!("127.0.0.1:{sam_port}"))
+            .await
+            .expect("to succeed");
+        control.write_all(b"HELLO VERSION\n").await.unwrap();
+        assert!(read_sam_line(&mut control).await.starts_with("HELLO REPLY RESULT=OK"));
+        control
+            .write_all(
+                format!(
+                    "SESSION CREATE STYLE=DATAGRAM3 ID={id} DESTINATION=TRANSIENT PORT={}\n",
+                    udp.local_addr().unwrap().port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(30), read_sam_line(&mut control))
+            .await
+            .expect("no timeout");
+        let private_key = status
+            .strip_prefix("SESSION STATUS RESULT=OK DESTINATION=")
+            .unwrap_or_else(|| panic!("unexpected session status: {status}"));
+        let destination = base64_encode(
+            Destination::parse(base64_decode(private_key.trim()).expect("valid base64"))
+                .unwrap()
+                .serialize(),
+        );
+
+        (control, udp, destination)
+    }
+
+    let (control_a, udp_a, destination_a) = create_session(ports[0].0, "a").await;
+    let (mut control_b, udp_b, destination_b) = create_session(ports[1].0, "b").await;
+    let hash_a = Destination::parse(base64_decode(&destination_a).unwrap()).unwrap().id();
+
+    // a sends a datagram3 to b through the sam udp port
+    let sam_udp_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sam_udp_a
+        .send_to(
+            format!("3.0 a {destination_b}\nhello, world!").as_bytes(),
+            format!("127.0.0.1:{}", ports[0].1),
+        )
+        .await
+        .unwrap();
+
+    // b receives the base64 hash of a's destination, the ports and the payload
+    let mut buffer = vec![0u8; 512];
+    let nread = tokio::time::timeout(Duration::from_secs(60), udp_b.recv(&mut buffer))
+        .await
+        .expect("no timeout")
+        .expect("to succeed");
+    let received = std::str::from_utf8(&buffer[..nread]).unwrap();
+    let (header, payload) = received.split_once('\n').unwrap();
+    assert_eq!(payload, "hello, world!");
+    assert_eq!(
+        header,
+        format!("{} FROM_PORT=0 TO_PORT=0", base64_encode(hash_a.to_vec()))
+    );
+    let sender_hash = header.split(' ').next().unwrap();
+    assert_eq!(sender_hash.len(), 44);
+
+    // b resolves the hash to a's destination with a naming lookup
+    let address = format!(
+        "{}.b32.i2p",
+        base32_encode(base64_decode(sender_hash).unwrap())
+    );
+    control_b
+        .write_all(format!("NAMING LOOKUP NAME={address}\n").as_bytes())
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(60), read_sam_line(&mut control_b))
+        .await
+        .expect("no timeout");
+    let resolved = reply
+        .strip_prefix(&format!("NAMING REPLY RESULT=OK NAME={address} VALUE="))
+        .unwrap_or_else(|| panic!("unexpected naming reply: {reply}"));
+    assert_eq!(resolved.trim(), destination_a);
+
+    // b replies to a
+    let sam_udp_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sam_udp_b
+        .send_to(
+            format!("3.0 b {resolved}\ngoodbye, world!").as_bytes(),
+            format!("127.0.0.1:{}", ports[1].1),
+        )
+        .await
+        .unwrap();
+
+    let nread = tokio::time::timeout(Duration::from_secs(60), udp_a.recv(&mut buffer))
+        .await
+        .expect("no timeout")
+        .expect("to succeed");
+    let received = std::str::from_utf8(&buffer[..nread]).unwrap();
+    let (header, payload) = received.split_once('\n').unwrap();
+    assert_eq!(payload, "goodbye, world!");
+    assert!(header.starts_with(&base64_encode(
+        Destination::parse(base64_decode(&destination_b).unwrap())
+            .unwrap()
+            .id()
+            .to_vec()
+    )));
+
+    drop(control_a);
+}

@@ -113,6 +113,9 @@ impl DeliveryStyle {
 pub enum DestinationEvent {
     /// One or more messages received.
     Messages {
+        /// ID of the remote destination which sent the messages.
+        destination_id: DestinationId,
+
         /// One or more I2NP Data messages.
         messages: Vec<Vec<u8>>,
     },
@@ -321,7 +324,6 @@ impl<R: Runtime> Destination<R> {
 
         let blinded = self.blinded_destinations.get(destination_id).cloned();
 
-
         if let Some(context) = self.remote_destinations.get(destination_id) {
             if !context.lease_set.is_expired::<R>() {
                 return LeaseSetStatus::Found;
@@ -349,11 +351,11 @@ impl<R: Runtime> Destination<R> {
                 // encrypted lease sets are stored under the hash of the blinded key of the day
                 let key = match &blinded {
                     None => Bytes::from(destination_id.to_vec()),
-                    Some(blinded) => match blinded.store_hash(&date_string(R::time_since_epoch()))
-                    {
-                        Some(hash) => Bytes::from(hash.to_vec()),
-                        None => return (destination_id, Err(QueryError::ValueNotFound)),
-                    },
+                    Some(blinded) =>
+                        match blinded.store_hash(&date_string(R::time_since_epoch())) {
+                            Some(hash) => Bytes::from(hash.to_vec()),
+                            None => return (destination_id, Err(QueryError::ValueNotFound)),
+                        },
                 };
 
                 let Ok(rx) = handle.query_lease_set(key) else {
@@ -609,7 +611,13 @@ impl<R: Runtime> Destination<R> {
     /// lease set.
     ///
     /// Any garlic clove containing an I2NP Data message is returned to user.
-    fn decrypt_message(&mut self, message: Message) -> crate::Result<Vec<Vec<u8>>> {
+    ///
+    /// Returns the ID of the remote destination which sent the message and the messages for the
+    /// client, or `None` if the message was consumed by the destination itself.
+    fn decrypt_message(
+        &mut self,
+        message: Message,
+    ) -> crate::Result<Option<(DestinationId, Vec<Vec<u8>>)>> {
         tracing::trace!(
             target: LOG_TARGET,
             local = %self.destination_id,
@@ -638,7 +646,7 @@ impl<R: Runtime> Destination<R> {
                     DatabaseStorePayload::LeaseSet2 { .. }
                     | DatabaseStorePayload::EncryptedLeaseSet2 { .. } => {
                         self.lease_set_manager.register_database_store(key.clone());
-                        return Ok(Vec::new());
+                        return Ok(None);
                     }
                     DatabaseStorePayload::RouterInfo { .. } => {
                         tracing::warn!(
@@ -663,7 +671,7 @@ impl<R: Runtime> Destination<R> {
                     })?;
 
                 self.lease_set_manager.register_database_search_reply(key.clone(), routers);
-                return Ok(Vec::new());
+                return Ok(None);
             }
             MessageType::DeliveryStatus => {
                 let DeliveryStatus { message_id, .. } = DeliveryStatus::parse(&message.payload)
@@ -683,7 +691,7 @@ impl<R: Runtime> Destination<R> {
                     "delivery status",
                 );
 
-                return Ok(Vec::new());
+                return Ok(None);
             }
             MessageType::Garlic => {}
             _ => {
@@ -708,10 +716,9 @@ impl<R: Runtime> Destination<R> {
             return Err(Error::InvalidData);
         }
 
-        Ok(self
-            .session_manager
-            .decrypt(message)
-            .map_err(Error::Session)?
+        let (destination_id, cloves) =
+            self.session_manager.decrypt_from(message).map_err(Error::Session)?;
+        let messages = cloves
             .filter_map(|clove| match clove.message_type {
                 MessageType::DatabaseStore => {
                     tracing::debug!(
@@ -801,7 +808,9 @@ impl<R: Runtime> Destination<R> {
                     None
                 }
             })
-            .collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        Ok(Some((destination_id, messages)))
     }
 
     /// Attempt to publish new lease set to `NetDb`.
@@ -916,8 +925,11 @@ impl<R: Runtime> Stream for Destination<R> {
                             ?error,
                             "failed to handle inbound message",
                         ),
-                        Ok(messages) if !messages.is_empty() =>
-                            return Poll::Ready(Some(DestinationEvent::Messages { messages })),
+                        Ok(Some((destination_id, messages))) if !messages.is_empty() =>
+                            return Poll::Ready(Some(DestinationEvent::Messages {
+                                destination_id,
+                                messages,
+                            })),
                         Ok(_) => {}
                     }
                 }
@@ -974,7 +986,8 @@ impl<R: Runtime> Stream for Destination<R> {
                             );
 
                             let key = key.clone();
-                            self.resolved_blinded.insert(queried_id.clone(), destination_id.clone());
+                            self.resolved_blinded
+                                .insert(queried_id.clone(), destination_id.clone());
                             self.blinded_destinations.insert(destination_id.clone(), key);
                         }
 
@@ -1002,7 +1015,6 @@ impl<R: Runtime> Stream for Destination<R> {
                         }));
                     }
                     Ok(lease_set) => {
-
                         match lease_set.public_keys.iter().find(|&remote_key| {
                             self.public_keys
                                 .iter()
@@ -1554,7 +1566,12 @@ mod tests {
     }
 
     /// Encrypted lease set of a random destination, its blinded key and the ID of the destination.
-    fn encrypted_remote() -> (EncryptedLeaseSet2, BlindedPublicKey, DestinationId, [u8; 32]) {
+    fn encrypted_remote() -> (
+        EncryptedLeaseSet2,
+        BlindedPublicKey,
+        DestinationId,
+        [u8; 32],
+    ) {
         let (lease_set, signing_key) = LeaseSet2::random();
         let remote_id = lease_set.header.destination.id();
         let serialized = lease_set.serialize(&signing_key);
@@ -1613,9 +1630,15 @@ mod tests {
         let context = destination.remote_destinations.get(&remote_id).unwrap();
         assert_eq!(context.lease_set.header.destination.id(), remote_id);
         assert!(!destination.remote_destinations.contains_key(&blinded_id));
-        assert_eq!(destination.query_lease_set(&remote_id), LeaseSetStatus::Found);
+        assert_eq!(
+            destination.query_lease_set(&remote_id),
+            LeaseSetStatus::Found
+        );
         assert!(!destination.pending_queries.contains(&blinded_id));
-        assert_eq!(destination.register_blinded_destination(blinded.clone()), remote_id);
+        assert_eq!(
+            destination.register_blinded_destination(blinded.clone()),
+            remote_id
+        );
         assert_eq!(destination.blinded_key(&remote_id), Some(&blinded));
     }
 
@@ -1668,9 +1691,9 @@ mod tests {
                 destination.query_lease_set(&blinded_id),
                 LeaseSetStatus::NotFound
             );
-            assert!(tokio::time::timeout(Duration::from_secs(2), destination.next())
-                .await
-                .is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), destination.next()).await.is_err()
+            );
 
             match rx.try_recv().unwrap() {
                 NetDbAction::QueryLeaseSet2 { tx, .. } => {
@@ -1701,9 +1724,9 @@ mod tests {
                 destination.query_lease_set(&remote_id),
                 LeaseSetStatus::NotFound
             );
-            assert!(tokio::time::timeout(Duration::from_secs(2), destination.next())
-                .await
-                .is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), destination.next()).await.is_err()
+            );
 
             match rx.try_recv().unwrap() {
                 NetDbAction::QueryLeaseSet2 { key, tx } => {
@@ -1796,7 +1819,7 @@ mod tests {
         assert!(destination.remote_destinations.get(&remote_dest_id).is_none());
 
         // decrypt NS
-        let messages = destination.decrypt_message(message).unwrap();
+        let (_, messages) = destination.decrypt_message(message).unwrap().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0], vec![1, 3, 3, 7]);
 
@@ -1851,7 +1874,7 @@ mod tests {
         };
 
         // decrypt NS
-        let messages = destination.decrypt_message(message).unwrap();
+        let (_, messages) = destination.decrypt_message(message).unwrap().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0], vec![1, 3, 3, 9]);
 
@@ -1892,7 +1915,7 @@ mod tests {
         };
 
         // decrypt NS
-        let messages = destination.decrypt_message(message).unwrap();
+        let (_, messages) = destination.decrypt_message(message).unwrap().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0], vec![1, 3, 4, 0]);
 

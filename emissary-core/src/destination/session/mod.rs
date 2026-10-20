@@ -654,10 +654,23 @@ impl<R: Runtime> SessionManager<R> {
     /// message of appropriate length, containing at least the message length and a garlic tag.
     ///
     /// On success, returns a serialized garlic clove set.
+    #[cfg(test)]
     pub fn decrypt(
         &mut self,
         message: Message,
     ) -> Result<impl Iterator<Item = GarlicClove>, SessionError> {
+        self.decrypt_from(message).map(|(_, cloves)| cloves)
+    }
+
+    /// Decrypt `message` like [`SessionManager::decrypt()`] and also return the ID of the remote
+    /// destination the garlic session is bound to, i.e., the sender of the cloves.
+    ///
+    /// Inbound sessions are only accepted with a bundled lease set whose encryption key matches
+    /// the session's static key, so the sender cannot be spoofed by a third party.
+    pub fn decrypt_from(
+        &mut self,
+        message: Message,
+    ) -> Result<(DestinationId, impl Iterator<Item = GarlicClove>), SessionError> {
         // extract garlic tag and attempt to find session key for the tag
         //
         // if no key is found, `message` is assumed to be `NewSession`
@@ -879,7 +892,8 @@ impl<R: Runtime> SessionManager<R> {
                         self.ratchet_threshold,
                     )? {
                         PendingSessionEvent::SendMessage { .. } => unreachable!(),
-                        PendingSessionEvent::DoNothing => return Ok(vec![].into_iter()),
+                        PendingSessionEvent::DoNothing =>
+                            return Ok((destination_id, vec![].into_iter())),
                         PendingSessionEvent::CreateSession {
                             message,
                             context,
@@ -1037,7 +1051,7 @@ impl<R: Runtime> SessionManager<R> {
             })
             .collect::<Vec<_>>();
 
-        Ok(cloves.into_iter())
+        Ok((destination_id, cloves.into_iter()))
     }
 
     /// Perform periodic maintenance of active and pending sessions.
@@ -1333,7 +1347,12 @@ mod tests {
             .unwrap();
         assert!(session.pending.contains_key(&outbound_destination_id));
 
-        (session, destination_id, outbound_session, outbound_destination_id)
+        (
+            session,
+            destination_id,
+            outbound_session,
+            outbound_destination_id,
+        )
     }
 
     #[tokio::test(start_paused = true)]

@@ -335,8 +335,7 @@ impl<R: Runtime> PendingSession<R> {
         &mut self,
         ratchet_threshold: u16,
     ) -> Result<Option<Vec<u8>>, SessionError> {
-        if self.nsr_sent || !core::matches!(self.state, PendingSessionState::InboundActive { .. })
-        {
+        if self.nsr_sent || !core::matches!(self.state, PendingSessionState::InboundActive { .. }) {
             return Ok(None);
         }
 

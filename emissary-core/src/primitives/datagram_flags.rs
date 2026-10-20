@@ -16,6 +16,10 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
+//! Datagram2 and Datagram3 flags.
+//!
+//! https://geti2p.net/spec/datagrams
+
 use crate::{
     error::parser::DatagramFlagsParseError,
     primitives::{Mapping, LOG_TARGET},
@@ -26,15 +30,26 @@ use nom::{bytes::complete::take, number::complete::be_u16, Err, IResult};
 
 /// Serialized length of [`DatagramFlags`].
 const FLAGS_LEN: usize = 2;
-/// Version mask for [`DatagramFlags`].
-const VERSION_MASK: u8 = 0x0f;
 
-/// Options mask for [`DatagramFlags::V2`].
-const V2_OPTIONS_MASK: u8 = 0x10;
-/// Offline mask for [`DatagramFlags::V2`].
-const V2_OFFLINE_MASK: u8 = 0x20;
+/// Version mask, bits 3-0 of the flags.
+const VERSION_MASK: u16 = 0x000f;
+
+/// Options mask, bit 4 of the flags.
+const OPTIONS_MASK: u16 = 0x0010;
+
+/// Offline signature mask, bit 5 of the flags (Datagram2 only).
+const OFFLINE_MASK: u16 = 0x0020;
+
+/// Datagram2 version.
+const V2: u16 = 2;
+
+/// Datagram3 version.
+const V3: u16 = 3;
 
 /// Datagram flags.
+///
+/// The flags are a big-endian 2-byte field: the version is in bits 3-0, i.e., the low nibble of the
+/// second byte, as in the specification and other routers.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum DatagramFlags {
     /// Used in Datagram2.
@@ -47,10 +62,11 @@ pub enum DatagramFlags {
     /// Used in Datagram3.
     ///
     /// https://geti2p.net/spec/datagrams#id14
-    V3, // Stub
+    V3 { options: Option<Mapping> },
 }
 
 impl DatagramFlags {
+    /// Create Datagram2 flags.
     pub fn new_v2(options: Option<Mapping>, has_offsig: bool) -> DatagramFlags {
         DatagramFlags::V2 {
             options,
@@ -58,14 +74,37 @@ impl DatagramFlags {
         }
     }
 
-    /// Serialize [`DatagramFlags`] into a byte vector.
+    /// Create Datagram3 flags.
+    pub fn new_v3(options: Option<Mapping>) -> DatagramFlags {
+        DatagramFlags::V3 { options }
+    }
+
+    /// Serialize [`DatagramFlags`] (and the options, if any) into a byte vector.
     pub fn serialize(&self) -> Bytes {
-        match self {
+        let (version, options, has_offsig) = match self {
             Self::V2 {
                 options,
-                has_offsig: has_offline_signature,
-            } => DatagramFlags::serialize_v2(options.as_ref(), *has_offline_signature),
-            Self::V3 => unreachable!(),
+                has_offsig,
+            } => (V2, options.as_ref(), *has_offsig),
+            Self::V3 { options } => (V3, options.as_ref(), false),
+        };
+
+        let mut flags = version;
+        if has_offsig {
+            flags |= OFFLINE_MASK;
+        }
+
+        let mut out = BytesMut::with_capacity(FLAGS_LEN);
+
+        match options {
+            Some(options) => {
+                out.put_u16(flags | OPTIONS_MASK);
+                options.serialize_into(out).freeze()
+            }
+            None => {
+                out.put_u16(flags);
+                out.freeze()
+            }
         }
     }
 
@@ -82,83 +121,57 @@ impl DatagramFlags {
             return Err(Err::Error(DatagramFlagsParseError::InvalidLength));
         }
 
-        let (rest, flags) = take(FLAGS_LEN)(input)?;
+        let (rest, flags) = be_u16(input)?;
+        let version = flags & VERSION_MASK;
 
-        match flags[0] & VERSION_MASK {
-            2 => DatagramFlags::parse_v2(rest, flags),
-            version => {
-                tracing::trace!(
-                    target: LOG_TARGET,
-                    ?version,
-                    "unknown flags version",
-                );
+        if version != V2 && version != V3 {
+            tracing::trace!(
+                target: LOG_TARGET,
+                ?version,
+                "unknown flags version",
+            );
 
-                Err(Err::Error(DatagramFlagsParseError::UnknownVersion))
-            }
+            return Err(Err::Error(DatagramFlagsParseError::UnknownVersion));
         }
-    }
-
-    /// Try to parse router information from `bytes`.
-    pub fn parse(bytes: impl AsRef<[u8]>) -> Result<Self, DatagramFlagsParseError> {
-        Ok(Self::parse_frame(bytes.as_ref())?.1)
-    }
-
-    fn serialize_v2(options: Option<&Mapping>, has_offline_signature: bool) -> Bytes {
-        const V2: u8 = 2;
-
-        let mut flags = BytesMut::with_capacity(2);
-        flags.put_u16(0);
-
-        flags[0] = V2;
-
-        if has_offline_signature {
-            flags[0] |= V2_OFFLINE_MASK
-        }
-
-        if let Some(opts) = options {
-            flags[0] |= V2_OPTIONS_MASK;
-            opts.serialize_into(flags).freeze()
-        } else {
-            flags.freeze()
-        }
-    }
-
-    fn parse_v2<'a>(
-        input: &'a [u8],
-        flags: &[u8],
-    ) -> IResult<&'a [u8], DatagramFlags, DatagramFlagsParseError> {
-        let flags = flags[0];
 
         // parse options
-        let (rest, options) = if (flags & V2_OPTIONS_MASK) == 0 {
-            (input, None)
+        let (rest, options) = if flags & OPTIONS_MASK == 0 {
+            (rest, None)
         } else {
-            let (_, optlen) = be_u16(input)?;
+            let (_, optlen) = be_u16(rest)?;
 
             match optlen {
-                0 => (input, None),
-                len if input.len() < len as usize => {
+                0 => (take(2usize)(rest)?.0, None),
+                len if rest.len() < len as usize + 2 => {
                     tracing::warn!(
                         target: LOG_TARGET,
-                        serialized_len = ?input.len(),
+                        serialized_len = ?rest.len(),
                         "not enough bytes for mapping",
                     );
                     return Err(Err::Error(DatagramFlagsParseError::InvalidBitstream));
                 }
                 _ => {
-                    let (rest, mapping) = Mapping::parse_frame(input).map_err(Err::convert)?;
+                    let (rest, mapping) = Mapping::parse_frame(rest).map_err(Err::convert)?;
                     (rest, Some(mapping))
                 }
             }
         };
 
-        Ok((
-            rest,
-            DatagramFlags::V2 {
-                options,
-                has_offsig: (flags & V2_OFFLINE_MASK) != 0,
-            },
-        ))
+        match version {
+            V2 => Ok((
+                rest,
+                DatagramFlags::V2 {
+                    options,
+                    has_offsig: flags & OFFLINE_MASK != 0,
+                },
+            )),
+            _ => Ok((rest, DatagramFlags::V3 { options })),
+        }
+    }
+
+    /// Try to parse [`DatagramFlags`] from `bytes`.
+    pub fn parse(bytes: impl AsRef<[u8]>) -> Result<Self, DatagramFlagsParseError> {
+        Ok(Self::parse_frame(bytes.as_ref())?.1)
     }
 }
 
@@ -183,11 +196,48 @@ mod tests {
     }
 
     #[test]
+    fn wire_format_matches_other_routers() {
+        // version in the low nibble of the second byte, options bit 4, offline signature bit 5
+        assert_eq!(
+            DatagramFlags::new_v2(None, false).serialize().as_ref(),
+            &[0x00, 0x02]
+        );
+        assert_eq!(
+            DatagramFlags::new_v2(None, true).serialize().as_ref(),
+            &[0x00, 0x22]
+        );
+        assert_eq!(
+            DatagramFlags::new_v3(None).serialize().as_ref(),
+            &[0x00, 0x03]
+        );
+
+        let mut options = Mapping::default();
+        options.insert("a".into(), "b".into());
+        let serialized = DatagramFlags::new_v3(Some(options)).serialize();
+        assert_eq!(&serialized[..2], &[0x00, 0x13]);
+
+        // the version in the first byte is not accepted
+        assert_eq!(
+            DatagramFlags::parse(b"\x02\x00"),
+            Err(DatagramFlagsParseError::UnknownVersion)
+        );
+        assert_eq!(
+            DatagramFlags::parse(b"\x00\x03"),
+            Ok(DatagramFlags::V3 { options: None })
+        );
+    }
+
+    #[test]
     fn valid_flags() {
         let flags = DatagramFlags::V2 {
             options: None,
             has_offsig: false,
         };
+        let ser = flags.serialize();
+
+        assert_eq!(DatagramFlags::parse(ser), Ok(flags));
+
+        let flags = DatagramFlags::V3 { options: None };
         let ser = flags.serialize();
 
         assert_eq!(DatagramFlags::parse(ser), Ok(flags));
@@ -199,13 +249,33 @@ mod tests {
         opts.insert("hello".into(), "world".into());
 
         let flags = DatagramFlags::V2 {
-            options: Some(opts),
+            options: Some(opts.clone()),
             has_offsig: true,
         };
-
         let ser = flags.serialize();
-
         assert_eq!(DatagramFlags::parse(ser), Ok(flags));
+
+        let flags = DatagramFlags::V3 {
+            options: Some(opts),
+        };
+        let ser = flags.serialize();
+        assert_eq!(DatagramFlags::parse(ser), Ok(flags));
+    }
+
+    #[test]
+    fn options_flag_without_options() {
+        // options bit set but the mapping is truncated
+        assert!(DatagramFlags::parse(b"\x00\x13").is_err());
+        assert!(DatagramFlags::parse(b"\x00\x13\x00").is_err());
+        assert_eq!(
+            DatagramFlags::parse(b"\x00\x13\x00\x10\x01"),
+            Err(DatagramFlagsParseError::InvalidBitstream)
+        );
+        // empty mapping
+        assert_eq!(
+            DatagramFlags::parse_frame(b"\x00\x13\x00\x00\x01").unwrap(),
+            (&b"\x01"[..], DatagramFlags::V3 { options: None })
+        );
     }
 
     #[test]
