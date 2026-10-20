@@ -2607,10 +2607,10 @@ async fn primary_session_with_repliable_and_anonymous_ssu2() {
 }
 
 // yosemite currently doesn't support specifying datagram options, meaning `FROM_PORT` will always
-// be the default port, meaning two datagrams listeners would be listening to the same port which is
-// not supported by emissary (and by the SAMv3 spec?)
+// be the default port for both sub-sessions
 //
-// this causes the second sub-session to b erejected
+// repliable and raw datagrams are different I2CP protocols so the sub-sessions don't conflict, but
+// a second repliable sub-session on the same port is rejected
 async fn primary_session_with_repliable_and_anonymous(kind: TransportKind) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -2667,9 +2667,21 @@ async fn primary_session_with_repliable_and_anonymous(kind: TransportKind) {
     .unwrap()
     .unwrap();
 
-    match tokio::time::timeout(
+    let _anonymous_session = tokio::time::timeout(
         Duration::from_secs(5),
         session2.create_subsession::<Anonymous>(SessionOptions {
+            samv3_tcp_port: ports[1].0,
+            samv3_udp_port: ports[1].1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("no timeout")
+    .expect("raw sub-session on the same port as a repliable one is accepted");
+
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        session2.create_subsession::<Repliable>(SessionOptions {
             samv3_tcp_port: ports[1].0,
             samv3_udp_port: ports[1].1,
             ..Default::default()
@@ -2679,7 +2691,7 @@ async fn primary_session_with_repliable_and_anonymous(kind: TransportKind) {
     {
         Err(_) => panic!("unexpected timeout"),
         Ok(Err(_)) => {}
-        Ok(Ok(_)) => panic!("duplicate session id should've been rejected"),
+        Ok(Ok(_)) => panic!("duplicate listen port should've been rejected"),
     }
 }
 
