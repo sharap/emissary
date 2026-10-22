@@ -76,13 +76,26 @@ const STREAM_CHANNEL_SIZE: usize = 512;
 const PENDING_STREAM_PRUNE_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// How long should a pending outbound stream wait before sending another `SYN`.
+///
+/// The wait doubles after each `SYN`, up to [`MAX_SYN_RETRY_TIMEOUT`], so a remote behind slow or
+/// congested tunnels gets close to a minute to answer instead of a dozen seconds.
 const SYN_RETRY_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Upper bound for the wait between two `SYN`s.
+const MAX_SYN_RETRY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Timeout for graceful shutdown.
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Maximum `SYN` retries before the remote destination is considered unreachable.
 const MAX_SYN_RETRIES: usize = 5usize;
+
+/// How long to wait for a reply after the `num_sent`th `SYN` before sending the next one.
+fn syn_retry_timeout(num_sent: usize) -> Duration {
+    let exponent = num_sent.saturating_sub(1).min(16) as u32;
+
+    SYN_RETRY_TIMEOUT.saturating_mul(1u32 << exponent).min(MAX_SYN_RETRY_TIMEOUT)
+}
 
 /// Maximum number of pending inbound streams, same as i2pd.
 ///
@@ -1138,7 +1151,8 @@ impl<R: Runtime> StreamManager<R> {
         // create pending stream and start timer for retrying `SYN` if the remote doesn't respond to
         // the first packet
         //
-        // `SYN` is retried 3 times before the remote destination is considered unreachable
+        // `SYN` is retried `MAX_SYN_RETRIES` times with a growing wait before the remote
+        // destination is considered unreachable
         self.pending_outbound.insert(
             recv_stream_id,
             PendingOutboundStream {
@@ -1158,7 +1172,7 @@ impl<R: Runtime> StreamManager<R> {
             .or_default()
             .insert(recv_stream_id);
         self.outbound_timers.push(async move {
-            R::delay(SYN_RETRY_TIMEOUT).await;
+            R::delay(syn_retry_timeout(1)).await;
             recv_stream_id
         });
 
@@ -1349,6 +1363,7 @@ impl<R: Runtime> futures::Stream for StreamManager<R> {
                         let src_port = *src_port;
                         let packet = packet.clone();
                         *num_sent += 1;
+                        let retry_timeout = syn_retry_timeout(*num_sent);
 
                         // poll routing path to get any tunnel updates
                         let _ = routing_path_handle.poll_unpin(cx);
@@ -1362,7 +1377,7 @@ impl<R: Runtime> futures::Stream for StreamManager<R> {
                             );
 
                             self.outbound_timers.push(async move {
-                                R::delay(SYN_RETRY_TIMEOUT).await;
+                                R::delay(retry_timeout).await;
                                 stream_id
                             });
 
@@ -1380,7 +1395,7 @@ impl<R: Runtime> futures::Stream for StreamManager<R> {
                         //
                         // the future is guaranteed to be polled as we return from this branch
                         self.outbound_timers.push(async move {
-                            R::delay(SYN_RETRY_TIMEOUT).await;
+                            R::delay(retry_timeout).await;
                             stream_id
                         });
 
@@ -1402,7 +1417,8 @@ impl<R: Runtime> futures::Stream for StreamManager<R> {
                             target: LOG_TARGET,
                             local = %self.destination_id,
                             ?stream_id,
-                            "remote didn't reply after 3 tries, closing stream",
+                            num_sent = ?MAX_SYN_RETRIES,
+                            "remote didn't reply to `SYN`, closing stream",
                         );
 
                         // send rejection to client and return event to `SamSession`
@@ -2239,6 +2255,21 @@ mod tests {
         assert_eq!(response.as_str(), "STREAM STATUS RESULT=OK\n");
     }
 
+    #[test]
+    fn syn_retry_timeout_doubles_up_to_cap() {
+        assert_eq!(syn_retry_timeout(0), Duration::from_millis(2500));
+        assert_eq!(syn_retry_timeout(1), Duration::from_millis(2500));
+        assert_eq!(syn_retry_timeout(2), Duration::from_millis(5000));
+        assert_eq!(syn_retry_timeout(3), Duration::from_millis(10_000));
+        assert_eq!(syn_retry_timeout(4), Duration::from_millis(20_000));
+        assert_eq!(syn_retry_timeout(5), Duration::from_millis(20_000));
+        assert_eq!(syn_retry_timeout(usize::MAX), Duration::from_millis(20_000));
+
+        // the remote gets close to a minute in total
+        let total: Duration = (1..=MAX_SYN_RETRIES).map(syn_retry_timeout).sum();
+        assert_eq!(total, Duration::from_millis(57_500));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn outbound_stream_rejected() {
         let socket_factory = SocketFactory::new().await;
@@ -2266,9 +2297,10 @@ mod tests {
             0,
         );
 
-        // verify the syn packet is sent 4 more times
-        for _ in 0..4 {
-            match tokio::time::timeout(Duration::from_secs(15), manager2.next())
+        // verify the syn packet is sent 4 more times, each after a longer wait
+        let started = tokio::time::Instant::now();
+        for i in 0..4 {
+            match tokio::time::timeout(Duration::from_secs(30), manager2.next())
                 .await
                 .expect("no timeout")
                 .expect("to succeed")
@@ -2279,13 +2311,14 @@ mod tests {
                     ..
                 } if delivery_style.destination_id() == &remote => {
                     assert!(Packet::parse::<MockRuntime>(&packet).unwrap().flags.synchronize());
+                    assert!(started.elapsed() >= syn_retry_timeout(i + 1));
                 }
                 _ => panic!("invalid event"),
             }
         }
 
-        // verify that stream rejection is emitted
-        match tokio::time::timeout(Duration::from_secs(15), manager2.next())
+        // verify that stream rejection is emitted after the last wait
+        match tokio::time::timeout(Duration::from_secs(30), manager2.next())
             .await
             .expect("no timeout")
             .expect("to succeed")
@@ -2293,6 +2326,7 @@ mod tests {
             StreamManagerEvent::StreamRejected { destination_id } if destination_id == remote => {}
             _ => panic!("invalid event"),
         }
+        assert!(started.elapsed() >= Duration::from_millis(57_500));
 
         let mut reader = BufReader::new(client_stream);
         let mut response = String::new();

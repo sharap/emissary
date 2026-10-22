@@ -75,6 +75,16 @@ const NETDB_BACKOFF_TIMEOUT: Duration = Duration::from_secs(5);
 /// in case the channel used by [`NetDbHandle`] is clogged.
 const NUM_QUERY_RETRIES: usize = 3usize;
 
+/// Number of lease set lookups attempted before the remote is reported unreachable.
+///
+/// A single NetDb query is bounded by its own timeout. A failed query usually teaches NetDb about
+/// floodfills closer to the key, so a retry has a better chance of succeeding than the first
+/// attempt, which matters when tunnels are slow or the local NetDb is still small.
+const LEASE_SET_QUERY_ATTEMPTS: usize = 3usize;
+
+/// Delay between two lease set lookup attempts.
+const LEASE_SET_QUERY_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// Stale lease set prune interval.
 const LEASE_SET_PRUNE_INTERVAL: Duration = Duration::from_secs(2 * 60);
 
@@ -347,77 +357,105 @@ impl<R: Runtime> Destination<R> {
 
         self.pending_queries.insert(destination_id.clone());
         self.query_futures.push(async move {
-            for _ in 0..NUM_QUERY_RETRIES {
-                // encrypted lease sets are stored under the hash of the blinded key of the day
-                let key = match &blinded {
-                    None => Bytes::from(destination_id.to_vec()),
-                    Some(blinded) =>
-                        match blinded.store_hash(&date_string(R::time_since_epoch())) {
-                            Some(hash) => Bytes::from(hash.to_vec()),
-                            None => return (destination_id, Err(QueryError::ValueNotFound)),
-                        },
+            let mut attempt = 1usize;
+
+            loop {
+                let result = 'query: {
+                    for _ in 0..NUM_QUERY_RETRIES {
+                        // encrypted lease sets are stored under the hash of the blinded key of the
+                        // day
+                        let key = match &blinded {
+                            None => Bytes::from(destination_id.to_vec()),
+                            Some(blinded) =>
+                                match blinded.store_hash(&date_string(R::time_since_epoch())) {
+                                    Some(hash) => Bytes::from(hash.to_vec()),
+                                    None => break 'query Err(QueryError::ValueNotFound),
+                                },
+                        };
+
+                        let Ok(rx) = handle.query_lease_set(key) else {
+                            R::delay(NETDB_BACKOFF_TIMEOUT).await;
+                            continue;
+                        };
+
+                        tracing::trace!(
+                            target: LOG_TARGET,
+                            %destination_id,
+                            encrypted = ?blinded.is_some(),
+                            "lease set query started",
+                        );
+
+                        let result = match rx.await {
+                            Err(_) => Err(QueryError::Timeout),
+                            Ok(Err(error)) => Err(error),
+                            Ok(Ok(QueriedLeaseSet::Standard(lease_set))) => match &blinded {
+                                None => Ok(*lease_set),
+                                Some(_) => {
+                                    tracing::warn!(
+                                        target: LOG_TARGET,
+                                        %destination_id,
+                                        "standard lease set received for a blinded destination",
+                                    );
+                                    Err(QueryError::Malformed)
+                                }
+                            },
+                            Ok(Ok(QueriedLeaseSet::Encrypted(lease_set))) => match &blinded {
+                                None => {
+                                    tracing::warn!(
+                                        target: LOG_TARGET,
+                                        %destination_id,
+                                        "encrypted lease set received for a regular destination",
+                                    );
+                                    Err(QueryError::Malformed)
+                                }
+                                Some(blinded) => match lease_set.decrypt::<R>(blinded) {
+                                    Ok(lease_set) => Ok(lease_set),
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            target: LOG_TARGET,
+                                            %destination_id,
+                                            ?error,
+                                            "failed to decrypt lease set",
+                                        );
+                                        Err(QueryError::Malformed)
+                                    }
+                                },
+                            },
+                        };
+
+                        break 'query result;
+                    }
+
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        %destination_id,
+                        "failed to start lease set query after {NUM_QUERY_RETRIES} retries",
+                    );
+
+                    Err(QueryError::RetryFailure)
                 };
 
-                let Ok(rx) = handle.query_lease_set(key) else {
-                    R::delay(NETDB_BACKOFF_TIMEOUT).await;
-                    continue;
-                };
-
-                tracing::trace!(
-                    target: LOG_TARGET,
-                    %destination_id,
-                    encrypted = ?blinded.is_some(),
-                    "lease set query started",
-                );
-
-                let result = match rx.await {
-                    Err(_) => Err(QueryError::Timeout),
-                    Ok(Err(error)) => Err(error),
-                    Ok(Ok(QueriedLeaseSet::Standard(lease_set))) => match &blinded {
-                        None => Ok(*lease_set),
-                        Some(_) => {
-                            tracing::warn!(
-                                target: LOG_TARGET,
-                                %destination_id,
-                                "standard lease set received for a blinded destination",
-                            );
-                            Err(QueryError::Malformed)
-                        }
-                    },
-                    Ok(Ok(QueriedLeaseSet::Encrypted(lease_set))) => match &blinded {
-                        None => {
-                            tracing::warn!(
-                                target: LOG_TARGET,
-                                %destination_id,
-                                "encrypted lease set received for a regular destination",
-                            );
-                            Err(QueryError::Malformed)
-                        }
-                        Some(blinded) => match lease_set.decrypt::<R>(blinded) {
-                            Ok(lease_set) => Ok(lease_set),
-                            Err(error) => {
-                                tracing::warn!(
-                                    target: LOG_TARGET,
-                                    %destination_id,
-                                    ?error,
-                                    "failed to decrypt lease set",
-                                );
-                                Err(QueryError::Malformed)
-                            }
-                        },
-                    },
-                };
-
-                return (destination_id, result);
+                // a query that timed out or came back empty is retried a few times, the netdb may
+                // have learned about closer floodfills in the meantime
+                match result {
+                    Err(
+                        error @ (QueryError::Timeout
+                        | QueryError::ValueNotFound
+                        | QueryError::NoFloodfills),
+                    ) if attempt < LEASE_SET_QUERY_ATTEMPTS => {
+                        tracing::debug!(
+                            target: LOG_TARGET,
+                            %destination_id,
+                            ?error,
+                            ?attempt,
+                            "lease set query failed, retrying",
+                        );
+                        attempt += 1;
+                        R::delay(LEASE_SET_QUERY_RETRY_DELAY).await;
+                    }
+                    result => return (destination_id, result),
+                }
             }
-
-            tracing::warn!(
-                target: LOG_TARGET,
-                %destination_id,
-                "failed to start lease set query after {NUM_QUERY_RETRIES} retries",
-            );
-
-            (destination_id, Err(QueryError::RetryFailure))
         });
 
         LeaseSetStatus::NotFound
@@ -1149,12 +1187,13 @@ mod tests {
     use crate::{
         crypto::SigningPrivateKey,
         i2np::garlic::GarlicClove,
-        netdb::NetDbAction,
+        netdb::{NetDbAction, NetDbActionRecycle},
         primitives::{Destination as Dest, LeaseSet2Header, MessageId, RouterId, TunnelId},
         runtime::{mock::MockRuntime, Runtime},
-        tunnel::{TunnelMessage, TunnelPoolConfig},
+        tunnel::{TunnelMessage, TunnelMessageRecycle, TunnelPoolConfig, TunnelPoolEvent},
     };
     use std::collections::VecDeque;
+    use thingbuf::mpsc;
 
     #[tokio::test]
     async fn query_lease_set_found() {
@@ -1295,6 +1334,166 @@ mod tests {
             destination.query_lease_set(&remote),
             LeaseSetStatus::Pending
         );
+    }
+
+    /// Create destination for lease set query tests and return it with the netdb action receiver.
+    ///
+    /// The tunnel pool handles are returned as well, dropping them would shut the destination down.
+    fn query_test_destination() -> (
+        Destination<MockRuntime>,
+        mpsc::Receiver<NetDbAction, NetDbActionRecycle>,
+        (
+            mpsc::Receiver<TunnelMessage, TunnelMessageRecycle>,
+            mpsc::Sender<TunnelPoolEvent>,
+            futures_channel::oneshot::Receiver<()>,
+        ),
+    ) {
+        let (netdb_handle, rx) = NetDbHandle::create();
+        let (tp_handle, tm_rx, tp_tx, srx) = TunnelPoolHandle::create();
+        let private_key = StaticPrivateKey::random(MockRuntime::rng());
+        let destination = Destination::<MockRuntime>::new(
+            DestinationId::random(),
+            private_key.clone(),
+            vec![private_key.public()],
+            Bytes::new(),
+            netdb_handle,
+            tp_handle,
+            Vec::new(),
+            Vec::new(),
+            false,
+            ProfileStorage::new(&[], &[], None),
+        );
+
+        (destination, rx, (tm_rx, tp_tx, srx))
+    }
+
+    /// Poll `destination` until netdb receives a lease set query and answer it with `reply`.
+    ///
+    /// Other actions are stored in `kept`, dropping their reply channels would make the lease set
+    /// manager exit and with it the destination.
+    async fn answer_lease_set_query(
+        destination: &mut Destination<MockRuntime>,
+        rx: &mpsc::Receiver<NetDbAction, NetDbActionRecycle>,
+        kept: &mut Vec<NetDbAction>,
+        reply: Result<QueriedLeaseSet, QueryError>,
+    ) {
+        let tx = loop {
+            match rx.try_recv() {
+                Ok(NetDbAction::QueryLeaseSet2 { tx, .. }) => break tx,
+                Ok(action) => kept.push(action),
+                Err(_) => {}
+            }
+
+            if let Ok(event) =
+                tokio::time::timeout(Duration::from_millis(100), destination.next()).await
+            {
+                panic!("unexpected event: {event:?}");
+            }
+        };
+
+        let _ = tx.send(reply);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_set_query_retried_after_timeout_and_not_found() {
+        let (mut destination, rx, _guards) = query_test_destination();
+        let mut kept = Vec::new();
+        let remote = DestinationId::random();
+        let (lease_set, _) = LeaseSet2::random();
+
+        assert_eq!(
+            destination.query_lease_set(&remote),
+            LeaseSetStatus::NotFound
+        );
+
+        // first two queries fail, the third one succeeds
+        answer_lease_set_query(&mut destination, &rx, &mut kept, Err(QueryError::Timeout)).await;
+        answer_lease_set_query(
+            &mut destination,
+            &rx,
+            &mut kept,
+            Err(QueryError::ValueNotFound),
+        )
+        .await;
+        answer_lease_set_query(
+            &mut destination,
+            &rx,
+            &mut kept,
+            Ok(QueriedLeaseSet::Standard(Box::new(lease_set))),
+        )
+        .await;
+
+        match tokio::time::timeout(Duration::from_secs(5), destination.next())
+            .await
+            .expect("no timeout")
+            .expect("to succeed")
+        {
+            DestinationEvent::LeaseSetFound { destination_id } => {
+                assert_eq!(destination_id, remote);
+            }
+            _ => panic!("invalid event"),
+        }
+        assert!(!destination.pending_queries.contains(&remote));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_set_query_gives_up_after_last_attempt() {
+        let (mut destination, rx, _guards) = query_test_destination();
+        let mut kept = Vec::new();
+        let remote = DestinationId::random();
+
+        assert_eq!(
+            destination.query_lease_set(&remote),
+            LeaseSetStatus::NotFound
+        );
+
+        for _ in 0..LEASE_SET_QUERY_ATTEMPTS {
+            answer_lease_set_query(&mut destination, &rx, &mut kept, Err(QueryError::Timeout))
+                .await;
+        }
+
+        match tokio::time::timeout(Duration::from_secs(5), destination.next())
+            .await
+            .expect("no timeout")
+            .expect("to succeed")
+        {
+            DestinationEvent::LeaseSetNotFound {
+                destination_id,
+                error,
+            } => {
+                assert_eq!(destination_id, remote);
+                assert_eq!(error, QueryError::Timeout);
+            }
+            _ => panic!("invalid event"),
+        }
+        assert!(!destination.pending_queries.contains(&remote));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_lease_set_reply_not_retried() {
+        let (mut destination, rx, _guards) = query_test_destination();
+        let mut kept = Vec::new();
+        let remote = DestinationId::random();
+
+        assert_eq!(
+            destination.query_lease_set(&remote),
+            LeaseSetStatus::NotFound
+        );
+        answer_lease_set_query(&mut destination, &rx, &mut kept, Err(QueryError::Malformed)).await;
+
+        match tokio::time::timeout(Duration::from_secs(5), destination.next())
+            .await
+            .expect("no timeout")
+            .expect("to succeed")
+        {
+            DestinationEvent::LeaseSetNotFound { error, .. } => {
+                assert_eq!(error, QueryError::Malformed);
+            }
+            _ => panic!("invalid event"),
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1533,7 +1732,7 @@ mod tests {
         }
     }
 
-    use crate::{netdb::NetDbActionRecycle, primitives::EncryptedLeaseSet2};
+    use crate::primitives::EncryptedLeaseSet2;
 
     /// Create a client destination and the receiver of its netdb actions.
     ///

@@ -43,6 +43,9 @@ mod response;
 /// Logging target for the file.
 const LOG_TARGET: &str = "emissary::proxy::http";
 
+/// Response sent to the client once a `CONNECT` tunnel to an I2P host is open.
+const TUNNEL_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
+
 /// Outproxy kind.
 #[derive(Debug, PartialEq, Eq)]
 enum OutproxyKind {
@@ -258,12 +261,17 @@ impl HttpProxy {
     /// After the final request has been assembled and the host has been resolved, opens a stream to
     /// the remote destination and if a connection is successfully established, sends the request
     /// and reads the response which is relayed to client.
+    ///
+    /// A `CONNECT` to an I2P host opens a raw tunnel instead: the client is told the connection is
+    /// established and its bytes are relayed to the remote as-is. This is what browsers send for
+    /// `https://` URLs, so an HTTPS-first browser gets a usable answer instead of an error.
     async fn on_request(&mut self, request: RequestContext) -> Result<(), (TcpStream, HttpError)> {
         let RequestContext {
             mut stream,
             request,
         } = request;
 
+        let is_tunnel = request.is_tunnel();
         let ((host, port), request) =
             match request.assemble(&self.address_book_handle, &self.outproxy).await {
                 Ok((host, request)) => (host, request),
@@ -273,7 +281,7 @@ impl HttpProxy {
         let future = self.session.connect_detached_with_options(
             &host,
             StreamOptions {
-                dst_port: port.unwrap_or(80),
+                dst_port: port.unwrap_or(if is_tunnel { 443 } else { 80 }),
                 ..Default::default()
             },
         );
@@ -290,8 +298,13 @@ impl HttpProxy {
                     Err(error)
                 }
                 Ok(mut i2p_stream) => {
-                    // write request and read from the stream until it is closed
-                    i2p_stream.write_all(&request).await?;
+                    if is_tunnel {
+                        // tell the client the tunnel is open, it speaks to the remote from now on
+                        stream.write_all(TUNNEL_ESTABLISHED).await?;
+                    } else {
+                        // write request and read from the stream until it is closed
+                        i2p_stream.write_all(&request).await?;
+                    }
 
                     tokio::io::copy_bidirectional(&mut i2p_stream, &mut stream)
                         .await
@@ -368,6 +381,19 @@ mod tests {
         sync::mpsc::{channel, Sender},
     };
 
+    /// How the fake SAM server answers `STREAM CONNECT`.
+    #[derive(Clone, Copy)]
+    enum StreamReply {
+        /// Leave the command unanswered.
+        Ignore,
+
+        /// Accept the stream and echo everything written to it.
+        Echo,
+
+        /// Reject the stream with `CANT_REACH_PEER`.
+        Reject,
+    }
+
     /// Fake SAMv3 server.
     struct SamServer {
         /// TCP listener for the server.
@@ -375,6 +401,9 @@ mod tests {
 
         /// Command sender.
         cmd_tx: Option<Sender<String>>,
+
+        /// How `STREAM CONNECT` is answered.
+        stream_reply: StreamReply,
     }
 
     impl SamServer {
@@ -385,6 +414,7 @@ mod tests {
             Self {
                 listener,
                 cmd_tx: None,
+                stream_reply: StreamReply::Ignore,
             }
         }
 
@@ -394,13 +424,21 @@ mod tests {
             Self {
                 listener,
                 cmd_tx: Some(cmd_tx),
+                stream_reply: StreamReply::Ignore,
             }
+        }
+
+        /// Answer `STREAM CONNECT` with `stream_reply` instead of leaving it unanswered.
+        fn with_stream_reply(mut self, stream_reply: StreamReply) -> Self {
+            self.stream_reply = stream_reply;
+            self
         }
 
         /// Run the event loop of [`SamServer`].
         async fn run(self) {
             while let Ok((stream, _)) = self.listener.accept().await {
                 let tx = self.cmd_tx.clone();
+                let stream_reply = self.stream_reply;
 
                 tokio::spawn(async move {
                     let mut lines = BufReader::new(stream).lines();
@@ -435,14 +473,108 @@ mod tests {
                             continue;
                         }
 
+                        let is_connect = command.starts_with("STREAM CONNECT");
+
                         match &tx {
                             Some(cmd_tx) => cmd_tx.send(command).await.unwrap(),
                             None => println!("unhandled command: {command}"),
+                        }
+
+                        match (is_connect, stream_reply) {
+                            (false, _) | (true, StreamReply::Ignore) => {}
+                            (true, StreamReply::Reject) => {
+                                lines
+                                    .get_mut()
+                                    .write_all("STREAM STATUS RESULT=CANT_REACH_PEER\n".as_bytes())
+                                    .await
+                                    .unwrap();
+                                return;
+                            }
+                            (true, StreamReply::Echo) => {
+                                lines
+                                    .get_mut()
+                                    .write_all("STREAM STATUS RESULT=OK\n".as_bytes())
+                                    .await
+                                    .unwrap();
+
+                                // the socket carries stream data from now on, echo it back
+                                let mut stream = lines.into_inner().into_inner();
+                                let mut buffer = vec![0u8; 4096];
+
+                                while let Ok(nread) = stream.read(&mut buffer).await {
+                                    if nread == 0
+                                        || stream.write_all(&buffer[..nread]).await.is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                return;
+                            }
                         }
                     }
                 });
             }
         }
+    }
+
+    /// Start a proxy backed by `sam` with an address book that knows `zzz.i2p`.
+    async fn start_proxy(sam: SamServer) -> u16 {
+        let sam_port = sam.listener.local_addr().unwrap().port();
+        tokio::spawn(sam.run());
+
+        let address_book = {
+            let hosts =
+                "zzz.i2p=lhbd7ojcaiofbfku7ixh47qj537g572zmhdc4oilvugzxdpdghua\n".to_string();
+            let dir = tempdir().unwrap().keep();
+            tokio::fs::create_dir_all(&dir.join("addressbook")).await.unwrap();
+            tokio::fs::write(dir.join("addressbook/addresses"), hosts).await.unwrap();
+
+            AddressBookManager::new(
+                dir.clone(),
+                AddressBookConfig {
+                    default: None,
+                    subscriptions: None,
+                },
+            )
+            .await
+            .handle()
+        };
+
+        let proxy = HttpProxy::new(
+            HttpProxyConfig {
+                port: 0,
+                host: "127.0.0.1".to_string(),
+                outproxy: None,
+                tunnel_config: None,
+                i2cp: None,
+            },
+            sam_port,
+            None,
+            Some(address_book),
+        )
+        .await
+        .unwrap();
+        let port = proxy.listener.local_addr().unwrap().port();
+        tokio::spawn(proxy.run());
+
+        port
+    }
+
+    /// Read from `stream` until the end of the HTTP response head.
+    async fn read_response_head(stream: &mut TcpStream) -> String {
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+
+        while !response.ends_with(b"\r\n\r\n") {
+            assert_eq!(
+                stream.read(&mut byte).await.unwrap(),
+                1,
+                "connection closed"
+            );
+            response.push(byte[0]);
+        }
+
+        String::from_utf8(response).unwrap()
     }
 
     async fn read_response(mut stream: TcpStream) -> String {
@@ -1234,6 +1366,93 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
         assert!(response.contains("TO_PORT=8888"));
         assert!(response
+            .contains("DESTINATION=lhbd7ojcaiofbfku7ixh47qj537g572zmhdc4oilvugzxdpdghua.b32.i2p"));
+    }
+
+    #[tokio::test]
+    async fn connect_opens_raw_tunnel_to_i2p_host() {
+        let (tx, mut rx) = channel(16);
+        let proxy_port =
+            start_proxy(SamServer::with_command_tx(tx).await.with_stream_reply(StreamReply::Echo))
+                .await;
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
+        stream
+            .write_all(
+                "CONNECT zzz.i2p:443 HTTP/1.1\r\nHost: zzz.i2p:443\r\n\
+                 Proxy-Connection: keep-alive\r\n\r\n"
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // the proxy connects to the resolved destination on port 443
+        let command =
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        assert!(command.contains("TO_PORT=443"), "{command}");
+        assert!(command
+            .contains("DESTINATION=lhbd7ojcaiofbfku7ixh47qj537g572zmhdc4oilvugzxdpdghua.b32.i2p"));
+
+        let response =
+            tokio::time::timeout(Duration::from_secs(5), read_response_head(&mut stream))
+                .await
+                .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        // bytes are relayed as-is in both directions, no HTTP request is sent to the remote
+        stream.write_all(b"\x16\x03\x01hello").await.unwrap();
+        let mut echoed = [0u8; 8];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&echoed, b"\x16\x03\x01hello");
+    }
+
+    #[tokio::test]
+    async fn connect_to_unreachable_i2p_host_returns_gateway_timeout() {
+        let proxy_port =
+            start_proxy(SamServer::new().await.with_stream_reply(StreamReply::Reject)).await;
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
+        stream
+            .write_all("CONNECT zzz.i2p:443 HTTP/1.1\r\nHost: zzz.i2p:443\r\n\r\n".as_bytes())
+            .await
+            .unwrap();
+
+        let response =
+            tokio::time::timeout(Duration::from_secs(5), read_response_head(&mut stream))
+                .await
+                .unwrap();
+        assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn port_in_host_header_used_as_destination_port() {
+        let (tx, mut rx) = channel(16);
+        let proxy_port = start_proxy(SamServer::with_command_tx(tx).await).await;
+
+        let client = Client::builder()
+            .proxy(Proxy::http(format!("http://127.0.0.1:{proxy_port}")).expect("to succeed"))
+            .http1_title_case_headers()
+            .build()
+            .expect("to succeed");
+
+        tokio::spawn(async move {
+            let _ = client
+                .get("http://zzz.i2p:8080/index.html")
+                .headers(HeaderMap::from_iter([(
+                    CONNECTION,
+                    HeaderValue::from_static("close"),
+                )]))
+                .send()
+                .await;
+        });
+
+        let command =
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        assert!(command.contains("TO_PORT=8080"), "{command}");
+        assert!(command
             .contains("DESTINATION=lhbd7ojcaiofbfku7ixh47qj537g572zmhdc4oilvugzxdpdghua.b32.i2p"));
     }
 }

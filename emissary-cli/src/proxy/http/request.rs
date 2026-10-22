@@ -75,8 +75,30 @@ pub struct Request {
     /// Path.
     path: String,
 
+    /// Port given in the `Host` header, if any.
+    port: Option<u16>,
+
     /// Request.
     request: Vec<u8>,
+}
+
+/// Split `host` into a hostname and an optional port.
+///
+/// Browsers send `Host: zzz.i2p:443` for `CONNECT` and `Host: zzz.i2p:8080` for a URL with an
+/// explicit port, so the port must be separated before the hostname is classified.
+fn split_host_port(host: &str) -> Result<(&str, Option<u16>), HttpError> {
+    match host.rsplit_once(':') {
+        Some((host, port))
+            if !host.contains(':')
+                && !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+            match port.parse::<u16>() {
+                Ok(port) => Ok((host, Some(port))),
+                Err(_) => Err(HttpError::InvalidHost),
+            },
+        Some(_) => Err(HttpError::InvalidHost),
+        None => Ok((host, None)),
+    }
 }
 
 impl Request {
@@ -119,34 +141,48 @@ impl Request {
             Err(_) => req.path.ok_or(HttpError::InvalidPath)?.to_string(),
         };
 
-        let host = match req.headers.iter().find(|header| header.name.to_lowercase() == "host") {
-            None => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    "host missing",
-                );
-                return Err(HttpError::InvalidHost);
-            }
-            Some(host) => {
-                let host = std::str::from_utf8(host.value).map_err(|_| HttpError::Malformed)?;
-                let host = host.strip_prefix("www.").unwrap_or(host).to_string();
-
-                match host.ends_with(".i2p") {
-                    false => HostKind::Clearnet { host },
-                    true => match host.ends_with(".b32.i2p") {
-                        false => HostKind::I2p { host },
-                        true => HostKind::B32 { host },
-                    },
+        let (host, port) =
+            match req.headers.iter().find(|header| header.name.to_lowercase() == "host") {
+                None => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        "host missing",
+                    );
+                    return Err(HttpError::InvalidHost);
                 }
-            }
-        };
+                Some(host) => {
+                    let host = std::str::from_utf8(host.value).map_err(|_| HttpError::Malformed)?;
+                    let (host, port) = split_host_port(host.trim())?;
+                    let host = host.strip_prefix("www.").unwrap_or(host).to_string();
+
+                    let host = match host.ends_with(".i2p") {
+                        false => HostKind::Clearnet { host },
+                        true => match host.ends_with(".b32.i2p") {
+                            false => HostKind::I2p { host },
+                            true => HostKind::B32 { host },
+                        },
+                    };
+
+                    (host, port)
+                }
+            };
 
         Ok(Self {
             host,
             method,
             path,
+            port,
             request,
         })
+    }
+
+    /// Is the request a `CONNECT` to an I2P host?
+    ///
+    /// Such a request opens a raw tunnel to the remote destination: no HTTP request is sent, the
+    /// client speaks to the remote directly once the stream is open. A `CONNECT` to a clearnet
+    /// host is forwarded to the outproxy as-is, like any other clearnet request.
+    pub fn is_tunnel(&self) -> bool {
+        self.method == "CONNECT" && !matches!(self.host, HostKind::Clearnet { .. })
     }
 
     /// Attempt to assemble [`Request`] into a serialized request that can be sent to remote host.
@@ -161,9 +197,10 @@ impl Request {
     /// "illegal" headers before returning it to the caller, allowing them to send it to remote
     /// host.
     ///
-    /// Returns a `(host, request)` tuple where the `host` is the .b32.i2p address of the remote
-    /// host SAM should connect to (either an eepsite or an outproxy) and where `request` is a
-    /// serialized HTTP request.
+    /// Returns a `((host, port), request)` tuple where the `host` is the .b32.i2p address of the
+    /// remote host SAM should connect to (either an eepsite or an outproxy), `port` is the port
+    /// given in the `Host` header (or the outproxy port for clearnet requests) and where `request`
+    /// is a serialized HTTP request.
     pub async fn assemble(
         self,
         address_book: &Option<Arc<dyn AddressBook>>,
@@ -184,11 +221,12 @@ impl Request {
         // if a clearnet address is used and an outproxy has been enabled, the host that is the
         // original request must be kept unmodified as the request is sent to clearnet and such
         // an address obviously doesn't need to (and cannot be) resolved to a .b32.i2p hostname
+        let requested_port = self.port;
         let (host, port, keep_original_host) = match (self.host, address_book, outproxy) {
-            (HostKind::B32 { host }, _, _) => (host, None, false),
+            (HostKind::B32 { host }, _, _) => (host, requested_port, false),
             (HostKind::I2p { host }, Some(address_book), _) =>
                 match address_book.resolve_base32(&host) {
-                    Some(host) => (format!("{host}.b32.i2p"), None, false),
+                    Some(host) => (format!("{host}.b32.i2p"), requested_port, false),
                     None => {
                         tracing::warn!(
                             target: LOG_TARGET,
@@ -354,7 +392,9 @@ mod tests {
             request,
             method,
             path,
+            port,
         } = Request::parse(request).unwrap();
+        assert!(port.is_none());
 
         assert_eq!(
             host,
@@ -835,11 +875,13 @@ mod tests {
         assert_eq!(
             request.host,
             HostKind::Clearnet {
-                host: "google.com:443".to_string()
+                host: "google.com".to_string()
             }
         );
+        assert_eq!(request.port, Some(443));
         assert_eq!(request.method, "CONNECT".to_string());
         assert_eq!(request.path, "www.google.com:443".to_string());
+        assert!(!request.is_tunnel());
 
         let ((host, port), request) = request
             .assemble(
@@ -871,5 +913,97 @@ mod tests {
             req.headers.iter().find(|header| header.name == "User-Agent").unwrap().value,
             "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0".as_bytes(),
         );
+    }
+
+    #[tokio::test]
+    async fn port_in_host_header_kept_for_i2p_host() {
+        let request = "GET /index.html HTTP/1.1\r\nHost: zzz.i2p:8080\r\n\r\n".as_bytes().to_vec();
+        let request = Request::parse(request).unwrap();
+
+        assert_eq!(
+            request.host,
+            HostKind::I2p {
+                host: "zzz.i2p".to_string()
+            }
+        );
+        assert_eq!(request.port, Some(8080));
+        assert!(!request.is_tunnel());
+
+        let (address_book, _) = make_address_book().await;
+        let ((host, port), request) = request.assemble(&Some(address_book), &None).await.unwrap();
+
+        assert_eq!(
+            host,
+            "lhbd7ojcaiofbfku7ixh47qj537g572zmhdc4oilvugzxdpdghua.b32.i2p".to_string()
+        );
+        assert_eq!(port, Some(8080));
+
+        // the `Host` sent to the eepsite is the .b32.i2p address, without the port
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut req = httparse::Request::new(&mut headers);
+        let _body_start = req.parse(&request).unwrap().unwrap();
+        assert_eq!(
+            req.headers.iter().find(|header| header.name == "Host").unwrap().value,
+            "lhbd7ojcaiofbfku7ixh47qj537g572zmhdc4oilvugzxdpdghua.b32.i2p".as_bytes(),
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_to_i2p_host_is_tunnel() {
+        let request = "CONNECT zzz.i2p:443 HTTP/1.1\r\n\
+            Host: zzz.i2p:443\r\n\
+            Proxy-Connection: keep-alive\r\n\r\n"
+            .as_bytes()
+            .to_vec();
+        let request = Request::parse(request).unwrap();
+
+        assert_eq!(
+            request.host,
+            HostKind::I2p {
+                host: "zzz.i2p".to_string()
+            }
+        );
+        assert_eq!(request.port, Some(443));
+        assert!(request.is_tunnel());
+
+        let (address_book, _) = make_address_book().await;
+        let ((host, port), _) = request.assemble(&Some(address_book), &None).await.unwrap();
+
+        assert_eq!(
+            host,
+            "lhbd7ojcaiofbfku7ixh47qj537g572zmhdc4oilvugzxdpdghua.b32.i2p".to_string()
+        );
+        assert_eq!(port, Some(443));
+    }
+
+    #[tokio::test]
+    async fn connect_to_b32_host_is_tunnel() {
+        let request = "CONNECT lhbd7ojcaiofbfku7ixh47qj537g572zmhdc4oilvugzxdpdghua.b32.i2p:443 \
+            HTTP/1.1\r\nHost: lhbd7ojcaiofbfku7ixh47qj537g572zmhdc4oilvugzxdpdghua.b32.i2p:443\r\n\r\n"
+            .as_bytes()
+            .to_vec();
+        let request = Request::parse(request).unwrap();
+
+        assert!(request.is_tunnel());
+        assert_eq!(request.port, Some(443));
+
+        let ((host, port), _) = request.assemble(&None, &None).await.unwrap();
+        assert_eq!(
+            host,
+            "lhbd7ojcaiofbfku7ixh47qj537g572zmhdc4oilvugzxdpdghua.b32.i2p".to_string()
+        );
+        assert_eq!(port, Some(443));
+    }
+
+    #[test]
+    fn invalid_port_in_host_rejected() {
+        for host in ["zzz.i2p:", "zzz.i2p:abc", "zzz.i2p:70000", "zzz.i2p:80:80"] {
+            let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes();
+            assert_eq!(
+                Request::parse(request).unwrap_err(),
+                HttpError::InvalidHost,
+                "{host}"
+            );
+        }
     }
 }
