@@ -22,8 +22,8 @@ use crate::{
     ui::dioxus::{
         style::global_css,
         types::{
-            AddressBook, HiddenServices, RouterState, RouterStatus, Settings,
-            SidebarSelection, Traffic,
+            AddressBook, HiddenServices, RouterState, RouterStatus, Settings, SidebarSelection,
+            Traffic,
         },
         util::{read_b32_address, save_router_config},
     },
@@ -40,7 +40,7 @@ use emissary_core::{
 use tokio::sync::mpsc::Sender;
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     net::Ipv4Addr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -114,6 +114,9 @@ struct AppState {
     /// Address book handle, if enabled.
     address_book_handle: Option<Arc<AddressBookHandle>>,
 
+    /// Version of the address book the "Browse" tab was last loaded from.
+    address_book_version: u64,
+
     /// Router base path.
     base_path: PathBuf,
 
@@ -154,6 +157,15 @@ struct AppState {
     show_router_id: bool,
 }
 
+/// Addresses of the "Browse" tab, `hostname -> http://<base32>.b32.i2p`, read from `handle`.
+fn browse_addresses(handle: &AddressBookHandle) -> BTreeMap<Arc<str>, Arc<str>> {
+    handle
+        .snapshot()
+        .into_iter()
+        .map(|(hostname, address)| (hostname, Arc::from(format!("http://{address}.b32.i2p"))))
+        .collect()
+}
+
 impl AppState {
     /// Create new `AppState`.
     fn new(options: AppOptions) -> Self {
@@ -188,9 +200,19 @@ impl AppState {
             false => UiKind::Web,
         };
 
+        let mut address_book = AddressBook::new(base_path.clone(), &config);
+        let address_book_version = match &address_book_handle {
+            None => 0u64,
+            Some(handle) => {
+                address_book.browse.addresses = browse_addresses(handle);
+                handle.version()
+            }
+        };
+
         Self {
             address_book_handle,
-            address_book: AddressBook::new(base_path.clone(), &config),
+            address_book,
+            address_book_version,
             base_path,
             hidden_services: HiddenServices::new(&config),
             theme: match config.router_ui {
@@ -253,9 +275,20 @@ impl AppState {
 
     /// Advance the state of the router UI.
     ///
-    /// Retain recent toasts and trigger rerenders for shared router state updates.
+    /// Retain recent toasts, trigger rerenders for shared router state updates and reload the
+    /// "Browse" tab of the address book when the address book has changed, e.g., after a
+    /// subscription download finished.
     fn tick(&mut self) {
         self.toasts.retain(|(_, pushed)| pushed.elapsed() < Duration::from_secs(3));
+
+        if let Some(handle) = &self.address_book_handle {
+            let version = handle.version();
+
+            if version != self.address_book_version {
+                self.address_book.browse.addresses = browse_addresses(handle);
+                self.address_book_version = version;
+            }
+        }
     }
 
     /// Save settings.
@@ -372,15 +405,19 @@ impl AppState {
             ));
         }
 
+        // an empty list is stored as such, an unset list would mean the built-in subscriptions
+        let subscriptions = Some(if is_empty { Vec::new() } else { subs });
+
         match self.config.address_book {
             None => {
                 self.config.address_book = Some(AddressBookConfig {
                     default: None,
-                    subscriptions: (!is_empty).then_some(subs),
+                    subscriptions,
+                    refresh_hours: None,
                 });
             }
             Some(ref mut config) => {
-                config.subscriptions = (!is_empty).then_some(subs);
+                config.subscriptions = subscriptions;
             }
         }
 
@@ -722,9 +759,8 @@ fn apply_settings(
     let sam = TryInto::<Option<crate::config::SamConfig>>::try_into(settings.sam.clone())?;
     let http_proxy =
         TryInto::<Option<crate::config::HttpProxyConfig>>::try_into(settings.http_proxy.clone())?;
-    let socks_proxy = TryInto::<Option<crate::config::SocksProxyConfig>>::try_into(
-        settings.socks_proxy.clone(),
-    )?;
+    let socks_proxy =
+        TryInto::<Option<crate::config::SocksProxyConfig>>::try_into(settings.socks_proxy.clone())?;
     let exploratory = TryInto::<Option<crate::config::ExploratoryConfig>>::try_into(
         settings.exploratory.clone(),
     )?;

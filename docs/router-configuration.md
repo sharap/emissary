@@ -401,7 +401,10 @@ host = "127.0.0.1"
 | Config file | CLI | Description |
 |-------------|-----|-------------|
 | `default` | - | Default address book subscription URL for initial bootstrap. |
-| `subscriptions` | - | List of additional address book subscription URLs. |
+| `subscriptions` | - | List of additional address book subscription URLs. When the key is absent, the built-in list (reg.i2p, notbob.i2p, identiguy.i2p and stats.i2p) is used; an empty list disables additional subscriptions. |
+| `refresh_hours` | - | How often the subscriptions are downloaded again, in hours. Default is 12, `0` downloads them only at startup. |
+
+The bootstrap `hosts.txt` of the I2P project only lists a few dozen names, the full lists come from the subscriptions. When several subscriptions list the same name, the first one wins. Entries whose destination uses an unsupported signature type (e.g. ECDSA) are skipped. Hosts added through the router console are stored in the same file as the downloaded ones.
 
 Example:
 
@@ -409,6 +412,7 @@ Example:
 [address-book]
 default = "http://udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p/hosts.txt"
 subscriptions = ["http://your-favorite-address-service.i2p/hosts.txt"]
+refresh_hours = 12
 ```
 
 ::: info

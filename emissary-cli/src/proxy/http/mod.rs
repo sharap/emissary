@@ -534,6 +534,7 @@ mod tests {
                 AddressBookConfig {
                     default: None,
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await
@@ -710,6 +711,7 @@ mod tests {
                 AddressBookConfig {
                     default: None,
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await
@@ -885,6 +887,7 @@ mod tests {
                 AddressBookConfig {
                     default: None,
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await
@@ -962,6 +965,7 @@ mod tests {
                 AddressBookConfig {
                     default: None,
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await
@@ -1322,6 +1326,7 @@ mod tests {
                 AddressBookConfig {
                     default: None,
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await

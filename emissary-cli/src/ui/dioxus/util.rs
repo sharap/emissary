@@ -140,7 +140,10 @@ mod tests {
 
         let loaded = load_router_config(&path).unwrap();
         assert!(loaded.floodfill);
-        assert_eq!(loaded.ntcp2.as_ref().unwrap().port, config.ntcp2.as_ref().unwrap().port);
+        assert_eq!(
+            loaded.ntcp2.as_ref().unwrap().port,
+            config.ntcp2.as_ref().unwrap().port
+        );
 
         // missing or malformed file yields `None`
         assert!(load_router_config(&dir.path().join("missing.toml")).is_none());

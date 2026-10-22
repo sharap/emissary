@@ -373,6 +373,7 @@ mod tests {
             AddressBookConfig {
                 default: Some(String::from("url")),
                 subscriptions: None,
+                refresh_hours: None,
             },
         )
         .await;

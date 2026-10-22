@@ -33,7 +33,15 @@ use reqwest::{
 };
 
 use std::{
-    collections::HashMap, future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration,
+    collections::{BTreeMap, HashMap},
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 /// Logging target for the file
@@ -44,6 +52,40 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// How many times each subscription is tried before giving up.
 const SUBSCRIPTION_NUM_RETRIES: usize = 5usize;
+
+/// How often the subscriptions are downloaded again unless configured otherwise.
+const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// Subscriptions used when the configuration doesn't list any.
+///
+/// The bootstrap `hosts.txt` of the I2P project only has a few dozen names. These services
+/// publish the full lists. `reg.i2p` is given as a `.b32.i2p` address because it's missing from
+/// the bootstrap file, the others are resolved through it.
+pub const DEFAULT_SUBSCRIPTIONS: &[&str] = &[
+    "http://shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32.i2p/hosts.txt",
+    "http://notbob.i2p/hosts.txt",
+    "http://identiguy.i2p/hosts.txt",
+    "http://stats.i2p/cgi-bin/newhosts.txt",
+];
+
+/// Write `addresses` to the base32 address file at `path`, one `hostname=base32` per line.
+///
+/// The in-memory map is the only source of truth: every change is written from it, so entries
+/// downloaded by the manager and entries added through the UI never overwrite each other.
+fn write_addresses(path: &Path, addresses: &HashMap<String, String>) -> std::io::Result<()> {
+    let serialized = addresses.iter().collect::<BTreeMap<_, _>>().into_iter().fold(
+        String::new(),
+        |mut acc, (hostname, address)| {
+            acc.push_str(hostname);
+            acc.push('=');
+            acc.push_str(address);
+            acc.push('\n');
+            acc
+        },
+    );
+
+    std::fs::write(path, serialized)
+}
 
 /// Used when requesting address books from servers. This should reduce load to servers whose
 /// address books haven't changed since our last lookup.
@@ -104,11 +146,14 @@ pub struct AddressBookManager {
     /// URL from which the primary `hosts.txt` is downloaded.
     hosts_url: Option<String>,
 
-    /// Serialized base32 addresses.
-    serialized: Arc<RwLock<String>>,
+    /// How often the subscriptions are downloaded again, `None` means only once at startup.
+    refresh_interval: Option<Duration>,
 
     /// Additional subscriptions.
     subscriptions: Vec<String>,
+
+    /// Incremented on every change of `addresses`, lets the UI notice updates cheaply.
+    version: Arc<AtomicU64>,
 }
 
 impl AddressBookManager {
@@ -117,8 +162,7 @@ impl AddressBookManager {
         let path = base_path.join("addressbook");
 
         // load (hostname, base32 address) mappings from disk
-        let (addresses, serialized) = match tokio::fs::read_to_string(path.join("addresses")).await
-        {
+        let addresses = match tokio::fs::read_to_string(path.join("addresses")).await {
             Err(error) => {
                 tracing::warn!(
                     target: LOG_TARGET,
@@ -127,26 +171,37 @@ impl AddressBookManager {
                     "failed to load base32 addresses from disk",
                 );
 
-                (HashMap::new(), String::new())
+                HashMap::new()
             }
-            Ok(content) => (
-                content
-                    .lines()
-                    .filter_map(|line| {
-                        line.split_once('=').map(|(key, value)| (key.to_owned(), value.to_owned()))
-                    })
-                    .collect(),
-                content,
-            ),
+            Ok(content) => content
+                .lines()
+                .filter_map(|line| {
+                    line.split_once('=').map(|(key, value)| (key.to_owned(), value.to_owned()))
+                })
+                .collect(),
         };
 
         Self {
             address_book_path: path,
             addresses: Arc::new(RwLock::new(addresses)),
             hosts_url: config.default,
-            serialized: Arc::new(RwLock::new(serialized)),
-            subscriptions: config.subscriptions.unwrap_or_default(),
+            refresh_interval: match config.refresh_hours {
+                None => Some(DEFAULT_REFRESH_INTERVAL),
+                Some(0) => None,
+                Some(hours) => Some(Duration::from_secs(hours.saturating_mul(60 * 60))),
+            },
+            subscriptions: config.subscriptions.unwrap_or_else(|| {
+                DEFAULT_SUBSCRIPTIONS.iter().map(|url| url.to_string()).collect()
+            }),
+            version: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Override the refresh interval, `None` disables periodic refreshes.
+    #[cfg(test)]
+    fn with_refresh_interval(mut self, refresh_interval: Option<Duration>) -> Self {
+        self.refresh_interval = refresh_interval;
+        self
     }
 
     /// Get handle to [`AddressBook`].
@@ -154,7 +209,7 @@ impl AddressBookManager {
         Arc::new(AddressBookHandle {
             address_book_path: Arc::from(self.address_book_path.to_str().expect("to succeed")),
             addresses: Arc::clone(&self.addresses),
-            serialized: Arc::clone(&self.serialized),
+            version: Arc::clone(&self.version),
         })
     }
 
@@ -368,6 +423,9 @@ impl AddressBookManager {
     ///
     /// Before the address book subscription download starts, [`AddressBook`] waits on
     /// `http_proxy_ready_rx` which the HTTP proxy sends a signal to once it's ready.
+    ///
+    /// The subscriptions are downloaded again every `refresh_interval`, so names registered after
+    /// the router was started show up without a restart.
     pub async fn run(
         self,
         http_port: u16,
@@ -397,11 +455,29 @@ impl AddressBookManager {
             .build()
             .expect("to succeed");
 
+        loop {
+            self.download_all(&client).await;
+
+            let Some(refresh_interval) = self.refresh_interval else {
+                return;
+            };
+
+            tracing::info!(
+                target: LOG_TARGET,
+                ?refresh_interval,
+                "address book downloaded, waiting for the next refresh",
+            );
+            tokio::time::sleep(refresh_interval).await;
+        }
+    }
+
+    /// Download the default `hosts.txt` and all subscriptions once and store the results on disk.
+    async fn download_all(&self, client: &Client) {
         let mut addresses = HashMap::<String, (String, String)>::new();
         let mut host_modified_times = self.load_host_modified_times().await;
 
         if let Some(url) = &self.hosts_url {
-            self.download_with_retries(url, &client, &mut addresses, &mut host_modified_times)
+            self.download_with_retries(url, client, &mut addresses, &mut host_modified_times)
                 .await;
 
             // save hosts to disk at this point as subscriptions might contain .i2p addresses
@@ -417,7 +493,7 @@ impl AddressBookManager {
         for subscription in &self.subscriptions {
             self.download_with_retries(
                 subscription,
-                &client,
+                client,
                 &mut addresses,
                 &mut host_modified_times,
             )
@@ -477,27 +553,14 @@ impl AddressBookManager {
 
         // store base32-encoded addresses on disk and update `addresses`
         {
-            // update `addresses`
-            {
-                let mut inner = self.addresses.write();
+            let mut inner = self.addresses.write();
 
-                for (hostname, address) in addresses {
-                    inner.insert(hostname.clone(), address.clone());
-                }
+            for (hostname, address) in addresses {
+                inner.insert(hostname, address);
             }
+            self.version.fetch_add(1, Ordering::Release);
 
-            // get full list of base32 addresses
-            let base32_addresses = {
-                let inner = self.addresses.read();
-
-                inner.iter().fold(String::new(), |acc, (hostname, address)| {
-                    format!("{hostname}={address}\n{acc}")
-                })
-            };
-
-            if let Err(error) =
-                tokio::fs::write(self.address_book_path.join("addresses"), base32_addresses).await
-            {
+            if let Err(error) = write_addresses(&self.address_book_path.join("addresses"), &inner) {
                 tracing::warn!(
                     target: LOG_TARGET,
                     ?error,
@@ -542,33 +605,52 @@ pub struct AddressBookHandle {
     /// Hostname -> Base32 address mappings
     addresses: Arc<RwLock<HashMap<String, String>>>,
 
-    /// Serialized list of Base32 addresses.
-    #[allow(dead_code)]
-    serialized: Arc<RwLock<String>>,
+    /// Incremented on every change of `addresses`.
+    version: Arc<AtomicU64>,
 }
 
 impl AddressBookHandle {
+    /// Version of the address book, changes whenever an entry is added, removed or downloaded.
+    #[allow(dead_code)]
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Copy of all `hostname -> base32 address` entries, sorted by hostname.
+    #[allow(dead_code)]
+    pub fn snapshot(&self) -> BTreeMap<Arc<str>, Arc<str>> {
+        self.addresses
+            .read()
+            .iter()
+            .map(|(hostname, address)| (Arc::from(hostname.as_str()), Arc::from(address.as_str())))
+            .collect()
+    }
+
+    /// Store `addresses` on disk after a modification.
+    fn store(&self, addresses: &HashMap<String, String>, host: &str) {
+        self.version.fetch_add(1, Ordering::Release);
+
+        if let Err(error) = write_addresses(
+            Path::new(&*self.address_book_path).join("addresses").as_path(),
+            addresses,
+        ) {
+            tracing::warn!(
+                target: LOG_TARGET,
+                %host,
+                error = ?error.kind(),
+                "failed to update on-disk base32 address list",
+            );
+        }
+    }
+
     /// Add new host to address book.
     ///
     /// Only the base32 address of the host is stored on disk.
     #[allow(dead_code)]
     pub fn add_base32(&self, host: String, address: String) {
-        self.addresses.write().insert(host.clone(), address.clone());
-
-        // update the on-disk version of the base32 address list
-        let mut inner = self.serialized.write();
-        inner.push_str(&format!("\n{host}={address}"));
-
-        if let Err(error) = std::fs::write(format!("{}/addresses", self.address_book_path), &*inner)
-        {
-            tracing::warn!(
-                target: LOG_TARGET,
-                %host,
-                %address,
-                error = ?error.kind(),
-                "failed to update on-disk base32 address list",
-            );
-        }
+        let mut inner = self.addresses.write();
+        inner.insert(host.clone(), address);
+        self.store(&inner, &host);
     }
 
     /// Add new host to address book.
@@ -578,21 +660,10 @@ impl AddressBookHandle {
     pub fn add_base64(&self, host: String, destination: Destination) {
         let base32_address = base32_encode(destination.id().to_vec());
 
-        self.addresses.write().insert(host.clone(), base32_address.clone());
-
-        // update the on-disk version of the base32 address list
-        let mut inner = self.serialized.write();
-        inner.push_str(&format!("\n{host}={base32_address}"));
-
-        if let Err(error) = std::fs::write(format!("{}/addresses", self.address_book_path), &*inner)
         {
-            tracing::warn!(
-                target: LOG_TARGET,
-                %host,
-                address = %base32_address,
-                error = ?error.kind(),
-                "failed to update on-disk base32 address list",
-            );
+            let mut inner = self.addresses.write();
+            inner.insert(host.clone(), base32_address);
+            self.store(&inner, &host);
         }
 
         if let Err(error) = std::fs::write(
@@ -611,24 +682,10 @@ impl AddressBookHandle {
     /// Remove `host` from address book.
     #[allow(dead_code)]
     pub fn remove(&self, host: &str) {
-        self.addresses.write().remove(host);
-
-        // update the on-disk version of the base32 address list
-        let mut inner = self.serialized.write();
-        *inner = inner
-            .lines()
-            .filter(|line| !line.starts_with(&format!("{host}=")))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if let Err(error) = std::fs::write(format!("{}/addresses", self.address_book_path), &*inner)
         {
-            tracing::warn!(
-                target: LOG_TARGET,
-                %host,
-                error = ?error.kind(),
-                "failed to update on-disk base32 address list",
-            );
+            let mut inner = self.addresses.write();
+            inner.remove(host);
+            self.store(&inner, host);
         }
 
         // remove destination file for the host
@@ -656,14 +713,274 @@ impl AddressBook for AddressBookHandle {
     }
 
     fn resolve_base32(&self, host: &str) -> Option<String> {
-        self.addresses.write().get(host).cloned()
+        self.addresses.read().get(host).cloned()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use emissary_core::crypto::SigningPrivateKey;
+    use emissary_util::runtime::tokio::Runtime as TokioRuntime;
+    use std::sync::atomic::AtomicUsize;
     use tempfile::tempdir;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    /// Create a `hostname=base64` line for a destination derived from `seed`.
+    fn hosts_line(hostname: &str, seed: u8) -> String {
+        let signing_key = SigningPrivateKey::from_bytes(&[seed; 32]).unwrap();
+        let destination = Destination::new::<TokioRuntime>(signing_key.public());
+
+        format!("{hostname}={}", base64_encode(destination.serialize()))
+    }
+
+    /// Minimal HTTP server standing in for the HTTP proxy.
+    ///
+    /// Answers every request with the next body of `bodies` (the last one is repeated) and counts
+    /// the requests.
+    async fn fake_proxy(bodies: Vec<String>) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let index = counter.fetch_add(1, Ordering::SeqCst).min(bodies.len() - 1);
+                let body = bodies[index].clone();
+
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+
+                    while !request.ends_with(b"\r\n\r\n") {
+                        if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        request.push(byte[0]);
+                    }
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        (port, requests)
+    }
+
+    #[tokio::test]
+    async fn built_in_subscriptions_used_when_unset() {
+        let dir = tempdir().unwrap().keep();
+
+        let manager = AddressBookManager::new(
+            dir.clone(),
+            AddressBookConfig {
+                default: None,
+                subscriptions: None,
+                refresh_hours: None,
+            },
+        )
+        .await;
+        assert_eq!(manager.subscriptions, DEFAULT_SUBSCRIPTIONS);
+        assert_eq!(manager.refresh_interval, Some(DEFAULT_REFRESH_INTERVAL));
+
+        let manager = AddressBookManager::new(
+            dir.clone(),
+            AddressBookConfig {
+                default: None,
+                subscriptions: Some(Vec::new()),
+                refresh_hours: Some(0),
+            },
+        )
+        .await;
+        assert!(manager.subscriptions.is_empty());
+        assert_eq!(manager.refresh_interval, None);
+
+        let manager = AddressBookManager::new(
+            dir,
+            AddressBookConfig {
+                default: None,
+                subscriptions: Some(vec![String::from("http://mine.i2p/hosts.txt")]),
+                refresh_hours: Some(3),
+            },
+        )
+        .await;
+        assert_eq!(
+            manager.subscriptions,
+            vec![String::from("http://mine.i2p/hosts.txt")]
+        );
+        assert_eq!(
+            manager.refresh_interval,
+            Some(Duration::from_secs(3 * 60 * 60))
+        );
+    }
+
+    #[tokio::test]
+    async fn console_changes_and_downloads_share_one_file() {
+        let dir = tempdir().unwrap().keep();
+        tokio::fs::create_dir_all(&dir.join("addressbook")).await.unwrap();
+
+        let manager = AddressBookManager::new(
+            dir.clone(),
+            AddressBookConfig {
+                default: None,
+                subscriptions: None,
+                refresh_hours: None,
+            },
+        )
+        .await;
+        let handle = manager.handle();
+        assert_eq!(handle.version(), 0);
+
+        // host added through the console before any download
+        handle.add_base32(String::from("manual.i2p"), String::from("manual-base32"));
+        assert_eq!(handle.version(), 1);
+
+        // subscription download finishes
+        let mut downloaded = HashMap::new();
+        downloaded.insert(
+            String::from("downloaded.i2p"),
+            (
+                String::from("downloaded-base32"),
+                String::from("downloaded-base64"),
+            ),
+        );
+        manager.save_to_disk(downloaded).await;
+        assert_eq!(handle.version(), 2);
+
+        // another host added through the console after the download
+        handle.add_base32(String::from("later.i2p"), String::from("later-base32"));
+        assert_eq!(handle.version(), 3);
+
+        let snapshot = handle.snapshot();
+        assert_eq!(
+            snapshot.keys().map(|key| key.as_ref()).collect::<Vec<_>>(),
+            vec!["downloaded.i2p", "later.i2p", "manual.i2p"]
+        );
+
+        // everything is on disk, nothing overwrote anything
+        let reloaded = AddressBookManager::new(
+            dir.clone(),
+            AddressBookConfig {
+                default: None,
+                subscriptions: None,
+                refresh_hours: None,
+            },
+        )
+        .await
+        .handle();
+        for (host, address) in [
+            ("manual.i2p", "manual-base32"),
+            ("downloaded.i2p", "downloaded-base32"),
+            ("later.i2p", "later-base32"),
+        ] {
+            assert_eq!(
+                reloaded.resolve_base32(host).as_deref(),
+                Some(address),
+                "{host}"
+            );
+        }
+
+        // removing one host keeps the others
+        handle.remove("downloaded.i2p");
+        assert_eq!(handle.version(), 4);
+        assert!(handle.resolve_base32("downloaded.i2p").is_none());
+
+        let reloaded = AddressBookManager::new(
+            dir,
+            AddressBookConfig {
+                default: None,
+                subscriptions: None,
+                refresh_hours: None,
+            },
+        )
+        .await
+        .handle();
+        assert!(reloaded.resolve_base32("downloaded.i2p").is_none());
+        assert!(reloaded.resolve_base32("manual.i2p").is_some());
+        assert!(reloaded.resolve_base32("later.i2p").is_some());
+    }
+
+    #[tokio::test]
+    async fn subscriptions_refreshed_periodically() {
+        let dir = tempdir().unwrap().keep();
+        tokio::fs::create_dir_all(&dir.join("addressbook")).await.unwrap();
+
+        // the first download lists one host, later downloads list two
+        let (port, requests) = fake_proxy(vec![
+            hosts_line("first.i2p", 1),
+            format!(
+                "{}\n{}",
+                hosts_line("first.i2p", 1),
+                hosts_line("second.i2p", 2)
+            ),
+        ])
+        .await;
+
+        let manager = AddressBookManager::new(
+            dir,
+            AddressBookConfig {
+                default: Some(String::from("http://registry.i2p/hosts.txt")),
+                subscriptions: Some(Vec::new()),
+                refresh_hours: None,
+            },
+        )
+        .await
+        .with_refresh_interval(Some(Duration::from_millis(200)));
+        let handle = manager.handle();
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        tokio::spawn(manager.run(port, String::from("127.0.0.1"), ready_rx));
+        ready_tx.send(()).unwrap();
+
+        // wait until the second download has been merged
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while handle.resolve_base32("second.i2p").is_none() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("second download merged");
+
+        assert!(requests.load(Ordering::SeqCst) >= 2);
+        assert!(handle.resolve_base32("first.i2p").is_some());
+        assert!(handle.resolve_base64(String::from("second.i2p")).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn no_refresh_without_interval() {
+        let dir = tempdir().unwrap().keep();
+        tokio::fs::create_dir_all(&dir.join("addressbook")).await.unwrap();
+
+        let (port, requests) = fake_proxy(vec![hosts_line("first.i2p", 1)]).await;
+        let manager = AddressBookManager::new(
+            dir,
+            AddressBookConfig {
+                default: Some(String::from("http://registry.i2p/hosts.txt")),
+                subscriptions: Some(Vec::new()),
+                refresh_hours: Some(0),
+            },
+        )
+        .await;
+        let handle = manager.handle();
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = tokio::spawn(manager.run(port, String::from("127.0.0.1"), ready_rx));
+        ready_tx.send(()).unwrap();
+
+        // the event loop exits after the single download
+        tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(handle.resolve_base32("first.i2p").is_some());
+    }
 
     #[tokio::test]
     async fn save_only_destination() {
@@ -673,6 +990,7 @@ mod tests {
             AddressBookConfig {
                 default: Some(String::from("url")),
                 subscriptions: None,
+                refresh_hours: None,
             },
         )
         .await;
@@ -778,6 +1096,7 @@ mod tests {
                 AddressBookConfig {
                     default: Some(String::from("url")),
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await;
@@ -821,6 +1140,7 @@ mod tests {
             AddressBookConfig {
                 default: None,
                 subscriptions: None,
+                refresh_hours: None,
             },
         )
         .await;
@@ -854,6 +1174,7 @@ mod tests {
             AddressBookConfig {
                 default: Some(String::from("url")),
                 subscriptions: None,
+                refresh_hours: None,
             },
         )
         .await;
@@ -937,6 +1258,7 @@ mod tests {
                 AddressBookConfig {
                     default: Some(String::from("url")),
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await;
@@ -983,6 +1305,7 @@ mod tests {
                 AddressBookConfig {
                     default: None,
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await;
@@ -1043,6 +1366,7 @@ mod tests {
                 AddressBookConfig {
                     default: None,
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await;
@@ -1075,6 +1399,7 @@ mod tests {
                 AddressBookConfig {
                     default: Some(String::from("url")),
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await;
@@ -1119,6 +1444,7 @@ mod tests {
                 AddressBookConfig {
                     default: None,
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await;
@@ -1144,6 +1470,7 @@ mod tests {
             AddressBookConfig {
                 default: None,
                 subscriptions: None,
+                refresh_hours: None,
             },
         )
         .await;
@@ -1168,6 +1495,7 @@ mod tests {
                 AddressBookConfig {
                     default: Some(String::from("url")),
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await;
@@ -1212,6 +1540,7 @@ mod tests {
                 AddressBookConfig {
                     default: None,
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await;
@@ -1224,7 +1553,7 @@ mod tests {
                 S1LZ3zGwVpEjCfVD1mQhCLzzIjRHgGB6Cr3xj3FntBhv0d9pBuogUjOkLEnmFHpj5ONE7l~3aUsR6vRYTUDfwn\
                 xXnIi9KF-PPyOAACXCz~T06QXVfaqzTj8tyr40cUqKIZHquaMZrAkqqa26KM3l0fu755UVo43MfD3f9zo3erjo\
                 ~UDI~oP1bYyEU3LBQAEAAcAAA==";
-            let deserialized = base64_decode(&base64_destination).unwrap();
+            let deserialized = base64_decode(base64_destination).unwrap();
             let destination = Destination::parse(&deserialized).unwrap();
 
             handle.add_base64("echo.idk.i2p".to_string(), destination);
@@ -1250,6 +1579,7 @@ mod tests {
             AddressBookConfig {
                 default: None,
                 subscriptions: None,
+                refresh_hours: None,
             },
         )
         .await;
@@ -1279,6 +1609,7 @@ mod tests {
                 AddressBookConfig {
                     default: Some(String::from("url")),
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await;
@@ -1332,6 +1663,7 @@ mod tests {
             AddressBookConfig {
                 default: None,
                 subscriptions: None,
+                refresh_hours: None,
             },
         )
         .await;
@@ -1353,6 +1685,7 @@ mod tests {
                 AddressBookConfig {
                     default: Some(String::from("url")),
                     subscriptions: None,
+                    refresh_hours: None,
                 },
             )
             .await;
@@ -1382,6 +1715,7 @@ mod tests {
             AddressBookConfig {
                 default: None,
                 subscriptions: None,
+                refresh_hours: None,
             },
         )
         .await;
@@ -1448,6 +1782,7 @@ mod tests {
             AddressBookConfig {
                 default: None,
                 subscriptions: None,
+                refresh_hours: None,
             },
         )
         .await;
@@ -1468,6 +1803,7 @@ mod tests {
             AddressBookConfig {
                 default: Some(String::from("url")),
                 subscriptions: None,
+                refresh_hours: None,
             },
         )
         .await;

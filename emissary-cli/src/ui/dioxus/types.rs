@@ -351,12 +351,13 @@ impl AddressBook {
                 pending_delete_server: None,
             },
             subscriptions: Subscriptions {
+                // an unset list means the built-in subscriptions, show them so they can be edited
                 subscriptions: match config.address_book {
                     Some(AddressBookConfig {
                         subscriptions: Some(ref subscriptions),
                         ..
                     }) => subscriptions.join(","),
-                    _ => String::from(""),
+                    _ => crate::address_book::DEFAULT_SUBSCRIPTIONS.join(","),
                 },
                 status: SubscriptionStatus::Idle,
             },

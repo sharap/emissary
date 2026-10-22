@@ -155,6 +155,7 @@ pub async fn run(path: Option<String>, native: bool) {
         AddressBookConfig {
             default: None,
             subscriptions: None,
+            refresh_hours: None,
         },
     )
     .await;

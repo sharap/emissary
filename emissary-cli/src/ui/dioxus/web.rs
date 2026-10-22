@@ -198,8 +198,14 @@ mod tests {
             Some("http://localhost:7657"),
             Some("LOCALHOST:7657")
         )));
-        assert!(origin_allowed(&headers(Some("http://[::1]:7657"), Some("[::1]:7657"))));
-        assert!(origin_allowed(&headers(Some("http://console.i2p"), Some("console.i2p"))));
+        assert!(origin_allowed(&headers(
+            Some("http://[::1]:7657"),
+            Some("[::1]:7657")
+        )));
+        assert!(origin_allowed(&headers(
+            Some("http://console.i2p"),
+            Some("console.i2p")
+        )));
 
         // page served from another site
         assert!(!origin_allowed(&headers(
@@ -210,8 +216,14 @@ mod tests {
             Some("http://127.0.0.1:8080"),
             Some("127.0.0.1:7657")
         )));
-        assert!(!origin_allowed(&headers(Some("null"), Some("127.0.0.1:7657"))));
-        assert!(!origin_allowed(&headers(Some("http://127.0.0.1:7657"), None)));
+        assert!(!origin_allowed(&headers(
+            Some("null"),
+            Some("127.0.0.1:7657")
+        )));
+        assert!(!origin_allowed(&headers(
+            Some("http://127.0.0.1:7657"),
+            None
+        )));
 
         // non-browser client without `Origin`
         assert!(origin_allowed(&headers(None, Some("127.0.0.1:7657"))));

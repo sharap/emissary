@@ -151,7 +151,10 @@ pub struct SocksProxyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddressBookConfig {
     pub default: Option<String>,
+    /// Subscriptions, the built-in list is used when unset and none when empty.
     pub subscriptions: Option<Vec<String>>,
+    /// How often the subscriptions are downloaded again, in hours. Default 12, 0 disables.
+    pub refresh_hours: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,7 +294,13 @@ impl EmissaryConfig {
                 default: Some(String::from(
                     "http://udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p/hosts.txt",
                 )),
-                subscriptions: None,
+                subscriptions: Some(
+                    crate::address_book::DEFAULT_SUBSCRIPTIONS
+                        .iter()
+                        .map(|url| url.to_string())
+                        .collect(),
+                ),
+                refresh_hours: Some(12),
             }),
             caps: None,
             bandwidth: Some(BandwidthConfig {
